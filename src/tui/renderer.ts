@@ -32,7 +32,8 @@ import {
   type Theme,
 } from "./theme.js";
 import {
-  buildScrollRows,
+  buildScrollDocument,
+  clearScrollCache,
   clampOffset,
   isFollowing,
 } from "./scrollback.js";
@@ -108,6 +109,11 @@ export class TuiRenderer {
   private running = false;
   private needsFull = true;
   private timer: NodeJS.Timeout | null = null;
+  /** Coalesce high-frequency store paints (stream deltas) to ~30fps */
+  private paintRaf: NodeJS.Timeout | null = null;
+  private paintQueued = false;
+  private lastPaintMs = 0;
+  private static readonly PAINT_MIN_MS = 32;
   private opts: RendererOptions;
   private stdin: NodeJS.ReadStream;
   private stdout: NodeJS.WriteStream;
@@ -177,6 +183,24 @@ export class TuiRenderer {
     this.state = state;
   }
 
+  /**
+   * Schedule a paint soon (coalesced). Use for store/stream events.
+   * Input handlers should call paint() for immediate feedback.
+   */
+  requestPaint(): void {
+    if (!this.running) return;
+    this.paintQueued = true;
+    if (this.paintRaf != null) return;
+    const elapsed = Date.now() - this.lastPaintMs;
+    const wait = Math.max(0, TuiRenderer.PAINT_MIN_MS - elapsed);
+    this.paintRaf = setTimeout(() => {
+      this.paintRaf = null;
+      if (!this.paintQueued) return;
+      this.paintQueued = false;
+      this.paint();
+    }, wait);
+  }
+
   getPromptText(): string {
     return this.prompt.text;
   }
@@ -184,6 +208,7 @@ export class TuiRenderer {
   setTheme(name: string, opts?: { preview?: boolean }): void {
     this.theme = resolveTheme(name);
     this.needsFull = true;
+    clearScrollCache();
     if (!opts?.preview) {
       this.themeBeforePreview = null;
     }
@@ -369,16 +394,17 @@ export class TuiRenderer {
     this.timer = setInterval(() => {
       this.tick++;
       if (!this.state) return;
-      // Always repaint when Ultra/Fusion glow is active so the sweep animates
+      // Spinner / glow / streaming caret — coalesced so we never double-paint
+      // with store events in the same frame budget
       if (
         this.state.phase !== "idle" ||
         this.hasStreaming() ||
         this.hasUltraGlow() ||
         this.copyFlash
       ) {
-        this.paint();
+        this.requestPaint();
       }
-    }, 33);
+    }, 50);
 
     this.refreshComplete();
     this.paint();
@@ -389,6 +415,8 @@ export class TuiRenderer {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.paintRaf) clearTimeout(this.paintRaf);
+    this.paintRaf = null;
 
     if (this.onData) this.stdin.off("data", this.onData);
     if (this.onResize) process.stdout.off("resize", this.onResize);
@@ -1145,6 +1173,8 @@ export class TuiRenderer {
     if (!this.running) return;
     const state = this.state;
     if (!state) return;
+    this.lastPaintMs = Date.now();
+    this.paintQueued = false;
 
     const { cols, rows } = this.size();
     if (cols !== this.buf.width || rows !== this.buf.height) {
@@ -1153,11 +1183,14 @@ export class TuiRenderer {
     }
 
     this.buf.setLevel(this.colorLevel);
-    this.buf.clear(this.theme.bg);
+    if (this.needsFull) {
+      this.buf.clear(this.theme.bg);
+    } else {
+      this.buf.beginFrame(this.theme.bg);
+    }
 
     const compact = state.compact;
     const padX = compact ? 1 : 2;
-    // Reserve 1 col for scrollbar gutter on the right
     const gutter = 1;
     const contentWidth = Math.max(20, cols - padX * 2 - gutter);
 
@@ -1167,11 +1200,7 @@ export class TuiRenderer {
     const dividerH = 1;
 
     const ghost =
-      this.focus === "prompt" && !this.completeOpen
-        ? this.completeResult.ghost
-        : this.focus === "prompt"
-          ? this.completeResult.ghost
-          : "";
+      this.focus === "prompt" ? this.completeResult.ghost : "";
 
     const promptLayout = layoutPrompt(
       this.prompt,
@@ -1182,7 +1211,6 @@ export class TuiRenderer {
     );
     const promptH = promptLayout.height;
 
-    // Same max density as pickers so `/` looks like a real tab, not a thin strip
     const completeMax = Math.min(
       this.completeResult.items.length,
       Math.max(10, Math.floor(rows / 2)),
@@ -1198,11 +1226,7 @@ export class TuiRenderer {
           )
         : { rows: [] as Row[], height: 0 };
 
-    // Give pickers (especially themes) most of the viewport so the list
-    // can show many items; remaining height is a thin scrollback strip.
-    const pickerMaxRows = this.picker
-      ? Math.max(14, rows - 8)
-      : 0;
+    const pickerMaxRows = this.picker ? Math.max(14, rows - 8) : 0;
     const pickerLayout = this.picker
       ? layoutPicker(
           this.picker,
@@ -1228,16 +1252,19 @@ export class TuiRenderer {
       (compact ? 0 : 1);
     const scrollH = Math.max(3, rows - chromeH);
 
-    const doc = buildScrollRows(state, this.theme, contentWidth, this.tick);
+    // Plain text only when selecting (copy) — skip join cost during stream
+    const needPlain = Boolean(this.selection) || this.focus === "scrollback";
+    const { rows: doc, plain } = buildScrollDocument(
+      state,
+      this.theme,
+      contentWidth,
+      this.tick,
+      { needPlain },
+    );
     this.lastDocLen = doc.length;
     this.lastScrollH = scrollH;
-    this.lastDocPlain = doc.map((row) =>
-      row.segments.map((s) => s.text).join(""),
-    );
+    if (needPlain) this.lastDocPlain = plain;
 
-    // Follow tail only when pinned; otherwise keep absolute line offset so
-    // scrolling walks the full transcript (user + assistant + tools), not
-    // message-to-message jumps.
     if (this.following) {
       this.scrollOffset = Math.max(0, doc.length - scrollH);
     } else {
@@ -1261,18 +1288,19 @@ export class TuiRenderer {
 
     const scrollTop = y;
     this.layout = { padX, scrollTop, scrollH, contentWidth };
-    const view = doc.slice(this.scrollOffset, this.scrollOffset + scrollH);
+    const viewEnd = Math.min(doc.length, this.scrollOffset + scrollH);
     for (let i = 0; i < scrollH; i++) {
-      const row = view[i];
       const docLine = this.scrollOffset + i;
+      const row = docLine < viewEnd ? doc[docLine] : undefined;
       if (row) {
         this.paintRow(padX, y, row, contentWidth, docLine);
+      } else {
+        this.buf.clearRowRest(0, y);
       }
       y++;
     }
 
-    // Scrollbar gutter
-    const sbCol = cols - (compact ? 1 : 1);
+    const sbCol = cols - 1;
     const sb = computeScrollbar(
       {
         top: scrollTop,
@@ -1289,7 +1317,6 @@ export class TuiRenderer {
       this.buf.put(sbCol, cell.y, cell.ch, cell.style);
     }
 
-    // Auth / device-code modal
     let modalTop = y;
     if (modalLayout.height > 0) {
       modalTop = y;
@@ -1298,14 +1325,12 @@ export class TuiRenderer {
       }
     }
 
-    // Settings picker sits above autocomplete / prompt
     if (pickerLayout.height > 0) {
       for (const row of pickerLayout.rows) {
         this.paintRow(padX, y++, row, contentWidth);
       }
     }
 
-    // Autocomplete popup sits just above the prompt divider
     if (popup.height > 0) {
       for (const row of popup.rows) {
         this.paintRow(padX, y++, row, contentWidth);
@@ -1325,7 +1350,6 @@ export class TuiRenderer {
     }
 
     const sp = scrollPercent(this.scrollOffset, doc.length, scrollH);
-    // Overlay brief "copied" toast without mutating store
     const statusState =
       this.copyFlash && state.phase === "idle"
         ? { ...state, activityLabel: this.copyFlash }
@@ -1369,22 +1393,25 @@ export class TuiRenderer {
   ): void {
     let col = x;
     const end = x + maxWidth;
-    let textCol = 0; // column within plain line
+    let textCol = 0;
+    const bg = this.theme.bg;
+    const selecting =
+      docLine !== undefined &&
+      this.selection &&
+      this.lineInSelection(docLine);
+
     for (const seg of row.segments) {
       if (col >= end) break;
-      const style = {
-        ...seg.style,
-        bg: seg.style.bg ?? this.theme.bg,
-      };
-      // Per-character paint when selection intersects this line
-      if (
-        docLine !== undefined &&
-        this.selection &&
-        this.lineInSelection(docLine)
-      ) {
+      // Reuse segment style object when bg already set
+      const style =
+        seg.style.bg !== undefined
+          ? seg.style
+          : ({ ...seg.style, bg } as typeof seg.style);
+
+      if (selecting) {
         for (const ch of [...seg.text]) {
           if (col >= end) break;
-          const selected = this.cellSelected(docLine, textCol);
+          const selected = this.cellSelected(docLine!, textCol);
           const w = this.buf.write(col, y, ch, {
             ...style,
             bg: selected ? this.theme.selection : style.bg,
@@ -1396,9 +1423,16 @@ export class TuiRenderer {
       } else {
         const written = this.buf.write(col, y, seg.text, style);
         col += written;
-        textCol += [...seg.text].length;
-        if (written < (seg.text ? 1 : 0) && seg.text) break;
+        // Approximate textCol without spreading full string (only for selection)
+        textCol += written > 0 ? seg.text.length : 0;
+        if (written === 0 && seg.text) break;
       }
+    }
+    // Erase stale glyphs past end of content on this row
+    if (col < end) {
+      this.buf.clearRowRest(col, y);
+    } else {
+      this.buf.markRow(y);
     }
   }
 

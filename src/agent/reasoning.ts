@@ -13,7 +13,11 @@
 import type { ProviderId } from "../auth/types.js";
 import type { RemoteModel } from "../auth/models.js";
 import { modelKey } from "../auth/models.js";
-import { loadAgentSettings, saveAgentSettings } from "./config.js";
+import {
+  CUSTOM_REASONING_OPTIONS,
+  loadAgentSettings,
+  saveAgentSettings,
+} from "./config.js";
 
 /** Canonical effort tokens we understand (order from least → most). */
 export const EFFORT_ORDER = [
@@ -856,56 +860,63 @@ export function effortPickerOptions(
 }
 
 /**
- * Slash-complete values for /reasoning — only real efforts for the active model,
- * plus harness modes (ultra / ultra-fusion). Never the global effort catalog.
+ * Slash-complete values for /reasoning — same set & labels as the /reasoning
+ * tab picker (effort levels for the active model + ultra / ultra-fusion).
+ * Values stay the CLI form (`low`, `ultra-fusion`); labels match the picker.
  */
 export function reasoningCompleteValues(
   provider: ProviderId | string | undefined,
   model: string | undefined,
-): { value: string; description: string }[] {
-  const values: { value: string; description: string }[] = [];
+): { value: string; label: string; description: string }[] {
+  const values: { value: string; label: string; description: string }[] = [];
 
-  if (
-    provider &&
+  const hasModel =
+    Boolean(provider) &&
     provider !== "none" &&
-    model &&
-    model !== "unset"
-  ) {
-    const opts = effortPickerOptions(provider as ProviderId, model, {
+    Boolean(model) &&
+    model !== "unset";
+
+  if (hasModel) {
+    const opts = effortPickerOptions(provider as ProviderId, model!, {
       allowHeuristic: false,
     });
     for (const o of opts) {
       values.push({
         value: o.value,
+        label: o.label,
         description: o.description,
       });
     }
-    const caps = getCachedReasoningCaps(provider as ProviderId, model);
-    if (!caps) {
+    const caps = getCachedReasoningCaps(provider as ProviderId, model!);
+    if (!caps && values.length === 0) {
       values.push({
         value: "default",
-        description: "Fetch models first (/model or /reasoning picker)",
+        label: effortLabel("default"),
+        description: "Open /reasoning or /model to refresh the catalog",
       });
     }
   } else {
+    // Mirror root picker when no model: custom harness modes only
+    for (const o of CUSTOM_REASONING_OPTIONS) {
+      values.push({
+        value: o.value,
+        label: o.label,
+        description: o.description,
+      });
+    }
+    return values;
+  }
+
+  // Same as openEffortModesPicker: skip "none", add ultra / ultra-fusion
+  for (const o of CUSTOM_REASONING_OPTIONS) {
+    if (o.value === "none") continue;
     values.push({
-      value: "default",
-      description: "Pick a model first — efforts are per-model from the catalog",
+      value: o.value,
+      label: o.label,
+      description: o.description,
     });
   }
 
-  values.push(
-    {
-      value: "ultra",
-      description: "Max effort + auto subagents",
-    },
-    {
-      value: "ultra-fusion",
-      description: "Both reason → main compares & executes",
-    },
-  );
-
-  // Dedupe by value (default may appear twice)
   const seen = new Set<string>();
   return values.filter((v) => {
     if (seen.has(v.value)) return false;

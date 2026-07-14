@@ -155,10 +155,20 @@ export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
   },
 };
 
+/** Parsed agent settings cache (keyed by config.agent identity). */
+let agentSettingsCache: { src: unknown; value: AgentSettings } | null = null;
+
 export function loadAgentSettings(): AgentSettings {
   const cfg = loadConfig();
   const a = cfg.agent;
-  if (!a) return structuredClone(DEFAULT_AGENT_SETTINGS);
+  if (agentSettingsCache && agentSettingsCache.src === a) {
+    return agentSettingsCache.value;
+  }
+  if (!a) {
+    const empty = structuredClone(DEFAULT_AGENT_SETTINGS);
+    agentSettingsCache = { src: a, value: empty };
+    return empty;
+  }
   // Migrate removed harness modes (deep/swarm were never provider-native)
   let custom = a.reasoning?.custom as string | undefined;
   if (custom === "deep" || custom === "swarm") custom = "none";
@@ -169,7 +179,7 @@ export function loadAgentSettings(): AgentSettings {
   ) {
     custom = DEFAULT_AGENT_SETTINGS.reasoning.custom;
   }
-  return {
+  const value: AgentSettings = {
     reasoning: {
       ...DEFAULT_AGENT_SETTINGS.reasoning,
       ...a.reasoning,
@@ -194,6 +204,8 @@ export function loadAgentSettings(): AgentSettings {
           : DEFAULT_SUBAGENT_ROLES.map((r) => ({ ...r })),
     },
   };
+  agentSettingsCache = { src: a, value };
+  return value;
 }
 
 export function saveAgentSettings(partial: {
@@ -202,6 +214,7 @@ export function saveAgentSettings(partial: {
   };
   subagents?: Partial<SubagentConfig>;
 }): AgentSettings {
+  agentSettingsCache = null;
   const cur = loadAgentSettings();
   const next: AgentSettings = {
     reasoning: {
@@ -252,6 +265,7 @@ export function saveAgentSettings(partial: {
   }
 
   saveConfig({ agent: next } as Partial<LibraConfig>);
+  agentSettingsCache = { src: next, value: next };
   return next;
 }
 

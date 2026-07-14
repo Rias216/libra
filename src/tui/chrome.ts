@@ -1,7 +1,7 @@
 /**
  * Header + status bar chrome.
  * Top-right: plain main / peer models (no rainbow badges).
- * Bottom-right: purple glow ULTRACODE + FUSION when active.
+ * Bottom-right: theme-accent glow for Ultra / Ultra + Fusion when active.
  */
 
 import type { HarnessState } from "../core/types.js";
@@ -12,9 +12,7 @@ import { spinnerFrame } from "./components/parts.js";
 import { loadAgentSettings } from "../agent/config.js";
 import { parseModelKey } from "../auth/models.js";
 
-/** Signature purple glow (bright peak + dim base) */
-const ULTRA_PURPLE: Rgb = { r: 216, g: 180, b: 254 };
-const ULTRA_DIM: Rgb = { r: 88, g: 56, b: 140 };
+
 
 export function renderHeader(
   state: HarnessState,
@@ -160,7 +158,7 @@ export function renderStatus(
   const room = width - used - 1;
   if (room > 8) {
     const glowSegs = modeLabel
-      ? animatedGlowSegments(modeLabel, tick)
+      ? animatedGlowSegments(modeLabel, tick, theme)
       : [];
     const glowW = modeLabel ? stringWidth(modeLabel) + 2 : 0;
     const keysRoom = Math.max(0, room - glowW);
@@ -199,37 +197,58 @@ function ultraModeLabel(): string {
   return "";
 }
 
-/** Purple sweep glow left → right across the label. */
+/**
+ * Seamless soft sheen across Ultra / Ultra + Fusion.
+ *
+ * Traveling cosine lobe over theme accent colors — continuous gradients
+ * between neighboring characters, mild bright tip (not pure white).
+ * ~0.9s per loop at 30fps for a 14-char label.
+ */
+const GLOW_SPEED = 0.39; // chars / tick (~25% slower than 0.52)
+const GLOW_HALF = 2.6; // half-width of the soft lobe (chars)
+
 function animatedGlowSegments(
   label: string,
   tick: number,
+  theme: Theme,
 ): Row["segments"] {
   const chars = [...label];
   const n = chars.length;
   if (n === 0) return [];
 
-  // Highlight window slides L→R; period ~1.2s at 30fps
-  const period = Math.max(n + 6, 18);
-  const head = tick % period;
+  const { dim, peak } = ultraGlowPalette(theme);
+  const head = ((tick * GLOW_SPEED) % n + n) % n;
   const segs: Row["segments"] = [];
 
   for (let i = 0; i < n; i++) {
-    const dist = head - i;
-    // Peak at head, soft trail behind (left of head as it moves right)
-    let t = 0;
-    if (dist >= 0 && dist <= 4) {
-      t = 1 - dist / 5;
-    } else if (dist < 0 && dist >= -1) {
-      t = 0.35; // slight lead glow
+    // Wrapped distance → seamless loop
+    let d = Math.abs(i - head);
+    d = Math.min(d, n - d);
+
+    // Cosine lobe: C1-smooth 1→0 with continuous slope at the edges
+    let intensity = 0;
+    if (d < GLOW_HALF) {
+      intensity = 0.5 * (1 + Math.cos((d / GLOW_HALF) * Math.PI));
     }
-    const fg = lerpRgb(ULTRA_DIM, ULTRA_PURPLE, t * t);
-    const bold = t > 0.45;
+
+    // Single continuous ramp dim → bright peak (no hard white layer)
+    const fg = lerpRgb(dim, peak, intensity);
+
     segs.push({
       text: chars[i]!,
-      style: { fg, bold },
+      style: { fg, bold: intensity > 0.78 },
     });
   }
   return segs;
+}
+
+/** Theme-based dim + peak (accent lifted lightly toward white). */
+function ultraGlowPalette(theme: Theme): { dim: Rgb; peak: Rgb } {
+  const base = theme.thinking ?? theme.accent;
+  const dim = lerpRgb(theme.fgFaint, base, 0.55);
+  // Peak: brighter accent, only a light lift toward white (~30%)
+  const peak = lerpRgb(theme.accent, { r: 255, g: 255, b: 255 }, 0.3);
+  return { dim, peak };
 }
 
 function lerpRgb(a: Rgb, b: Rgb, t: number): Rgb {

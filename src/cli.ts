@@ -73,8 +73,48 @@ import {
 } from "./agent/reasoning.js";
 import { prepareFusionForMain } from "./agent/fusion.js";
 import { buildSystemPrompt } from "./agent/loop.js";
+import { initDebug, dbg } from "./agent/debug.js";
 
 async function main(): Promise<void> {
+  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+    const { createRequire } = await import("node:module");
+    const require = createRequire(import.meta.url);
+    let version = "0.1.0";
+    try {
+      version = require("../package.json").version ?? version;
+    } catch {
+      try {
+        version = require("../../package.json").version ?? version;
+      } catch {
+        /* dist/cli.js → package.json is one up from dist */
+      }
+    }
+    console.log(`libra ${version}`);
+    return;
+  }
+  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+    console.log(`libra — AI coding harness TUI
+
+Usage:
+  libra [options]
+
+Options:
+  --theme=<name>   Theme (libra-night, tokyo-night, …)
+  --version, -v    Print version
+  --help, -h       Show this help
+
+Environment:
+  LIBRA_THEME      Default theme
+  LIBRA_FONT       Font profile
+  LIBRA_DEBUG      Debug level (1 / info / trace)
+
+Run from any project directory — the workspace is process.cwd().
+After install:  npm run link   (from the libra repo)
+`);
+    return;
+  }
+
+  initDebug();
   const cfg = loadConfig();
   const themeArg = process.argv.find((a) => a.startsWith("--theme="));
   const theme =
@@ -89,6 +129,11 @@ async function main(): Promise<void> {
     model: cfg.model ?? "unset",
     provider: cfg.provider ?? "none",
     cwd: process.cwd(),
+  });
+  dbg("cli", "boot", {
+    model: cfg.model,
+    provider: cfg.provider,
+    reasoning: loadAgentSettings().reasoning.custom,
   });
 
   const mockAgent = new MockAgent(store);
@@ -112,7 +157,8 @@ async function main(): Promise<void> {
 
   store.subscribe((_event, state) => {
     ui.setState(state, _event);
-    ui.paint();
+    // Coalesce stream/tool events — full paint on every token is the main lag source
+    ui.requestPaint();
   });
 
   // Quiet start — no welcome wall of text
@@ -1341,13 +1387,14 @@ async function handleUserSubmit(
     }
     try {
       const settings = loadAgentSettings();
+      // Collect dual reasoning off-screen; display as one normal thinking block
       const prep = await prepareFusionForMain(
         store,
         text,
         provider,
         model,
       );
-      notify(store, prep.summary);
+      toast(store, prep.summary);
       const system =
         buildSystemPrompt(settings.reasoning.customInstructions) +
         "\n\n" +
@@ -1358,6 +1405,8 @@ async function handleUserSubmit(
         cwd: process.cwd(),
         tools: true,
         systemPrompt: system,
+        // Same assistant turn as tools/text — not a split second panel
+        seedReasoning: prep.displayReasoning,
       });
     } catch (err) {
       notify(
@@ -1397,12 +1446,28 @@ function openSubagentMenu(
   arg: string,
 ): void {
   const cfg = loadAgentSettings();
+  const action = arg.trim().toLowerCase();
 
-  if (arg === "on" || arg === "off") {
+  if (action === "on" || action === "off") {
     saveAgentSettings({
-      subagents: { ...cfg.subagents, enabled: arg === "on" },
+      subagents: { ...cfg.subagents, enabled: action === "on" },
     });
-    notify(store, `subagents ${arg}`);
+    notify(store, `subagents ${action}`);
+    return;
+  }
+
+  // Same actions as the subagent tab / autocomplete suggestions
+  if (
+    action === "toggle" ||
+    action === "auto" ||
+    action === "max" ||
+    action === "roles" ||
+    action === "model" ||
+    action === "reset"
+  ) {
+    applySubagentAction(store, ui, action, () =>
+      openSubagentMenu(store, ui, ""),
+    );
     return;
   }
 

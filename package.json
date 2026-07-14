@@ -8,18 +8,31 @@
   "bin": {
     "libra": "./dist/cli.js"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
     "demo": "tsx src/cli.ts",
+    "link": "npm run build && npm link",
+    "unlink": "npm unlink -g libra",
     "test": "tsx src/tui/buffer.test.ts && tsx src/auth/auth.test.ts",
     "test:auth": "tsx src/auth/auth.test.ts",
     "test:auth:live": "tsx src/auth/auth.test.ts --live",
     "bench:openrouter": "tsx scripts/benchmark-openrouter.ts",
+    "bench:harness": "tsx scripts/benchmark-harness.ts",
+    "bench:grok": "tsx scripts/benchmark-grok.ts",
+    "bench:fusion": "tsx scripts/benchmark-fusion.ts",
+    "bench:fusion:hy3": "tsx scripts/benchmark-fusion-hy3.ts",
+    "bench:fusion-local": "tsx scripts/benchmark-fusion-local.ts",
     "smoke:agent": "tsx scripts/smoke-agent.ts"
   },
+
   "keywords": [
     "tui",
     "ai",

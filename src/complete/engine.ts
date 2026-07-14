@@ -6,8 +6,11 @@ import { fuzzyFilter, type FuzzyHit } from "./fuzzy.js";
 import {
   getSlashCommand,
   paramHint,
+  PROVIDER_VALUES,
   SLASH_COMMANDS,
+  SUBAGENT_ACTION_VALUES,
   type SlashCommand,
+  type SlashParamValue,
 } from "./commands.js";
 import type { PathIndex } from "../memory/paths.js";
 import type { PromptHistory } from "../memory/history.js";
@@ -17,7 +20,13 @@ import {
 } from "../memory/session-memory.js";
 import type { HarnessState } from "../core/types.js";
 import type { ProviderId } from "../auth/types.js";
+import { getProvider } from "../auth/types.js";
 import { reasoningCompleteValues } from "../agent/reasoning.js";
+import {
+  listCachedModels,
+  modelKey,
+} from "../auth/models.js";
+import { listCredentials } from "../auth/store.js";
 
 export type SuggestKind = "command" | "param" | "file" | "path-session";
 
@@ -196,45 +205,118 @@ function completeParams(
   limit: number,
   ctx?: CompleteContext,
 ): Suggestion[] {
-  // /reasoning — live per-model efforts from catalog cache (never static slop)
-  let values = cmd.params?.flatMap((p) => p.values ?? []) ?? [];
-  if (cmd.name === "reasoning" || cmd.aliases?.includes("reason")) {
-    const session = ctx?.state?.session;
-    values = reasoningCompleteValues(
-      session?.provider as ProviderId | undefined,
-      session?.model,
-    );
-  }
+  // Dynamic values must match each command's picker/tab options
+  const values = resolveParamValues(cmd, ctx);
 
   if (values.length === 0) {
     // Freeform param — no enum list; return empty so UI doesn't show junk
     return [];
   }
 
-  // Empty arg query — show full value list in definition order (tab-like)
-  if (!query.trim()) {
-    return values.slice(0, Math.max(limit, values.length)).map((v) => ({
-      kind: "param" as const,
-      insert: v.value,
-      label: v.value,
-      detail: v.description ?? cmd.description,
-      score: 0,
+  const q = query.trim();
+  // Empty arg query — full list in definition order (same order as pickers)
+  if (!q) {
+    return values.slice(0, Math.max(limit, values.length)).map((v) =>
+      toParamSuggestion(v, cmd, 0),
+    );
+  }
+
+  // Fuzzy on value + label + description so "Ultra" hits ultra-fusion
+  type Cand = { key: string; v: SlashParamValue };
+  const cands: Cand[] = [];
+  for (const v of values) {
+    cands.push({ key: v.value, v });
+    if (v.label && v.label.toLowerCase() !== v.value.toLowerCase()) {
+      cands.push({ key: v.label, v });
+    }
+  }
+  const hits = fuzzyFilter(
+    q,
+    cands.map((c) => c.key),
+    limit * 2,
+  );
+  const seen = new Set<string>();
+  const out: Suggestion[] = [];
+  for (const h of hits) {
+    const meta = cands.find((c) => c.key === h.item);
+    if (!meta || seen.has(meta.v.value)) continue;
+    seen.add(meta.v.value);
+    out.push(toParamSuggestion(meta.v, cmd, h.score, h.positions));
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** Build param value list aligned with the command's interactive picker. */
+function resolveParamValues(
+  cmd: SlashCommand,
+  ctx?: CompleteContext,
+): SlashParamValue[] {
+  const name = cmd.name;
+
+  if (name === "reasoning" || cmd.aliases?.includes("reason")) {
+    const session = ctx?.state?.session;
+    return reasoningCompleteValues(
+      session?.provider as ProviderId | undefined,
+      session?.model,
+    );
+  }
+
+  if (name === "model" || cmd.aliases?.includes("m")) {
+    const models = listCachedModels();
+    return models.map((m) => ({
+      value: modelKey({ provider: m.provider, model: m.id }),
+      label: `${m.provider}/${m.id}`,
+      description: `${m.reasoning ? "reasoning  " : ""}${m.description ?? m.name}`.trim(),
     }));
   }
 
-  const keys = values.map((v) => v.value);
-  const hits = fuzzyFilter(query, keys, limit);
-  return hits.map((h) => {
-    const meta = values.find((v) => v.value === h.item)!;
-    return {
-      kind: "param" as const,
-      insert: h.item,
-      label: h.item,
-      detail: meta.description ?? cmd.description,
-      score: h.score,
-      positions: h.positions,
-    };
-  });
+  if (name === "logout") {
+    const creds = listCredentials();
+    return creds.map((c) => {
+      const def = getProvider(c.provider as ProviderId);
+      return {
+        value: c.provider,
+        label: def?.name ?? c.provider,
+        description: c.label ?? c.method,
+      };
+    });
+  }
+
+  if (
+    name === "subagent" ||
+    cmd.aliases?.includes("subagents") ||
+    cmd.aliases?.includes("agents")
+  ) {
+    return SUBAGENT_ACTION_VALUES;
+  }
+
+  if (name === "login" || cmd.aliases?.includes("auth") || cmd.aliases?.includes("connect")) {
+    return PROVIDER_VALUES;
+  }
+
+  if (name === "verify" || cmd.aliases?.includes("check")) {
+    // Picker-less: all providers, same labels as login
+    return PROVIDER_VALUES;
+  }
+
+  return cmd.params?.flatMap((p) => p.values ?? []) ?? [];
+}
+
+function toParamSuggestion(
+  v: SlashParamValue,
+  cmd: SlashCommand,
+  score: number,
+  positions?: number[],
+): Suggestion {
+  return {
+    kind: "param",
+    insert: v.value,
+    label: v.label ?? v.value,
+    detail: v.description ?? cmd.description,
+    score,
+    positions,
+  };
 }
 
 function completeFiles(

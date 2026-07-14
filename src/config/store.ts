@@ -1,6 +1,9 @@
 /**
  * Persistent user config — theme, font, active model, agent settings.
  * Stored at ~/.libra/config.json
+ *
+ * Hot path: loadConfig() is called from paint / agent settings frequently.
+ * Results are cached in memory and invalidated on saveConfig().
  */
 
 import {
@@ -31,13 +34,16 @@ const DEFAULTS: LibraConfig = {
   font: "default",
 };
 
+/** In-memory cache — avoids sync disk I/O on every TUI paint */
+let cached: LibraConfig | null = null;
+
 function configPath(): string {
   return (
     process.env.LIBRA_CONFIG ?? join(homedir(), ".libra", "config.json")
   );
 }
 
-export function loadConfig(): LibraConfig {
+function readFromDisk(): LibraConfig {
   try {
     const p = configPath();
     if (!existsSync(p)) return { ...DEFAULTS };
@@ -48,8 +54,15 @@ export function loadConfig(): LibraConfig {
   }
 }
 
+export function loadConfig(): LibraConfig {
+  if (cached) return cached;
+  cached = readFromDisk();
+  return cached;
+}
+
 export function saveConfig(partial: Partial<LibraConfig>): LibraConfig {
   const next = { ...loadConfig(), ...partial };
+  cached = next;
   try {
     const p = configPath();
     mkdirSync(dirname(p), { recursive: true });
@@ -58,4 +71,9 @@ export function saveConfig(partial: Partial<LibraConfig>): LibraConfig {
     // best-effort
   }
   return next;
+}
+
+/** Drop cache (tests / external config edits). */
+export function invalidateConfigCache(): void {
+  cached = null;
 }

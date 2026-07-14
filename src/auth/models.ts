@@ -180,6 +180,19 @@ export function connectedProviders(): ProviderId[] {
   return PROVIDERS.filter((p) => Boolean(resolveToken(p.id))).map((p) => p.id);
 }
 
+/** Snapshot of models currently in the in-memory catalog cache (no network). */
+export function listCachedModels(): RemoteModel[] {
+  const out: RemoteModel[] = [];
+  for (const entry of cache.values()) {
+    for (const m of entry.models) out.push(m);
+  }
+  out.sort((a, b) => {
+    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+    return a.id.localeCompare(b.id);
+  });
+  return out;
+}
+
 /**
  * Pick the highest native-reasoning model (provider catalog caps first).
  * Delegates to agent/reasoning so ultra / fusion use real API capabilities.

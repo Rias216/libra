@@ -36,9 +36,38 @@ npm run dev
 
 Type any message and press **Enter** — a mock agent streams a full turn (reasoning → tools → markdown → diff) so you can evaluate the renderer without API keys.
 
-```bash
-npm run build
-node dist/cli.js --theme=tokyo-night
+### Install as a global `libra` command (PowerShell / any folder)
+
+From the repo root (once):
+
+```powershell
+npm install
+npm run link
+```
+
+That builds the CLI and puts `libra` on your PATH via npm’s global bin
+(`npm config get prefix` — already on PATH for most Node installs).
+
+Then from **any** project directory:
+
+```powershell
+cd C:\path\to\your\project
+libra
+libra --theme=tokyo-night
+libra --version
+```
+
+Update after pulling code:
+
+```powershell
+cd C:\Users\rias\Desktop\libra
+npm run link
+```
+
+Remove the global command:
+
+```powershell
+npm run unlink
 ```
 
 ## Architecture

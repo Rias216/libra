@@ -129,52 +129,55 @@ export function reduce(state: HarnessState, event: HarnessEvent): HarnessState {
       };
 
     case "text.delta":
-    case "reasoning.delta":
-      return {
-        ...state,
-        messages: state.messages.map((m) => {
-          if (m.id !== event.messageId) return m;
-          return {
-            ...m,
-            parts: m.parts.map((p) => {
-              if (p.id !== event.partId) return p;
-              if (p.type !== "text" && p.type !== "reasoning") return p;
-              return { ...p, content: p.content + event.delta, streaming: true };
-            }),
-          };
-        }),
-      };
+    case "reasoning.delta": {
+      // Hot path: mutate the target part in place (no full message array clone).
+      // Stream deltas are the dominant event volume during agent runs.
+      const msgs = state.messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i]!;
+        if (m.id !== event.messageId) continue;
+        const parts = m.parts;
+        for (let j = 0; j < parts.length; j++) {
+          const p = parts[j]!;
+          if (p.id !== event.partId) continue;
+          if (p.type !== "text" && p.type !== "reasoning") return state;
+          p.content += event.delta;
+          p.streaming = true;
+          return state;
+        }
+        return state;
+      }
+      return state;
+    }
 
-    case "tool.status":
-      return {
-        ...state,
-        messages: state.messages.map((m) => {
-          if (m.id !== event.messageId) return m;
-          return {
-            ...m,
-            parts: m.parts.map((p) => {
-              if (p.id !== event.partId || p.type !== "tool") return p;
-              const next: ToolPart = {
-                ...p,
-                status: event.status,
-                result: event.result ?? p.result,
-                error: event.error ?? p.error,
-              };
-              if (event.status === "running" && !next.startedAt) {
-                next.startedAt = Date.now();
-              }
-              if (
-                event.status === "completed" ||
-                event.status === "error" ||
-                event.status === "cancelled"
-              ) {
-                next.finishedAt = Date.now();
-              }
-              return next;
-            }),
-          };
-        }),
-      };
+    case "tool.status": {
+      const msgs = state.messages;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i]!;
+        if (m.id !== event.messageId) continue;
+        for (let j = 0; j < m.parts.length; j++) {
+          const p = m.parts[j]!;
+          if (p.id !== event.partId || p.type !== "tool") continue;
+          const tool = p as ToolPart;
+          tool.status = event.status;
+          if (event.result !== undefined) tool.result = event.result;
+          if (event.error !== undefined) tool.error = event.error;
+          if (event.status === "running" && !tool.startedAt) {
+            tool.startedAt = Date.now();
+          }
+          if (
+            event.status === "completed" ||
+            event.status === "error" ||
+            event.status === "cancelled"
+          ) {
+            tool.finishedAt = Date.now();
+          }
+          return state;
+        }
+        return state;
+      }
+      return state;
+    }
 
     case "phase":
       return {

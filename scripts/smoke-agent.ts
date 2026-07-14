@@ -1,13 +1,17 @@
-import { saveApiKey } from "../src/auth/api-key.js";
+import { saveApiKey, resolveToken } from "../src/auth/api-key.js";
 import { saveConfig } from "../src/config/store.js";
 import { HarnessStore } from "../src/core/store.js";
 import { AgentLoop } from "../src/agent/loop.js";
+import { initDebug, getDebugLogPath } from "../src/agent/debug.js";
 
-const KEY =
-  process.env.OPENROUTER_API_KEY ||
-  "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";
+const KEY = process.env.OPENROUTER_API_KEY || resolveToken("openrouter") || "";
 
 async function main() {
+  initDebug(process.env.LIBRA_DEBUG ? undefined : "info");
+  if (!KEY) {
+    console.error("No OpenRouter key. Set OPENROUTER_API_KEY or /login openrouter");
+    process.exit(1);
+  }
   saveApiKey("openrouter", KEY, { label: "user" });
   saveConfig({
     provider: "openrouter",
@@ -32,6 +36,8 @@ async function main() {
       model: "tencent/hy3:free",
       cwd: process.cwd(),
       tools: true,
+      lightReasoning: true,
+      label: "smoke",
     },
   );
   const ms = Date.now() - t0;
@@ -51,7 +57,12 @@ async function main() {
   console.log("tools", tools.join(", ") || "(none)");
   console.log("text:", text.slice(0, 500));
   console.log("tokens", store.state.tokens);
+  console.log("debug", getDebugLogPath());
   if (store.state.phase === "error") process.exit(1);
+  if (!tools.some((t) => t.includes("completed"))) {
+    console.error("FAIL: expected completed tool call");
+    process.exit(1);
+  }
 }
 
 main().catch((e) => {

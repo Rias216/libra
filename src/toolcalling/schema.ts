@@ -16,13 +16,15 @@ export const OPENAI_TOOLS: OpenAITool[] = [
     type: "function",
     function: {
       name: "list_dir",
-      description: "List files and directories at a path (relative to workspace).",
+      description:
+        "List files and directories at a path (relative to workspace). Omit target_directory or use '.' for workspace root. Do not re-list a path you already listed.",
       parameters: {
         type: "object",
         properties: {
           target_directory: {
             type: "string",
-            description: "Directory path, default '.'",
+            description: "Directory path relative to workspace. Default: '.'",
+            default: ".",
           },
         },
         required: [],
@@ -33,7 +35,8 @@ export const OPENAI_TOOLS: OpenAITool[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a text file. Optional line offset/limit for large files.",
+      description:
+        "Read a text file. Optional line offset/limit for large files. Do not re-read the same file unless it may have changed.",
       parameters: {
         type: "object",
         properties: {

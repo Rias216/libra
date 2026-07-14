@@ -109,7 +109,13 @@ function assert(cond: unknown, msg: string): void {
   });
   assert(params.mode === "param", "param mode after /thinking ");
   assert(
-    params.items.some((i) => i.label === "on" || i.label === "off"),
+    params.items.some(
+      (i) =>
+        i.insert === "on" ||
+        i.insert === "off" ||
+        /^on$/i.test(i.label) ||
+        /^off$/i.test(i.label),
+    ),
     "suggests on/off",
   );
 

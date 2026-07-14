@@ -8,7 +8,10 @@ import { PROVIDERS } from "../auth/types.js";
 import { CUSTOM_REASONING_OPTIONS } from "../agent/config.js";
 
 export interface SlashParamValue {
+  /** Inserted into the prompt / accepted by the command handler */
   value: string;
+  /** Display label in the suggestion popup (defaults to value) */
+  label?: string;
   description?: string;
 }
 
@@ -29,16 +32,19 @@ export interface SlashCommand {
 
 export const THEME_VALUES: SlashParamValue[] = listThemes().map((t) => ({
   value: t.name,
+  label: t.displayName,
   description: t.description ?? t.displayName,
 }));
 
 export const FONT_VALUES: SlashParamValue[] = FONT_PROFILES.map((f) => ({
   value: f.name,
+  label: f.displayName,
   description: f.description,
 }));
 
 export const PROVIDER_VALUES: SlashParamValue[] = PROVIDERS.map((p) => ({
   value: p.id,
+  label: p.name,
   description: p.description,
 }));
 
@@ -46,16 +52,53 @@ export const PROVIDER_VALUES: SlashParamValue[] = PROVIDERS.map((p) => ({
 export const MODEL_VALUES: SlashParamValue[] = [];
 
 export const ON_OFF: SlashParamValue[] = [
-  { value: "on", description: "Enable" },
-  { value: "off", description: "Disable" },
+  { value: "on", label: "On", description: "Enable" },
+  { value: "off", label: "Off", description: "Disable" },
 ];
 
 /** Static harness modes only — effort enums come from live model caps. */
 export const CUSTOM_REASONING_VALUES: SlashParamValue[] =
   CUSTOM_REASONING_OPTIONS.map((o) => ({
     value: o.value,
+    label: o.label,
     description: o.description,
   }));
+
+/** Matches /subagent picker rows (insertable args). */
+export const SUBAGENT_ACTION_VALUES: SlashParamValue[] = [
+  { value: "on", label: "Enabled on", description: "Turn subagents on" },
+  { value: "off", label: "Enabled off", description: "Turn subagents off" },
+  {
+    value: "toggle",
+    label: "Enabled",
+    description: "Toggle subagents on/off",
+  },
+  {
+    value: "auto",
+    label: "Auto-spawn",
+    description: "Toggle auto-spawn for complex tasks",
+  },
+  {
+    value: "max",
+    label: "Max concurrent",
+    description: "Cycle max concurrent subagents",
+  },
+  {
+    value: "roles",
+    label: "Roles",
+    description: "Edit subagent roles",
+  },
+  {
+    value: "model",
+    label: "Preferred model",
+    description: "Pick preferred subagent model",
+  },
+  {
+    value: "reset",
+    label: "Reset defaults",
+    description: "Restore default roles and limits",
+  },
+];
 
 export const SLASH_COMMANDS: SlashCommand[] = [
   {
@@ -124,6 +167,13 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     aliases: ["subagents", "agents"],
     description: "Configure subagents (roles, concurrency, auto-spawn)",
     picker: "select",
+    params: [
+      {
+        name: "action",
+        description: "Menu action (same as the subagent tab)",
+        values: SUBAGENT_ACTION_VALUES,
+      },
+    ],
   },
   {
     name: "login",

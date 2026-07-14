@@ -63,9 +63,18 @@ function harvestMessage(
       }
     } else if (part.type === "tool") {
       tools.add(part.toolName);
-      for (const v of Object.values(part.args)) {
-        if (typeof v === "string" && (v.includes("/") || v.includes("\\") || v.includes("."))) {
-          paths.add(v.replace(/\\/g, "/"));
+      for (const [k, v] of Object.entries(part.args)) {
+        if (typeof v !== "string" || !v.trim()) continue;
+        const s = v.replace(/\\/g, "/").trim();
+        // Path-like keys always harvest (even single segment: "src", "package.json")
+        if (
+          /(?:file|path|dir|directory|glob|target)/i.test(k) ||
+          s.includes("/") ||
+          s.includes(".") ||
+          s === "."
+        ) {
+          if (s !== "." && s !== "./") paths.add(s);
+          else if (s === "." || s === "./") paths.add(".");
         }
       }
     } else if (part.type === "file" || part.type === "diff") {

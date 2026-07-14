@@ -36,7 +36,7 @@ export function layoutPopup(
     result.mode === "command"
       ? "Commands"
       : result.mode === "param"
-        ? "Parameters"
+        ? "Options"
         : result.mode === "file"
           ? "Files"
           : "Suggestions";

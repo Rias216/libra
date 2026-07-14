@@ -64,9 +64,12 @@ function segsToRows(lines: RenderLine[]): Row[] {
 }
 
 function renderText(part: TextPart, theme: Theme, width: number): Row[] {
-  const rows = segsToRows(renderMarkdown(part.content, theme, width));
+  // Streaming: plain wrap only — full markdown on the finished part is much
+  // cheaper and avoids re-parsing the whole answer every token.
+  const rows = part.streaming
+    ? wrapPlainRows(part.content, theme.fg, width)
+    : segsToRows(renderMarkdown(part.content, theme, width));
   if (part.streaming) {
-    // caret on last line
     if (rows.length === 0) {
       rows.push({
         segments: [{ text: "|", style: { fg: theme.accentAssistant } }],
@@ -78,6 +81,52 @@ function renderText(part: TextPart, theme: Theme, width: number): Row[] {
         { text: "|", style: { fg: theme.accentAssistant } },
       ];
     }
+  }
+  return rows;
+}
+
+/** Fast word/line wrap without markdown — used while tokens stream in. */
+function wrapPlainRows(
+  content: string,
+  fg: Theme["fg"],
+  width: number,
+): Row[] {
+  if (!content) return [];
+  const rows: Row[] = [];
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  for (const line of lines) {
+    if (!line) {
+      rows.push({ segments: [] });
+      continue;
+    }
+    let col = 0;
+    let buf = "";
+    const flush = () => {
+      if (buf) {
+        rows.push({ segments: [{ text: buf, style: { fg } }] });
+        buf = "";
+        col = 0;
+      } else if (rows.length === 0) {
+        rows.push({ segments: [] });
+      }
+    };
+    for (let i = 0; i < line.length; ) {
+      const code = line.codePointAt(i)!;
+      const ch = String.fromCodePoint(code);
+      i += code > 0xffff ? 2 : 1;
+      const w = stringWidth(ch);
+      if (w <= 0) continue;
+      if (col + w > width && buf) {
+        rows.push({ segments: [{ text: buf, style: { fg } }] });
+        buf = ch;
+        col = w;
+      } else {
+        buf += ch;
+        col += w;
+      }
+    }
+    if (buf) rows.push({ segments: [{ text: buf, style: { fg } }] });
+    else flush();
   }
   return rows;
 }
@@ -110,6 +159,30 @@ function renderReasoning(
   if (collapsed) return rows;
 
   const bodyWidth = Math.max(1, width - 2);
+  // Streaming thoughts: plain wrap; finished: markdown
+  if (part.streaming) {
+    const plain = wrapPlainRows(part.content || "...", theme.fgMuted, bodyWidth);
+    for (const line of plain) {
+      rows.push({
+        segments: [
+          { text: "| ", style: { fg: theme.border } },
+          ...line.segments.map((s) => ({
+            text: s.text,
+            style: { ...s.style, italic: true },
+          })),
+        ],
+      });
+    }
+    const last = rows[rows.length - 1];
+    if (last) {
+      last.segments.push({
+        text: "|",
+        style: { fg: theme.thinking },
+      });
+    }
+    return rows;
+  }
+
   const body = renderMarkdown(part.content || "...", theme, bodyWidth);
   for (const line of body) {
     rows.push({
@@ -121,15 +194,6 @@ function renderReasoning(
         })),
       ],
     });
-  }
-  if (part.streaming) {
-    const last = rows[rows.length - 1];
-    if (last) {
-      last.segments.push({
-        text: "|",
-        style: { fg: theme.thinking },
-      });
-    }
   }
   return rows;
 }
