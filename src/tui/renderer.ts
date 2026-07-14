@@ -50,7 +50,6 @@ import {
 import { renderDivider, renderHeader, renderStatus } from "./chrome.js";
 import { computeScrollbar, scrollPercent } from "./scrollbar.js";
 import { decodeInput, type KeyEvent } from "./input.js";
-import type { Row } from "./components/parts.js";
 import {
   createPicker,
   layoutPicker,
@@ -83,6 +82,9 @@ import {
   type ModalInputSpec,
   type ModalInputState,
 } from "./modal-input.js";
+import { copyText } from "./clipboard.js";
+import type { Row } from "./components/parts.js";
+import { loadAgentSettings } from "../agent/config.js";
 
 export interface RendererOptions {
   theme?: string;
@@ -135,6 +137,24 @@ export class TuiRenderer {
   private themeBeforePreview: string | null = null;
   private lastDocLen = 0;
   private lastScrollH = 0;
+  /** Plain-text lines of last painted scrollback document (for selection copy) */
+  private lastDocPlain: string[] = [];
+  /** Geometry of last paint (for mouse hit-testing) */
+  private layout = {
+    padX: 2,
+    scrollTop: 0,
+    scrollH: 0,
+    contentWidth: 80,
+  };
+  /** Text selection in document coords (line + column in plain text) */
+  private selection: {
+    active: boolean;
+    anchorLine: number;
+    anchorCol: number;
+    focusLine: number;
+    focusCol: number;
+  } | null = null;
+  private copyFlash: string | null = null;
 
   constructor(opts: RendererOptions = {}) {
     this.opts = opts;
@@ -348,7 +368,14 @@ export class TuiRenderer {
 
     this.timer = setInterval(() => {
       this.tick++;
-      if (this.state && (this.state.phase !== "idle" || this.hasStreaming())) {
+      if (!this.state) return;
+      // Always repaint when Ultra/Fusion glow is active so the sweep animates
+      if (
+        this.state.phase !== "idle" ||
+        this.hasStreaming() ||
+        this.hasUltraGlow() ||
+        this.copyFlash
+      ) {
         this.paint();
       }
     }, 33);
@@ -398,6 +425,16 @@ export class TuiRenderer {
       }
     }
     return false;
+  }
+
+  /** True when bottom-right Ultra glow should animate. */
+  private hasUltraGlow(): boolean {
+    try {
+      const c = loadAgentSettings().reasoning.custom;
+      return c === "ultra" || c === "ultra-fusion";
+    } catch {
+      return false;
+    }
   }
 
   private refreshComplete(): void {
@@ -465,8 +502,9 @@ export class TuiRenderer {
       return;
     }
 
-    // Ignore other mouse events (clicks/drags) — keyboard drives the UI
+    // Mouse: selection in scrollback (auto-copy plain content, not TUI chrome)
     if (ev.name === "mouse") {
+      this.handleMouse(ev);
       return;
     }
 
@@ -524,6 +562,112 @@ export class TuiRenderer {
    * Positive = down (newer), negative = up (older history / prior replies).
    * Wheel + Up/Down always use this — never prompt history.
    */
+  /**
+   * Left-drag in the scrollback pane selects plain message text and
+   * auto-copies on release (no header/prompt/status chrome).
+   */
+  private handleMouse(ev: KeyEvent): void {
+    // Don't fight pickers/modals
+    if (this.picker || this.modal) return;
+    if (ev.button !== 0 && !ev.drag) return; // left button only
+    const x = (ev.x ?? 1) - 1; // 0-based
+    const y = (ev.y ?? 1) - 1;
+    const { padX, scrollTop, scrollH, contentWidth } = this.layout;
+    const inScroll =
+      y >= scrollTop &&
+      y < scrollTop + scrollH &&
+      x >= padX &&
+      x < padX + contentWidth;
+    if (!inScroll) {
+      if (ev.release && this.selection?.active) {
+        this.finishSelectionCopy();
+      }
+      return;
+    }
+
+    const docLine = this.scrollOffset + (y - scrollTop);
+    const col = Math.max(0, x - padX);
+    const line = Math.max(0, Math.min(docLine, this.lastDocPlain.length - 1));
+
+    if (!ev.release && !ev.drag) {
+      // Press — start selection
+      this.selection = {
+        active: true,
+        anchorLine: line,
+        anchorCol: col,
+        focusLine: line,
+        focusCol: col,
+      };
+      this.following = false;
+      this.paint();
+      return;
+    }
+
+    if (ev.drag && this.selection) {
+      this.selection.focusLine = line;
+      this.selection.focusCol = col;
+      this.selection.active = true;
+      this.paint();
+      return;
+    }
+
+    if (ev.release && this.selection) {
+      this.selection.focusLine = line;
+      this.selection.focusCol = col;
+      this.finishSelectionCopy();
+    }
+  }
+
+  private finishSelectionCopy(): void {
+    const sel = this.selection;
+    if (!sel) return;
+    const text = this.selectionPlainText(sel);
+    this.selection = {
+      ...sel,
+      active: false,
+    };
+    if (text.trim()) {
+      copyText(text, this.stdout);
+      this.copyFlash = "copied";
+      setTimeout(() => {
+        if (this.copyFlash === "copied") {
+          this.copyFlash = null;
+          this.paint();
+        }
+      }, 1500);
+    }
+    this.paint();
+  }
+
+  private selectionPlainText(sel: {
+    anchorLine: number;
+    anchorCol: number;
+    focusLine: number;
+    focusCol: number;
+  }): string {
+    const lines = this.lastDocPlain;
+    if (lines.length === 0) return "";
+    let aL = sel.anchorLine;
+    let aC = sel.anchorCol;
+    let bL = sel.focusLine;
+    let bC = sel.focusCol;
+    if (aL > bL || (aL === bL && aC > bC)) {
+      [aL, bL] = [bL, aL];
+      [aC, bC] = [bC, aC];
+    }
+    aL = Math.max(0, Math.min(aL, lines.length - 1));
+    bL = Math.max(0, Math.min(bL, lines.length - 1));
+    if (aL === bL) {
+      const line = lines[aL] ?? "";
+      return line.slice(aC, bC);
+    }
+    const out: string[] = [];
+    out.push((lines[aL] ?? "").slice(aC));
+    for (let i = aL + 1; i < bL; i++) out.push(lines[i] ?? "");
+    out.push((lines[bL] ?? "").slice(0, bC));
+    return out.join("\n");
+  }
+
   private scrollTranscript(delta: number): void {
     if (delta === 0) return;
     const max = Math.max(0, this.lastDocLen - this.lastScrollH);
@@ -569,7 +713,7 @@ export class TuiRenderer {
         this.paint();
         break;
       case "left":
-        // Change value / toggle — does NOT move selection
+        // Switch hovered item value only — never move hover
         pickerCycle(this.picker, -1);
         this.paint();
         break;
@@ -606,7 +750,7 @@ export class TuiRenderer {
         break;
       case "char":
         if (ev.char === " ") {
-          // Space: toggle / activate value — stay in the tab
+          // Space: cycle/toggle hovered value (+1) — never type into search, never move hover
           pickerActivate(this.picker);
           this.paint();
         } else if (ev.char === "j" && !searching && !this.picker.query) {
@@ -616,8 +760,12 @@ export class TuiRenderer {
           pickerMove(this.picker, -1, view);
           this.paint();
         } else if (ev.char && ev.char >= " ") {
-          // Type-to-search (large lists like OpenRouter models)
-          if (searching || this.picker.query.length > 0 || this.picker.spec.options.length > 12) {
+          // Type-to-search (large lists) — space is reserved for toggle above
+          if (
+            searching ||
+            this.picker.query.length > 0 ||
+            this.picker.spec.options.length > 12
+          ) {
             pickerType(this.picker, ev.char, view);
             this.paint();
           }
@@ -762,13 +910,9 @@ export class TuiRenderer {
   }
 
   private handlePromptKey(ev: KeyEvent): void {
-    // Complete tab navigation — same hover keys as full pickers
+    // Autocomplete tab: up/down move hover; left/right/space switch value (accept item)
     if (this.completeOpen && this.completeResult.items.length > 0) {
-      if (
-        ev.name === "up" ||
-        ev.name === "left" ||
-        ev.name === "ctrl+p"
-      ) {
+      if (ev.name === "up" || ev.name === "ctrl+p") {
         this.completeSelected = clampSelected(
           this.completeSelected - 1,
           this.completeResult.items.length,
@@ -776,11 +920,7 @@ export class TuiRenderer {
         this.paint();
         return;
       }
-      if (
-        ev.name === "down" ||
-        ev.name === "right" ||
-        ev.name === "ctrl+n"
-      ) {
+      if (ev.name === "down" || ev.name === "ctrl+n") {
         this.completeSelected = clampSelected(
           this.completeSelected + 1,
           this.completeResult.items.length,
@@ -788,12 +928,36 @@ export class TuiRenderer {
         this.paint();
         return;
       }
-      // Space: move hover only (do not insert space / leave the tab)
-      if (ev.name === "char" && ev.char === " ") {
+      // Left / right: cycle which item is active (switch value under hover list)
+      // — does not leave the tab; updates the filled arg when accepting
+      if (ev.name === "left") {
+        this.completeSelected = clampSelected(
+          this.completeSelected - 1,
+          this.completeResult.items.length,
+        );
+        this.acceptComplete();
+        // keep complete open for further cycling
+        this.completeOpen = true;
+        this.refreshComplete();
+        this.paint();
+        return;
+      }
+      if (ev.name === "right") {
         this.completeSelected = clampSelected(
           this.completeSelected + 1,
           this.completeResult.items.length,
         );
+        this.acceptComplete();
+        this.completeOpen = true;
+        this.refreshComplete();
+        this.paint();
+        return;
+      }
+      // Space: apply hovered value into the prompt (toggle/set value)
+      if (ev.name === "char" && ev.char === " ") {
+        this.acceptComplete();
+        this.completeOpen = true;
+        this.refreshComplete();
         this.paint();
         return;
       }
@@ -1067,6 +1231,9 @@ export class TuiRenderer {
     const doc = buildScrollRows(state, this.theme, contentWidth, this.tick);
     this.lastDocLen = doc.length;
     this.lastScrollH = scrollH;
+    this.lastDocPlain = doc.map((row) =>
+      row.segments.map((s) => s.text).join(""),
+    );
 
     // Follow tail only when pinned; otherwise keep absolute line offset so
     // scrolling walks the full transcript (user + assistant + tools), not
@@ -1093,10 +1260,14 @@ export class TuiRenderer {
     }
 
     const scrollTop = y;
+    this.layout = { padX, scrollTop, scrollH, contentWidth };
     const view = doc.slice(this.scrollOffset, this.scrollOffset + scrollH);
     for (let i = 0; i < scrollH; i++) {
       const row = view[i];
-      if (row) this.paintRow(padX, y, row, contentWidth);
+      const docLine = this.scrollOffset + i;
+      if (row) {
+        this.paintRow(padX, y, row, contentWidth, docLine);
+      }
       y++;
     }
 
@@ -1154,10 +1325,15 @@ export class TuiRenderer {
     }
 
     const sp = scrollPercent(this.scrollOffset, doc.length, scrollH);
+    // Overlay brief "copied" toast without mutating store
+    const statusState =
+      this.copyFlash && state.phase === "idle"
+        ? { ...state, activityLabel: this.copyFlash }
+        : state;
     this.paintRow(
       padX,
       rows - 1,
-      renderStatus(state, this.theme, contentWidth, this.tick, this.focus, {
+      renderStatus(statusState, this.theme, contentWidth, this.tick, this.focus, {
         scroll: sp,
         completeOpen: this.completeOpen && !this.picker && !this.modal,
         pickerOpen: Boolean(this.picker || this.modal),
@@ -1184,17 +1360,71 @@ export class TuiRenderer {
     this.stdout.write(payload);
   }
 
-  private paintRow(x: number, y: number, row: Row, maxWidth: number): void {
+  private paintRow(
+    x: number,
+    y: number,
+    row: Row,
+    maxWidth: number,
+    docLine?: number,
+  ): void {
     let col = x;
     const end = x + maxWidth;
+    let textCol = 0; // column within plain line
     for (const seg of row.segments) {
       if (col >= end) break;
-      const written = this.buf.write(col, y, seg.text, {
+      const style = {
         ...seg.style,
         bg: seg.style.bg ?? this.theme.bg,
-      });
-      col += written;
-      if (written < (seg.text ? 1 : 0) && seg.text) break;
+      };
+      // Per-character paint when selection intersects this line
+      if (
+        docLine !== undefined &&
+        this.selection &&
+        this.lineInSelection(docLine)
+      ) {
+        for (const ch of [...seg.text]) {
+          if (col >= end) break;
+          const selected = this.cellSelected(docLine, textCol);
+          const w = this.buf.write(col, y, ch, {
+            ...style,
+            bg: selected ? this.theme.selection : style.bg,
+            inverse: selected ? true : style.inverse,
+          });
+          col += w;
+          textCol += w > 0 ? 1 : 0;
+        }
+      } else {
+        const written = this.buf.write(col, y, seg.text, style);
+        col += written;
+        textCol += [...seg.text].length;
+        if (written < (seg.text ? 1 : 0) && seg.text) break;
+      }
     }
+  }
+
+  private lineInSelection(docLine: number): boolean {
+    const sel = this.selection;
+    if (!sel) return false;
+    const lo = Math.min(sel.anchorLine, sel.focusLine);
+    const hi = Math.max(sel.anchorLine, sel.focusLine);
+    return docLine >= lo && docLine <= hi;
+  }
+
+  private cellSelected(docLine: number, col: number): boolean {
+    const sel = this.selection;
+    if (!sel) return false;
+    let aL = sel.anchorLine;
+    let aC = sel.anchorCol;
+    let bL = sel.focusLine;
+    let bC = sel.focusCol;
+    if (aL > bL || (aL === bL && aC > bC)) {
+      [aL, bL] = [bL, aL];
+      [aC, bC] = [bC, aC];
+    }
+    if (docLine < aL || docLine > bL) return false;
+    if (aL === bL) return col >= aC && col < bC;
+    if (docLine === aL) return col >= aC;
+    if (docLine === bL) return col < bC;
+    return true;
   }
 }

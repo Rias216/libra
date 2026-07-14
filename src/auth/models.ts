@@ -44,13 +44,29 @@ export function modelKey(ref: ModelRef): string {
   return `${ref.provider}/${ref.model}`;
 }
 
+/**
+ * Parse "provider/model/id" keys.
+ * Provider is only the first segment when it matches a known ProviderId
+ * (so openrouter/tencent/hy3 → provider=openrouter, model=tencent/hy3).
+ */
 export function parseModelKey(key: string): ModelRef | null {
-  const i = key.indexOf("/");
+  const raw = key.trim();
+  if (!raw) return null;
+  const i = raw.indexOf("/");
   if (i <= 0) return null;
-  const provider = key.slice(0, i) as ProviderId;
-  const model = key.slice(i + 1);
+  const provider = raw.slice(0, i) as ProviderId;
+  const model = raw.slice(i + 1).trim();
   if (!getProvider(provider) || !model) return null;
+  // Reject accidental cycle-encoding from pickers
+  if (model.includes("::")) return null;
   return { provider, model };
+}
+
+/** True when this provider/model exists in the live catalog cache (if loaded). */
+export function isKnownModel(provider: ProviderId, model: string): boolean {
+  const list = cache.get(provider)?.models;
+  if (!list || list.length === 0) return true; // unknown catalog — allow
+  return list.some((m) => m.id === model);
 }
 
 export function clearModelCache(provider?: ProviderId): void {

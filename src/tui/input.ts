@@ -46,6 +46,14 @@ export interface KeyEvent {
   shift?: boolean;
   /** Wheel lines (positive = down) */
   wheelDelta?: number;
+  /** Mouse: button (0=left, 1=middle, 2=right), 1-based cell coords */
+  button?: number;
+  x?: number;
+  y?: number;
+  /** true on button release (SGR trailing `m`) */
+  release?: boolean;
+  /** motion/drag with button held */
+  drag?: boolean;
   raw: string;
 }
 
@@ -142,24 +150,42 @@ function matchEscape(
   const sgr = rest.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
   if (sgr) {
     const btn = Number(sgr[1]);
+    const x = Number(sgr[2]);
+    const y = Number(sgr[3]);
+    const release = sgr[4] === "m";
     const raw = sgr[0]!;
     const len = raw.length;
-    // Wheel: 64 = up, 65 = down. Modifiers or in as +4/+8/+16.
+    // Modifiers: +4 shift, +8 meta, +16 ctrl — strip for core button
+    const mods = btn & 0x1c;
     const core = btn & ~0x1c;
+    // Wheel: 64 = up, 65 = down (sometimes 66/67)
     if (core === 64 || core === 65 || core === 66 || core === 67) {
       const down = core === 65 || core === 67;
       return {
         event: {
           name: down ? "wheeldown" : "wheelup",
           wheelDelta: down ? 3 : -3,
+          x,
+          y,
           raw,
         },
         len,
       };
     }
-    // Clicks / drags — ignored by the app (keyboard drives UI)
+    // 32 = motion with button held (drag), 35 = motion no button
+    const drag = core >= 32;
+    const button = drag ? core - 32 : core;
     return {
-      event: { name: "mouse", raw },
+      event: {
+        name: "mouse",
+        button,
+        x,
+        y,
+        release,
+        drag,
+        shift: Boolean(mods & 4),
+        raw,
+      },
       len,
     };
   }

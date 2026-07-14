@@ -64,6 +64,12 @@ async function main(): Promise<void> {
   // Model key helpers
   assert(modelKey({ provider: "xai", model: "grok-4.5" }) === "xai/grok-4.5");
   assert(parseModelKey("openai/gpt-4.1")?.model === "gpt-4.1");
+  assert(
+    parseModelKey("openrouter/tencent/hy3")?.model === "tencent/hy3",
+    "openrouter multi-slash model ids",
+  );
+  assert(parseModelKey("openrouter/tencent/hy3")?.provider === "openrouter");
+  assert(parseModelKey("xai/foo::bar") === null, "reject cycle encoding");
 
   const sample: RemoteModel[] = [
     { id: "fast-mini", name: "mini", provider: "xai" },
@@ -96,7 +102,9 @@ async function main(): Promise<void> {
   });
   assert(fusion.reasoning.custom === "ultra-fusion", "ultra-fusion mode");
   assert(fusion.reasoning.fusion.reasoningOnly === true, "fusion reasoning only");
-  assert(fusion.reasoning.fusion.modelKeys.length === 2, "fusion roster");
+  // Hard cap: one peer only (extra keys trimmed on save)
+  assert(fusion.reasoning.fusion.modelKeys.length === 1, "fusion peer cap 1");
+  assert(fusion.reasoning.fusion.maxParallel === 1, "maxParallel forced to 1");
   assert(fusion.subagents.autoSpawn, "ultra-fusion forces autoSpawn");
   assert(
     CUSTOM_REASONING_OPTIONS.some((o) => o.value === "ultra-fusion"),

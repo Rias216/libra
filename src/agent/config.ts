@@ -125,16 +125,19 @@ export const DEFAULT_SUBAGENT_ROLES: SubagentRole[] = [
   },
 ];
 
+/** Hard cap: one peer reasoner + main (never more). */
+export const FUSION_MAX_SECONDARIES = 1;
+
 export const DEFAULT_FUSION: FusionConfig = {
   modelKeys: [],
   judgeModelKey: undefined,
   minModels: 1,
-  maxParallel: 3,
-  reasoningOnly: true, // secondaries only
+  maxParallel: FUSION_MAX_SECONDARIES,
+  reasoningOnly: true, // phase-1 reasoners only
   analysisInstructions:
     "Reason step-by-step. Cover risks, alternatives, and a concrete executable plan. No tool use in this pass.",
   fuseInstructions:
-    "Compare your first-pass reasoning with every secondary trace. Keep only what is correct, valuable, and actionable. Merge into one plan, then execute with tools.",
+    "Compare your first-pass reasoning with the peer trace. Keep only what is correct, valuable, and actionable. Merge into one plan, then execute with tools.",
 };
 
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
@@ -237,8 +240,16 @@ export function saveAgentSettings(partial: {
       next.reasoning.effort = "max";
     }
   }
-  // Fusion is reasoning-only by product rule
+  // Fusion: peer reasoners only in phase 1; hard-cap one additional agent
   next.reasoning.fusion.reasoningOnly = true;
+  next.reasoning.fusion.maxParallel = FUSION_MAX_SECONDARIES;
+  next.reasoning.fusion.minModels = 1;
+  if (next.reasoning.fusion.modelKeys.length > FUSION_MAX_SECONDARIES) {
+    next.reasoning.fusion.modelKeys = next.reasoning.fusion.modelKeys.slice(
+      0,
+      FUSION_MAX_SECONDARIES,
+    );
+  }
 
   saveConfig({ agent: next } as Partial<LibraConfig>);
   return next;

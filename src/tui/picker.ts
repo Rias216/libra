@@ -175,43 +175,55 @@ export function pickerAccept(p: PickerState): boolean {
   return p.spec.closeOnSelect !== false;
 }
 
-/** Space — activate/toggle without closing */
+/**
+ * Space — toggle / cycle the hovered row's value (+1). Never moves hover.
+ * Stays open.
+ */
 export function pickerActivate(p: PickerState): void {
-  const opts = filteredOptions(p);
-  const opt = opts[p.selected];
-  if (!opt) return;
-  if (p.spec.onActivate) p.spec.onActivate(opt.value);
-  else p.spec.onSelect(opt.value);
+  pickerCycle(p, 1);
 }
 
-/** Left/right — cycle value on row or call onCycle */
+/**
+ * Left/right (and space→+1) — switch the value of the hovered item only.
+ * Never moves selection to another row.
+ *
+ * Priority:
+ *  1. cycleValues on the option (built-in enum)
+ *  2. onCycle(value, dir) callback
+ *  3. no-op (do not call onSelect — that would "pick" a leaf)
+ */
 export function pickerCycle(p: PickerState, dir: -1 | 1): boolean {
   const opts = filteredOptions(p);
   const opt = opts[p.selected];
   if (!opt) return false;
 
+  // Prefer explicit onCycle (settings that rebuild the menu)
   if (p.spec.onCycle) {
     p.spec.onCycle(opt.value, dir);
     return true;
   }
 
-  // Built-in cycleValues on the option
+  // Built-in cycleValues — advance and keep cycleIndex in sync for display
   if (opt.cycleValues && opt.cycleValues.length > 0) {
     const n = opt.cycleValues.length;
     const cur = opt.cycleIndex ?? 0;
     const next = (cur + dir + n * 10) % n;
+    opt.cycleIndex = next;
+    const full = p.spec.options.find((o) => o.value === opt.value);
+    if (full) full.cycleIndex = next;
+
     const nextVal = opt.cycleValues[next]!;
-    // Encode as value|cycle so callers can parse, or use onActivate with next
-    if (p.spec.onActivate) p.spec.onActivate(`${opt.value}::${nextVal}`);
-    else p.spec.onSelect(`${opt.value}::${nextVal}`);
+    const label = opt.cycleLabels?.[next] ?? nextVal;
+    opt.description = label;
+    if (full) full.description = label;
+
+    if (p.spec.onActivate) {
+      p.spec.onActivate(`${opt.value}::${nextVal}`);
+    }
     return true;
   }
 
-  // Default: treat as soft activate (toggle) so left/right still do something useful
-  if (p.spec.onActivate) {
-    p.spec.onActivate(opt.value);
-    return true;
-  }
+  // No cyclable value on this row — leave hover alone, do nothing
   return false;
 }
 
@@ -409,8 +421,8 @@ export function layoutPicker(
       {
         text: truncate(
           searchable
-            ? ` up/down  space  left/right  type=search  enter  ${escHint}`
-            : ` up/down  space  left/right  enter  ${escHint}`,
+            ? ` up/down hover  space/left/right value  type  enter  ${escHint}`
+            : ` up/down hover  space/left/right value  enter  ${escHint}`,
           inner,
         ),
         style: { fg: theme.fgFaint, bg: theme.bgElevated },

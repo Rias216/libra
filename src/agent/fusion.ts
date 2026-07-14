@@ -20,13 +20,13 @@ import {
   modelKey,
 } from "../auth/models.js";
 import {
+  FUSION_MAX_SECONDARIES,
   loadAgentSettings,
   type FusionConfig,
 } from "./config.js";
 import {
   buildReasoningApiFields,
   rankModelsByNativeReasoning,
-  setMaxEffortForModel,
 } from "./reasoning.js";
 
 export interface FusionCandidate {
@@ -56,53 +56,31 @@ Be concrete and structured. Output an executable plan.
 No filler. No tool calls.`;
 
 /**
- * Resolve secondary reasoner model keys (NOT the main executor).
- * Uses config.modelKeys when set; otherwise auto-picks strong reasoners
- * other than the main session model.
+ * Resolve the single peer reasoner (NOT the main executor).
+ * Hard cap: 1 additional agent. Uses fusion.modelKeys[0] or auto-picks.
  */
 export async function resolveSecondaryReasoners(
   fusion: FusionConfig,
   mainKey: string,
 ): Promise<string[]> {
-  const max = Math.max(1, fusion.maxParallel || 2);
+  const max = FUSION_MAX_SECONDARIES; // always 1
   const configured = fusion.modelKeys.filter((k) => k && k !== mainKey);
 
   if (configured.length > 0) {
-    for (const key of configured.slice(0, max)) {
-      const ref = parseModelKey(key);
-      if (ref) setMaxEffortForModel(ref.provider, ref.model);
-    }
-    return configured.slice(0, max);
+    return [configured[0]!];
   }
 
   const { models } = await fetchAllConnectedModels({ force: false });
   if (models.length === 0) return [];
 
   const scored = rankModelsByNativeReasoning(models);
-  const picked: string[] = [];
-  const seenProv = new Set<string>();
-
   for (const m of scored) {
-    if (picked.length >= max) break;
     const key = modelKey({ provider: m.provider, model: m.id });
     if (key === mainKey) continue;
-    // Prefer distinct providers for diversity
-    if (!seenProv.has(m.provider) || picked.length === 0) {
-      picked.push(key);
-      seenProv.add(m.provider);
-      setMaxEffortForModel(m.provider, m.id);
-    }
-  }
-  // Fill remaining even from same provider
-  for (const m of scored) {
-    if (picked.length >= max) break;
-    const key = modelKey({ provider: m.provider, model: m.id });
-    if (key === mainKey || picked.includes(key)) continue;
-    picked.push(key);
-    setMaxEffortForModel(m.provider, m.id);
+    return [key];
   }
 
-  return picked;
+  return [];
 }
 
 /**
@@ -125,9 +103,6 @@ export async function prepareFusionForMain(
       "Fusion needs at least one secondary reasoner model (different from the main model). Connect another provider or pick models in /reasoning → Ultra + Fusion.",
     );
   }
-
-  // Pin max native effort on main for its reasoning pass too
-  setMaxEffortForModel(mainProvider, mainModel);
 
   store.setPhase(
     "thinking",
@@ -358,10 +333,8 @@ async function completeOpenAI(
     ],
     temperature: 0.3,
   };
-  Object.assign(
-    body,
-    buildReasoningApiFields(provider, model, { forceMax: true }),
-  );
+  // Use per-model effort from settings (main + peer independently configurable)
+  Object.assign(body, buildReasoningApiFields(provider, model));
 
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -396,7 +369,7 @@ async function completeGemini(
   const base = baseUrl || "https://generativelanguage.googleapis.com/v1beta";
   const id = model.replace(/^models\//, "");
   const url = `${base}/models/${id}:generateContent?key=${encodeURIComponent(token)}`;
-  const native = buildReasoningApiFields("gemini", model, { forceMax: true });
+  const native = buildReasoningApiFields("gemini", model);
   const genCfg = native.generationConfig as Record<string, unknown> | undefined;
   const res = await fetch(url, {
     method: "POST",
@@ -429,7 +402,7 @@ async function completeAnthropic(
   user: string,
 ): Promise<string> {
   const base = baseUrl || "https://api.anthropic.com";
-  const native = buildReasoningApiFields("anthropic", model, { forceMax: true });
+  const native = buildReasoningApiFields("anthropic", model);
   const thinking = native.thinking as
     | { type: string; budget_tokens: number }
     | undefined;

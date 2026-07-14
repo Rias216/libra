@@ -23,13 +23,13 @@ export const ansi = {
   underline: `${CSI}4m`,
   inverse: `${CSI}7m`,
   /**
-   * Mouse tracking for scroll wheel only.
-   * 1000 = button events (includes wheel as btn 64/65)
+   * Mouse tracking:
+   * 1000 = button events (wheel + click)
+   * 1002 = drag/motion while button held (for text selection)
    * 1006 = SGR encoding (reliable coords / buttons)
-   * We intentionally skip 1002/1003 (drag/motion) so we don't steal everything.
    */
-  mouseOn: `${CSI}?1000h${CSI}?1006h`,
-  mouseOff: `${CSI}?1000l${CSI}?1006l`,
+  mouseOn: `${CSI}?1000h${CSI}?1002h${CSI}?1006h`,
+  mouseOff: `${CSI}?1000l${CSI}?1002l${CSI}?1006l`,
   move(row: number, col: number): string {
     return `${CSI}${row};${col}H`;
   },
