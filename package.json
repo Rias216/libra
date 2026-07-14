@@ -1,0 +1,47 @@
+{
+  "name": "libra",
+  "version": "0.1.0",
+  "description": "Custom TUI renderer for an AI coding harness — inspired by OpenCode and Grok CLI",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "libra": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "demo": "tsx src/cli.ts",
+    "test": "tsx src/tui/buffer.test.ts && tsx src/auth/auth.test.ts",
+    "test:auth": "tsx src/auth/auth.test.ts",
+    "test:auth:live": "tsx src/auth/auth.test.ts --live",
+    "bench:openrouter": "tsx scripts/benchmark-openrouter.ts",
+    "smoke:agent": "tsx scripts/smoke-agent.ts"
+  },
+  "keywords": [
+    "tui",
+    "ai",
+    "harness",
+    "terminal",
+    "agent",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "string-width": "^7.2.0",
+    "strip-ansi": "^7.1.0",
+    "wrap-ansi": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
