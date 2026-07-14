@@ -126,6 +126,8 @@ export class TuiRenderer {
   private completeSelected = 0;
   private completeOpen = false;
   private picker: PickerState | null = null;
+  /** Nested pickers — Escape pops back instead of exiting the whole tab */
+  private pickerStack: PickerState[] = [];
   private modal: ModalInputState | null = null;
   private font: FontProfile;
   private glyphs: GlyphSet;
@@ -206,11 +208,34 @@ export class TuiRenderer {
 
   /**
    * Open an OpenCode-style settings picker (modal).
+   * If a picker is already open, the current one is stacked so Escape goes back.
    * Pass onPreview for live theme/font preview.
    */
   openPicker(spec: PickerSpec): void {
     this.modal = null;
     // Snapshot theme if this picker previews themes
+    if (spec.onPreview && !this.themeBeforePreview) {
+      this.themeBeforePreview = this.theme.name;
+    }
+    // Push current picker so Escape can return to it
+    if (this.picker) {
+      this.pickerStack.push(this.picker);
+    }
+    this.picker = createPicker(spec);
+    this.completeOpen = false;
+    this.prompt.text = "";
+    this.prompt.cursor = 0;
+    this.refreshComplete();
+    this.paint();
+  }
+
+  /**
+   * Replace the current picker without stacking (top-level entry points).
+   * Use when Escape should leave the settings tab entirely, not go "back".
+   */
+  openPickerRoot(spec: PickerSpec): void {
+    this.modal = null;
+    this.pickerStack = [];
     if (spec.onPreview) {
       this.themeBeforePreview = this.theme.name;
     }
@@ -222,16 +247,29 @@ export class TuiRenderer {
     this.paint();
   }
 
+  /** Pop nested picker, or fully close if at root. */
+  pickerBack(): void {
+    if (this.pickerStack.length > 0) {
+      this.picker = this.pickerStack.pop()!;
+      this.paint();
+      return;
+    }
+    this.closePicker();
+  }
+
   closePicker(): void {
-    if (this.picker) {
+    if (this.picker || this.pickerStack.length > 0) {
       // Revert live theme preview
       if (this.themeBeforePreview) {
         this.setTheme(this.themeBeforePreview);
         this.themeBeforePreview = null;
       }
-      this.picker.spec.onCancel?.();
+      // Only cancel the top-level entry (deepest child's cancel is skip)
+      const root = this.pickerStack[0] ?? this.picker;
+      root?.spec.onCancel?.();
     }
     this.picker = null;
+    this.pickerStack = [];
     this.paint();
   }
 
@@ -587,22 +625,30 @@ export class TuiRenderer {
         break;
       case "enter": {
         this.themeBeforePreview = null;
+        const before = this.picker;
         const shouldClose = pickerAccept(this.picker);
         if (shouldClose) {
-          this.picker = null;
+          if (this.picker !== before) {
+            // onSelect opened a child/root picker — keep it (Esc back uses stack)
+          } else {
+            // Leaf selection — leave the settings tab entirely
+            this.picker = null;
+            this.pickerStack = [];
+          }
         }
         this.paint();
         break;
       }
       case "escape":
         if (this.picker.query) {
-          // First esc clears search; second closes
+          // First esc clears search; next esc goes back
           this.picker.query = "";
           this.picker.selected = 0;
           this.picker.scroll = 0;
           this.paint();
         } else {
-          this.closePicker();
+          // Nested tab: back to parent picker; root: dismiss settings
+          this.pickerBack();
         }
         break;
       default:
@@ -994,7 +1040,13 @@ export class TuiRenderer {
       ? Math.max(14, rows - 8)
       : 0;
     const pickerLayout = this.picker
-      ? layoutPicker(this.picker, this.theme, contentWidth, pickerMaxRows)
+      ? layoutPicker(
+          this.picker,
+          this.theme,
+          contentWidth,
+          pickerMaxRows,
+          this.pickerStack.length > 0,
+        )
       : { rows: [] as Row[], height: 0, viewSize: 0 };
 
     const modalLayout = this.modal

@@ -1,42 +1,18 @@
 /**
- * xAI auth helpers.
- *
- * The xAI *developer* Inference API authenticates with a Bearer API key
- * from https://console.x.ai — there is no public device-code OAuth for
- * api.x.ai. Libra stores that key via /login xai.
- *
- * Optional: open the console in a browser and prompt the user to paste
- * the key (still API-key auth, not a fake local "retype code" dance).
+ * xAI auth helpers — browser open + API-key path.
+ * Full OAuth PKCE lives in ./xai-oauth.ts
  */
 
-import { spawn } from "node:child_process";
 import { saveApiKey } from "./api-key.js";
+export { openBrowser } from "./open-browser.js";
 
 export const XAI_CONSOLE_URL = "https://console.x.ai/team/default/api-keys";
 export const XAI_DOCS_URL = "https://docs.x.ai/docs/tutorial";
-
-/** Best-effort open URL in the default browser. */
-export function openBrowser(url: string): void {
-  try {
-    const plat = process.platform;
-    if (plat === "win32") {
-      spawn("cmd", ["/c", "start", "", url], {
-        detached: true,
-        stdio: "ignore",
-      }).unref();
-    } else if (plat === "darwin") {
-      spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
-    } else {
-      spawn("xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
-    }
-  } catch {
-    // ignore
-  }
-}
+export const XAI_AUTH_URL = "https://auth.x.ai";
 
 /**
- * Validate and store an xAI API key.
- * Accepts keys from console.x.ai (typically start with xai-).
+ * Validate and store an xAI API key (console.x.ai).
+ * Prefer OAuth via /login xai → Browser OAuth for SuperGrok subscription.
  */
 export function connectXaiApiKey(
   key: string,
@@ -47,7 +23,7 @@ export function connectXaiApiKey(
     return {
       ok: false,
       error:
-        "That looks like an old demo token. Paste a real key from console.x.ai",
+        "That looks like an old demo token. Use Browser OAuth or paste a key from console.x.ai",
     };
   }
   if (trimmed.length < 8) return { ok: false, error: "key too short" };
@@ -61,43 +37,13 @@ export function connectXaiApiKey(
   return saveApiKey("xai", trimmed, { label: "xAI console API key" });
 }
 
-/**
- * @deprecated Device-code OAuth is not used by the xAI Inference API.
- * Kept as thin wrappers so old call sites fail clearly.
- */
-export interface DeviceCodeStart {
-  deviceCode: string;
-  userCode: string;
-  verificationUri: string;
-  verificationUriComplete?: string;
-  intervalSec: number;
-  expiresInSec: number;
-}
-
-export interface DeviceFlowCallbacks {
-  onCode: (info: DeviceCodeStart) => void;
-  onStatus?: (msg: string) => void;
-  signal?: AbortSignal;
-}
-
-export async function startXaiDeviceFlow(
-  _cbs: DeviceFlowCallbacks,
-): Promise<{ ok: true; label: string } | { ok: false; error: string }> {
-  return {
-    ok: false,
-    error:
-      "xAI Inference API uses API keys (console.x.ai), not device-code OAuth. Use /login xai and paste your key.",
-  };
-}
-
-export async function confirmXaiDeviceCode(_opts: {
-  issued: DeviceCodeStart;
-  enteredCode: string;
-  tokenUrl?: string;
-}): Promise<{ ok: true } | { ok: false; error: string }> {
-  return {
-    ok: false,
-    error:
-      "Device-code confirm is disabled. Connect with an API key from console.x.ai",
-  };
-}
+// Re-export OAuth for convenience
+export {
+  loginXaiOAuth,
+  importGrokCliAuth,
+  resolveXaiAccessToken,
+  ensureFreshXaiCredentials,
+  loadGrokCliCredentials,
+  XAI_OAUTH_CLIENT_ID,
+  XAI_OAUTH_REDIRECT_PORT,
+} from "./xai-oauth.js";

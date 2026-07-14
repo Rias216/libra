@@ -54,8 +54,9 @@ export const PROVIDERS: ProviderDef[] = [
   {
     id: "xai",
     name: "xAI (Grok)",
-    description: "API key from console.x.ai — OpenAI-compatible",
-    methods: ["api_key"],
+    description:
+      "SuperGrok OAuth (browser PKCE) or API key from console.x.ai",
+    methods: ["oauth_browser", "api_key"],
     baseUrl: "https://api.x.ai/v1",
     envKey: "XAI_API_KEY",
     keyPlaceholder: "xai-...",

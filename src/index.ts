@@ -123,15 +123,17 @@ export {
   saveAgentSettings,
   PROVIDER_EFFORT_OPTIONS,
   CUSTOM_REASONING_OPTIONS,
+  prepareFusionForMain,
+  resolveSecondaryReasoners,
   runFusionReasoning,
-  resolveFusionModels,
   type AgentSettings,
   type ReasoningConfig,
   type SubagentConfig,
   type FusionConfig,
   type CustomReasoningMode,
   type ProviderReasoningEffort,
-  type FusionResult,
+  type FusionPrepResult,
+  type FusionCandidate,
 } from "./agent/index.js";
 
 // ── config ────────────────────────────────────────────

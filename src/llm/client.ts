@@ -5,9 +5,10 @@
 
 import type { ProviderId } from "../auth/types.js";
 import { getProvider } from "../auth/types.js";
-import { resolveToken } from "../auth/api-key.js";
+import { resolveTokenFresh } from "../auth/api-key.js";
 import { getCredential } from "../auth/store.js";
 import type { OpenAITool } from "../toolcalling/schema.js";
+import { buildReasoningApiFields } from "../agent/reasoning.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -46,8 +47,13 @@ export interface ChatRequest {
   temperature?: number;
   max_tokens?: number;
   stream?: boolean;
-  /** Provider effort hint when supported */
+  /**
+   * @deprecated Prefer native fields from buildReasoningApiFields.
+   * Still accepted for callers that pass an explicit override.
+   */
   reasoning_effort?: string;
+  /** When true (default), apply per-model native reasoning API fields */
+  applyNativeReasoning?: boolean;
 }
 
 export async function chatComplete(
@@ -56,7 +62,7 @@ export async function chatComplete(
 ): Promise<ChatResult> {
   const def = getProvider(req.provider);
   if (!def) throw new Error(`unknown provider ${req.provider}`);
-  const token = resolveToken(req.provider);
+  const token = await resolveTokenFresh(req.provider);
   if (!token) throw new Error(`${req.provider} not authenticated — /login ${req.provider}`);
   const cred = getCredential(req.provider);
   const base = (cred?.meta?.baseUrl || def.baseUrl || "").replace(/\/$/, "");
@@ -98,8 +104,23 @@ async function chatOpenAI(
     body.tool_choice = req.tool_choice ?? "auto";
   }
   if (req.max_tokens) body.max_tokens = req.max_tokens;
+
+  // Native reasoning control (per-model capabilities) — not prompt text.
+  // buildReasoningApiFields clamps to what this model supports (e.g. hy3: none/low/high only).
+  if (req.applyNativeReasoning !== false) {
+    const native = buildReasoningApiFields(provider, req.model);
+    Object.assign(body, native);
+  }
+  // Explicit override wins (still sent as native API fields, not prompt)
   if (req.reasoning_effort && req.reasoning_effort !== "default") {
-    body.reasoning = { effort: req.reasoning_effort };
+    if (provider === "openrouter") {
+      body.reasoning = { effort: req.reasoning_effort };
+    } else if (provider === "xai") {
+      body.reasoning_effort = req.reasoning_effort;
+      body.reasoning = { effort: req.reasoning_effort };
+    } else {
+      body.reasoning_effort = req.reasoning_effort;
+    }
   }
 
   const res = await fetch(`${base}/chat/completions`, {
@@ -248,12 +269,16 @@ async function chatGemini(
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content ?? "" }],
     }));
+  const native = buildReasoningApiFields(req.provider, req.model);
+  const genCfg = native.generationConfig as Record<string, unknown> | undefined;
+
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       systemInstruction: system ? { parts: [{ text: system }] } : undefined,
       contents,
+      ...(genCfg ? { generationConfig: genCfg } : {}),
     }),
     signal: AbortSignal.timeout(120_000),
   });
@@ -282,6 +307,11 @@ async function chatAnthropic(
   const messages = req.messages
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => ({ role: m.role, content: m.content ?? "" }));
+  const native = buildReasoningApiFields(req.provider, req.model);
+  const thinking = native.thinking as
+    | { type: string; budget_tokens: number }
+    | undefined;
+
   const res = await fetch(`${base}/v1/messages`, {
     method: "POST",
     headers: {
@@ -294,6 +324,7 @@ async function chatAnthropic(
       max_tokens: req.max_tokens ?? 8192,
       system,
       messages,
+      ...(thinking ? { thinking } : {}),
     }),
     signal: AbortSignal.timeout(180_000),
   });

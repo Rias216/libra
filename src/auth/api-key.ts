@@ -1,5 +1,6 @@
 /**
- * API-key based provider connection.
+ * API-key based provider connection + token resolution.
+ * xAI OAuth tokens are refreshed via resolveTokenFresh.
  */
 
 import type { ProviderId } from "./types.js";
@@ -33,7 +34,10 @@ export function saveApiKey(
   return { ok: true };
 }
 
-/** Resolve a usable token: stored credential, then env var. */
+/**
+ * Sync token lookup (no network). Prefer resolveTokenFresh for API calls
+ * so xAI OAuth tokens are refreshed when expired.
+ */
 export function resolveToken(provider: ProviderId): string | undefined {
   const stored = getCredential(provider)?.token;
   if (stored) return stored;
@@ -42,4 +46,17 @@ export function resolveToken(provider: ProviderId): string | undefined {
     return process.env[def.envKey];
   }
   return undefined;
+}
+
+/**
+ * Resolve a usable bearer token, refreshing xAI OAuth when needed.
+ */
+export async function resolveTokenFresh(
+  provider: ProviderId,
+): Promise<string | undefined> {
+  if (provider === "xai") {
+    const { resolveXaiAccessToken } = await import("./xai-oauth.js");
+    return resolveXaiAccessToken();
+  }
+  return resolveToken(provider);
 }

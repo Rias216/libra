@@ -5,8 +5,12 @@
 
 import type { ProviderId } from "./types.js";
 import { getProvider, PROVIDERS } from "./types.js";
-import { resolveToken } from "./api-key.js";
+import { resolveToken, resolveTokenFresh } from "./api-key.js";
 import { getCredential } from "./store.js";
+import {
+  attachCapsToModels,
+  pickHighestNativeReasoningModel,
+} from "../agent/reasoning.js";
 
 export interface RemoteModel {
   /** Provider-native model id */
@@ -65,11 +69,11 @@ export async function fetchModelsForProvider(
   const def = getProvider(provider);
   if (!def) return { models: [], error: "unknown provider", fromCache: false };
 
-  const token = resolveToken(provider);
+  const token = await resolveTokenFresh(provider);
   if (!token) {
     return {
       models: [],
-      error: `not logged in (${def.envKey ?? "API key"})`,
+      error: `not logged in (${def.envKey ?? "API key / OAuth"})`,
       fromCache: false,
     };
   }
@@ -103,6 +107,9 @@ export async function fetchModelsForProvider(
       default:
         models = [];
     }
+
+    // Discover native reasoning effort levels per model (API / heuristic)
+    models = attachCapsToModels(provider, models);
 
     // Sort: reasoning-ish first, then alpha
     models.sort((a, b) => {
@@ -157,30 +164,20 @@ export function connectedProviders(): ProviderId[] {
   return PROVIDERS.filter((p) => Boolean(resolveToken(p.id))).map((p) => p.id);
 }
 
-/** Heuristic: pick "highest" reasoning model from a list. */
+/**
+ * Pick the highest native-reasoning model (provider catalog caps first).
+ * Delegates to agent/reasoning so ultra / fusion use real API capabilities.
+ */
 export function pickHighestReasoningModel(
   models: RemoteModel[],
 ): RemoteModel | undefined {
-  if (models.length === 0) return undefined;
-  const scored = models.map((m) => ({ m, s: reasonScore(m) }));
-  scored.sort((a, b) => b.s - a.s || a.m.id.localeCompare(b.m.id));
-  return scored[0]?.m;
-}
-
-function reasonScore(m: RemoteModel): number {
-  const id = m.id.toLowerCase();
-  let s = 0;
-  if (m.reasoning) s += 50;
-  if (/reason|thinking|o3|o4|opus|pro|ultra|4\.5|4-1/.test(id)) s += 30;
-  if (/mini|fast|flash|haiku|lite|nano/.test(id)) s -= 20;
-  if (/grok-4|claude-opus|gpt-4\.1(?!-mini)|gemini-2\.5-pro/.test(id)) s += 25;
-  if (/grok-4\.5|grok-4-1/.test(id)) s += 40;
-  return s;
+  return pickHighestNativeReasoningModel(models);
 }
 
 function looksReasoning(id: string): boolean {
   const x = id.toLowerCase();
-  return /reason|thinking|o1|o3|o4|r1|opus/.test(x);
+  if (/non[-_]?reason|no[-_]?think/.test(x)) return false;
+  return /reason|thinking|o1|o3|o4|r1|opus|hy3|gpt-5|qwq/.test(x);
 }
 
 async function fetchOpenAIStyle(
@@ -190,39 +187,111 @@ async function fetchOpenAIStyle(
   timeoutMs: number,
 ): Promise<RemoteModel[]> {
   if (!baseUrl) throw new Error("missing base URL");
-  const url = `${baseUrl}/models`;
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
+    Accept: "application/json",
   };
   if (provider === "openrouter") {
     headers["HTTP-Referer"] = "https://github.com/libra-tui";
     headers["X-Title"] = "Libra";
   }
-  const res = await fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (res.status === 401 || res.status === 403) {
-    throw new Error(`HTTP ${res.status} unauthorized — check API key`);
+
+  // xAI (and some gateways) may expose chat models under slightly different paths
+  const urls =
+    provider === "xai"
+      ? [`${baseUrl}/models`, `${baseUrl}/language-models`]
+      : [`${baseUrl}/models`];
+
+  let lastErr = "";
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(`HTTP ${res.status} unauthorized — check API key`);
+      }
+      if (res.status === 404) {
+        lastErr = `HTTP 404 ${url}`;
+        continue;
+      }
+      if (!res.ok) {
+        lastErr = `HTTP ${res.status} listing models`;
+        continue;
+      }
+      const json = (await res.json()) as {
+        data?: Array<{
+          id?: string;
+          object?: string;
+          owned_by?: string;
+          name?: string;
+        }>;
+        models?: Array<{ id?: string; name?: string }>;
+      };
+      // Support { data: [...] } and { models: [...] }
+      const rawList = json.data ?? json.models ?? [];
+      const mapped: RemoteModel[] = [];
+      for (const m of rawList) {
+        const id = m.id ?? m.name;
+        if (!id) continue;
+        // Skip non-chat noise when obvious
+        if (/embed|whisper|tts|moderation|dall-e|image|audio/i.test(id)) {
+          continue;
+        }
+        const owned =
+          "owned_by" in m && typeof (m as { owned_by?: string }).owned_by === "string"
+            ? (m as { owned_by: string }).owned_by
+            : undefined;
+        mapped.push({
+          id,
+          name: m.name ?? id,
+          provider,
+          description:
+            owned != null
+              ? `owned_by ${owned}`
+              : provider === "xai"
+                ? "xAI Grok"
+                : undefined,
+          reasoning: looksReasoning(id),
+          raw: m,
+        });
+      }
+
+      if (mapped.length > 0) return mapped;
+      lastErr = "empty model list from API";
+    } catch (err) {
+      lastErr = err instanceof Error ? err.message : String(err);
+      // Auth errors should surface immediately
+      if (/unauthorized|401|403/i.test(lastErr)) throw err;
+    }
   }
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} listing models`);
-  }
-  const json = (await res.json()) as {
-    data?: Array<{ id?: string; object?: string; owned_by?: string }>;
-  };
-  const data = json.data ?? [];
-  return data
-    .filter((m) => m.id)
-    .map((m) => ({
-      id: m.id!,
-      name: m.id!,
-      provider,
-      description: m.owned_by ? `owned_by ${m.owned_by}` : undefined,
-      reasoning: looksReasoning(m.id!),
-      raw: m,
+
+  // xAI fallback catalog if live list fails (still allows selecting known IDs)
+  if (provider === "xai") {
+    return XAI_FALLBACK_MODELS.map((id) => ({
+      id,
+      name: id,
+      provider: "xai" as const,
+      description: "xAI (fallback catalog — API list unavailable)",
+      reasoning: looksReasoning(id),
     }));
+  }
+
+  throw new Error(lastErr || "failed to list models");
 }
+
+/** Known Grok chat model IDs when /models is empty or blocked */
+const XAI_FALLBACK_MODELS = [
+  "grok-4.5",
+  "grok-4-1-fast-reasoning",
+  "grok-4-1-fast-non-reasoning",
+  "grok-4-0709",
+  "grok-3",
+  "grok-3-mini",
+  "grok-2-1212",
+  "grok-2-vision-1212",
+];
 
 async function fetchGemini(
   provider: ProviderId,

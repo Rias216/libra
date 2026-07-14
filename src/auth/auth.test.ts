@@ -103,8 +103,12 @@ async function main(): Promise<void> {
     "ultra-fusion in catalog",
   );
   assert(
-    PROVIDER_EFFORT_OPTIONS.length >= 5 && CUSTOM_REASONING_OPTIONS.length >= 5,
+    PROVIDER_EFFORT_OPTIONS.length >= 5 && CUSTOM_REASONING_OPTIONS.length >= 3,
     "reasoning options",
+  );
+  assert(
+    !CUSTOM_REASONING_OPTIONS.some((o) => o.value === "deep" || o.value === "swarm"),
+    "deep/swarm removed (not official)",
   );
   // reset custom to none for cleanliness
   saveAgentSettings({
@@ -124,7 +128,7 @@ async function main(): Promise<void> {
   console.log("ok — multi-provider store");
   console.log("ok — model key helpers + highest-reasoning pick");
   console.log("ok — ultra custom reasoning forces subagent auto-spawn");
-  console.log("ok — ultra-fusion reasoning-only multi-model config");
+  console.log("ok — ultra-fusion secondary-reason / main-execute config");
   console.log("ok — offline verify suite");
 
   if (live) {

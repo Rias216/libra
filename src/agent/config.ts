@@ -3,10 +3,9 @@
  *
  * Layers:
  * 1. Provider effort (off/low/medium/high/max) — API thinking budget
- * 2. Libra custom modes (deep/swarm/ultra/ultra-fusion) — harness behavior
- *    independent of per-model native reasoning flags
+ * 2. Libra harness profiles (ultra / ultra-fusion) — not provider effort enums
  *
- * ultra-fusion: multi-model side-by-side REASONING ONLY, then fuse.
+ * ultra-fusion: main + secondary both reason; main compares traces + executes.
  */
 
 import { loadConfig, saveConfig, type LibraConfig } from "../config/store.js";
@@ -14,22 +13,20 @@ import { loadConfig, saveConfig, type LibraConfig } from "../config/store.js";
 /** Provider-native reasoning effort (when the model supports it). */
 export type ProviderReasoningEffort =
   | "off"
+  | "none"
+  | "minimal"
   | "low"
   | "medium"
   | "high"
+  | "xhigh"
   | "max"
   | "default";
 
 /**
- * Libra harness reasoning profiles — custom, not fetched from providers.
- * Order of power: none < deep < swarm < ultra < ultra-fusion
+ * Libra harness profiles (not official model efforts like low/high).
+ * Order: none < ultra < ultra-fusion
  */
-export type CustomReasoningMode =
-  | "none"
-  | "deep"
-  | "swarm"
-  | "ultra"
-  | "ultra-fusion";
+export type CustomReasoningMode = "none" | "ultra" | "ultra-fusion";
 
 export interface SubagentRole {
   id: string;
@@ -47,22 +44,39 @@ export interface SubagentConfig {
   roles: SubagentRole[];
 }
 
-/** Multi-model reasoning fusion (REASONING ONLY — no tools/edits). */
+/**
+ * Multi-model fusion: main + secondaries all reason first;
+ * then main compares both reasonings and executes with tools.
+ */
 export interface FusionConfig {
-  /** provider/model keys to run side-by-side */
+  /** Secondary reasoner model keys (provider/model). Main is always the session model. */
   modelKeys: string[];
-  /** Judge that fuses candidates; empty = highest reasoning model */
+  /** Optional preferred secondary (legacy field) */
   judgeModelKey?: string;
+  /** Minimum secondary reasoners (default 1) */
   minModels: number;
   maxParallel: number;
-  /** Always true for this product surface */
+  /**
+   * Phase-1 reasoners use no tools. Main phase-2 always has tools.
+   */
   reasoningOnly: boolean;
+  /** Instructions for the shared phase-1 reasoning pass */
   analysisInstructions: string;
+  /** Instructions for main when comparing both reasonings before execute */
   fuseInstructions: string;
 }
 
 export interface ReasoningConfig {
+  /**
+   * Global fallback effort when a model has no per-model override.
+   * Actual API value is clamped to what the active model supports.
+   */
   effort: ProviderReasoningEffort;
+  /**
+   * Per-model effort: key = "provider/model" → effort level.
+   * This is the source of truth for which models use which native setting.
+   */
+  perModelEffort?: Record<string, string>;
   custom: CustomReasoningMode;
   customInstructions: string;
   fusion: FusionConfig;
@@ -114,13 +128,13 @@ export const DEFAULT_SUBAGENT_ROLES: SubagentRole[] = [
 export const DEFAULT_FUSION: FusionConfig = {
   modelKeys: [],
   judgeModelKey: undefined,
-  minModels: 2,
-  maxParallel: 4,
-  reasoningOnly: true,
+  minModels: 1,
+  maxParallel: 3,
+  reasoningOnly: true, // secondaries only
   analysisInstructions:
-    "Reason step-by-step. Cover risks, alternatives, and a concrete plan. No tool use.",
+    "Reason step-by-step. Cover risks, alternatives, and a concrete executable plan. No tool use in this pass.",
   fuseInstructions:
-    "Compare candidates, pick the strongest arguments, produce one fused analysis and plan. Reasoning only.",
+    "Compare your first-pass reasoning with every secondary trace. Keep only what is correct, valuable, and actionable. Merge into one plan, then execute with tools.",
 };
 
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
@@ -142,10 +156,25 @@ export function loadAgentSettings(): AgentSettings {
   const cfg = loadConfig();
   const a = cfg.agent;
   if (!a) return structuredClone(DEFAULT_AGENT_SETTINGS);
+  // Migrate removed harness modes (deep/swarm were never provider-native)
+  let custom = a.reasoning?.custom as string | undefined;
+  if (custom === "deep" || custom === "swarm") custom = "none";
+  if (
+    custom !== "none" &&
+    custom !== "ultra" &&
+    custom !== "ultra-fusion"
+  ) {
+    custom = DEFAULT_AGENT_SETTINGS.reasoning.custom;
+  }
   return {
     reasoning: {
       ...DEFAULT_AGENT_SETTINGS.reasoning,
       ...a.reasoning,
+      custom: (custom ?? DEFAULT_AGENT_SETTINGS.reasoning.custom) as CustomReasoningMode,
+      perModelEffort: {
+        ...(DEFAULT_AGENT_SETTINGS.reasoning.perModelEffort ?? {}),
+        ...(a.reasoning?.perModelEffort ?? {}),
+      },
       fusion: {
         ...DEFAULT_FUSION,
         ...a.reasoning?.fusion,
@@ -175,6 +204,8 @@ export function saveAgentSettings(partial: {
     reasoning: {
       ...cur.reasoning,
       ...partial.reasoning,
+      perModelEffort:
+        partial.reasoning?.perModelEffort ?? cur.reasoning.perModelEffort,
       fusion: {
         ...cur.reasoning.fusion,
         ...partial.reasoning?.fusion,
@@ -195,7 +226,14 @@ export function saveAgentSettings(partial: {
   if (next.reasoning.custom === "ultra" || next.reasoning.custom === "ultra-fusion") {
     next.subagents.enabled = true;
     next.subagents.autoSpawn = true;
-    if (next.reasoning.effort === "default" || next.reasoning.effort === "off") {
+    // Prefer highest native effort; "max" is clamped per-model at request time
+    if (
+      next.reasoning.effort === "default" ||
+      next.reasoning.effort === "off" ||
+      next.reasoning.effort === "none" ||
+      next.reasoning.effort === "low" ||
+      next.reasoning.effort === "minimal"
+    ) {
       next.reasoning.effort = "max";
     }
   }
@@ -206,21 +244,21 @@ export function saveAgentSettings(partial: {
   return next;
 }
 
+/** Full catalog — UI should filter via getCachedReasoningCaps for the active model. */
 export const PROVIDER_EFFORT_OPTIONS: {
   value: ProviderReasoningEffort;
   label: string;
   description: string;
 }[] = [
-  { value: "off", label: "Off", description: "No extended reasoning" },
-  { value: "low", label: "Low", description: "Light thinking budget" },
-  { value: "medium", label: "Medium", description: "Balanced" },
-  { value: "high", label: "High", description: "Deep reasoning" },
-  { value: "max", label: "Max", description: "Highest effort the API allows" },
-  {
-    value: "default",
-    label: "Model default",
-    description: "Leave effort to the provider",
-  },
+  { value: "default", label: "Model default", description: "Omit API reasoning field" },
+  { value: "off", label: "Off", description: "Map to none/minimal when supported" },
+  { value: "none", label: "None", description: "API: no reasoning tokens" },
+  { value: "minimal", label: "Minimal", description: "API: minimal reasoning" },
+  { value: "low", label: "Low", description: "API: low effort" },
+  { value: "medium", label: "Medium", description: "API: medium effort" },
+  { value: "high", label: "High", description: "API: high effort" },
+  { value: "xhigh", label: "XHigh", description: "API: xhigh (not all models)" },
+  { value: "max", label: "Max", description: "API: max (not all models)" },
 ];
 
 export const CUSTOM_REASONING_OPTIONS: {
@@ -231,17 +269,7 @@ export const CUSTOM_REASONING_OPTIONS: {
   {
     value: "none",
     label: "None",
-    description: "No Libra harness reasoning profile",
-  },
-  {
-    value: "deep",
-    label: "Deep",
-    description: "Highest reasoning model + long plan before edits",
-  },
-  {
-    value: "swarm",
-    label: "Swarm",
-    description: "Manual multi-agent; spawn roles on demand",
+    description: "No Libra harness profile",
   },
   {
     value: "ultra",
@@ -253,7 +281,7 @@ export const CUSTOM_REASONING_OPTIONS: {
     value: "ultra-fusion",
     label: "Ultra + Fusion",
     description:
-      "REASONING ONLY — multi-model side-by-side, analyze, fuse best result",
+      "Main + secondary both reason; main compares both and executes with tools",
   },
 ];
 

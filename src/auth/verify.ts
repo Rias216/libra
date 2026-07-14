@@ -7,7 +7,7 @@ import {
   type ProviderId,
   PROVIDERS,
 } from "./types.js";
-import { resolveToken } from "./api-key.js";
+import { resolveToken, resolveTokenFresh } from "./api-key.js";
 import { getCredential } from "./store.js";
 import { connectXaiApiKey } from "./device.js";
 import { fetchModelsForProvider } from "./models.js";
@@ -95,7 +95,7 @@ export async function verifyProvider(
   }
 
   const cred = getCredential(provider);
-  const token = resolveToken(provider);
+  const token = await resolveTokenFresh(provider);
 
   if (!token) {
     return {
@@ -107,15 +107,18 @@ export async function verifyProvider(
     };
   }
 
-  const fmt = validateKeyFormat(provider, token);
-  if (!fmt.ok) {
-    return {
-      provider,
-      ok: false,
-      status: "invalid_format",
-      message: fmt.error,
-      method: cred?.method ?? "api_key",
-    };
+  // OAuth access tokens are opaque/JWT — skip console API-key format checks
+  if (cred?.method !== "oauth_browser") {
+    const fmt = validateKeyFormat(provider, token);
+    if (!fmt.ok) {
+      return {
+        provider,
+        ok: false,
+        status: "invalid_format",
+        message: fmt.error,
+        method: cred?.method ?? "api_key",
+      };
+    }
   }
 
   if (opts.offline) {

@@ -8,7 +8,7 @@
  *   enter           activate and close (unless closeOnSelect=false)
  *   type-to-search  filter options (when searchable)
  *   backspace       delete search char
- *   esc             cancel
+ *   esc             back (clear search → parent picker → close)
  */
 
 import type { Style } from "./ansi.js";
@@ -262,6 +262,7 @@ export function layoutPicker(
   theme: Theme,
   width: number,
   maxRows = 16,
+  canGoBack = false,
 ): { rows: Row[]; height: number; viewSize: number } {
   const inner = Math.max(20, Math.min(width, 72));
   const rows: Row[] = [];
@@ -402,13 +403,14 @@ export function layoutPicker(
   rows.push({
     segments: [{ text: bar("-"), style: { fg: theme.border } }],
   });
+  const escHint = canGoBack || p.query ? "esc back" : "esc close";
   rows.push({
     segments: [
       {
         text: truncate(
           searchable
-            ? " up/down move  space toggle  left/right value  type=search  enter  esc"
-            : " up/down move  space toggle  left/right value  enter  esc",
+            ? ` up/down  space  left/right  type=search  enter  ${escHint}`
+            : ` up/down  space  left/right  enter  ${escHint}`,
           inner,
         ),
         style: { fg: theme.fgFaint, bg: theme.bgElevated },

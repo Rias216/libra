@@ -25,6 +25,11 @@ import {
   openBrowser,
   XAI_CONSOLE_URL,
 } from "./auth/device.js";
+import {
+  importGrokCliAuth,
+  loadGrokCliCredentials,
+  loginXaiOAuth,
+} from "./auth/xai-oauth.js";
 import { saveApiKey } from "./auth/api-key.js";
 import {
   listCredentials,
@@ -52,12 +57,22 @@ import {
   CUSTOM_REASONING_OPTIONS,
   DEFAULT_SUBAGENT_ROLES,
   loadAgentSettings,
-  PROVIDER_EFFORT_OPTIONS,
   saveAgentSettings,
   type CustomReasoningMode,
-  type ProviderReasoningEffort,
 } from "./agent/config.js";
-import { runFusionReasoning } from "./agent/fusion.js";
+import {
+  effortLabel,
+  effortPickerOptions,
+  getCachedReasoningCaps,
+  getEffortForModel,
+  pickHighestNativeReasoningModel,
+  resolveCapsForModel,
+  setEffortForModel,
+  setMaxEffortForModel,
+  type EffortLevel,
+} from "./agent/reasoning.js";
+import { prepareFusionForMain } from "./agent/fusion.js";
+import { buildSystemPrompt } from "./agent/loop.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -121,7 +136,7 @@ async function main(): Promise<void> {
           "- `/login` · `/model` · `/verify` · `/reasoning` · `/subagent`\n" +
           `- ${authLine}\n` +
           `- Active: **${store.state.session.provider}** / \`${store.state.session.model}\`\n` +
-          `- Reasoning: effort=\`${agentCfg.reasoning.effort}\` custom=\`${agentCfg.reasoning.custom}\`` +
+          `- Reasoning: per-model native API effort (see \`/reasoning\`) · custom=\`${agentCfg.reasoning.custom}\`` +
           (agentCfg.reasoning.custom === "ultra-fusion"
             ? `\n- Fusion models: ${agentCfg.reasoning.fusion.modelKeys.length || "(auto-pick)"}`
             : "") +
@@ -166,18 +181,16 @@ function handleCommand(
             type: "text",
             content:
               "### Commands\n\n" +
-              "- `/login [provider]` — connect API keys; stay logged into many at once\n" +
+              "- `/login [provider]` — OAuth (xAI SuperGrok PKCE) or API keys; multi-login OK\n" +
               "- `/model` — pick any model from **all** connected providers (fetched live)\n" +
-              "- `/reasoning` — provider effort + Libra custom modes\n" +
-              "- `/subagent` — deep subagent config\n" +
+              "- `/reasoning` — official model effort modes + ultra / ultra-fusion\n" +
+              "- `/subagent` — subagent config\n" +
               "- `/verify [provider]` — live model list proves the key\n" +
               "- `/theme` `/font` `/whoami` `/logout`\n\n" +
-              "### Custom reasoning ladder\n\n" +
-              "- **deep** — strongest model, long plan\n" +
-              "- **swarm** — multi-agent on demand\n" +
+              "### Reasoning\n\n" +
+              "Effort levels are **per model** (from the provider catalog). Esc goes **back** in nested pickers.\n\n" +
               "- **ultra** — max effort + auto subagents\n" +
-              "- **ultra-fusion** — REASONING ONLY: run your chosen models side-by-side, analyze, fuse best result\n\n" +
-              "Fusion model list is configured under `/reasoning` → Ultra + Fusion → models.",
+              "- **ultra-fusion** — both reason; main compares both traces & executes",
           },
         ],
       });
@@ -318,8 +331,14 @@ function handleCommand(
         lines.push("No stored credentials. Run `/login`.");
       }
       for (const c of creds) {
+        const exp =
+          c.method === "oauth_browser" && c.expiresAt
+            ? c.expiresAt > Date.now()
+              ? ` · expires ${new Date(c.expiresAt).toLocaleString()}`
+              : " · expired (will refresh)"
+            : "";
         lines.push(
-          `- **${c.provider}** (${c.method}) ${c.label ?? ""}  token ${maskSecret(c.token)}`,
+          `- **${c.provider}** (${c.method}) ${c.label ?? ""}  token ${maskSecret(c.token)}${exp}`,
         );
       }
       for (const p of PROVIDERS) {
@@ -342,7 +361,15 @@ function handleCommand(
               "### Auth status\n\n" +
               lines.join("\n") +
               `\n\n**Active:** \`${store.state.session.provider}/${store.state.session.model}\`` +
-              `\n**Reasoning effort:** \`${agentCfg.reasoning.effort}\`` +
+              `\n**Reasoning (this model):** \`${
+                store.state.session.provider !== "none" &&
+                store.state.session.model !== "unset"
+                  ? getEffortForModel(
+                      store.state.session.provider as ProviderId,
+                      store.state.session.model,
+                    )
+                  : agentCfg.reasoning.effort
+              }\` (native API, per model)` +
               `\n**Custom mode:** \`${agentCfg.reasoning.custom}\`` +
               `\n**Subagents:** ${agentCfg.subagents.enabled ? "on" : "off"}` +
               `  max=${agentCfg.subagents.maxConcurrent}` +
@@ -459,22 +486,47 @@ function startProviderLogin(
   }
 
   if (provider === "xai") {
+    const hasGrokCli = Boolean(loadGrokCliCredentials());
+    const opts = [
+      {
+        value: "oauth",
+        label: "Browser OAuth (SuperGrok)",
+        description:
+          "PKCE on 127.0.0.1 · opens auth.x.ai · access + refresh tokens",
+      },
+      ...(hasGrokCli
+        ? [
+            {
+              value: "grok-cli",
+              label: "Import Grok CLI (~/.grok/auth.json)",
+              description: "Reuse official Grok CLI OAuth tokens",
+            },
+          ]
+        : []),
+      {
+        value: "paste",
+        label: "Paste API key",
+        description: "Key from console.x.ai (xai-...)",
+      },
+      {
+        value: "console",
+        label: "Open console.x.ai API keys",
+        description: "Then paste a developer API key",
+      },
+    ];
     ui.openPicker({
-      title: "xAI (Grok) — API key",
-      options: [
-        {
-          value: "paste",
-          label: "Paste API key",
-          description: "Key from console.x.ai (xai-...)",
-        },
-        {
-          value: "browser",
-          label: "Open console + paste key",
-          description: "Opens console.x.ai API keys page",
-        },
-      ],
+      title: "xAI (Grok) — auth",
+      options: opts,
       onSelect: (method) => {
-        if (method === "browser") openBrowser(XAI_CONSOLE_URL);
+        if (method === "oauth") {
+          void runXaiOAuthLogin(ui, store);
+          return;
+        }
+        if (method === "grok-cli") {
+          void runXaiImportGrokCli(store, ui);
+          return;
+        }
+        if (method === "console") openBrowser(XAI_CONSOLE_URL);
         promptXaiKey(ui, store);
       },
     });
@@ -495,6 +547,7 @@ function promptXaiKey(ui: TuiRenderer, store: HarnessStore): void {
     lines: [
       "Create a key at console.x.ai → API keys",
       "Paste the key below (Bearer auth to api.x.ai/v1)",
+      "Prefer Browser OAuth for SuperGrok subscription access",
       XAI_CONSOLE_URL,
     ],
     placeholder: "xai-...",
@@ -509,6 +562,73 @@ function promptXaiKey(ui: TuiRenderer, store: HarnessStore): void {
       void onProviderConnected(store, ui, "xai");
     },
   });
+}
+
+async function runXaiOAuthLogin(
+  ui: TuiRenderer,
+  store: HarnessStore,
+): Promise<void> {
+  // Prefer existing Grok CLI tokens when present (avoids re-auth)
+  if (loadGrokCliCredentials()) {
+    notify(store, "Found ~/.grok/auth.json — importing Grok CLI OAuth…");
+    const imported = await importGrokCliAuth();
+    if (imported.ok) {
+      notify(store, "xAI connected via Grok CLI tokens (auto-refresh enabled)");
+      void onProviderConnected(store, ui, "xai");
+      return;
+    }
+    notify(
+      store,
+      `Grok CLI import failed (${imported.error}) — starting browser OAuth…`,
+      "warn",
+    );
+  }
+
+  notify(
+    store,
+    "xAI OAuth: starting local callback on 127.0.0.1:56121…",
+  );
+  const r = await loginXaiOAuth({
+    onProgress: (msg) => notify(store, msg),
+    onAuthUrl: (url) => {
+      notify(store, "Browser opened to xAI login (auth.x.ai)");
+      // Always show full URL — Windows used to truncate &client_id=...
+      store.appendMessage({
+        id: newId("m"),
+        role: "system",
+        createdAt: Date.now(),
+        parts: [
+          {
+            id: newId("p"),
+            type: "status",
+            level: "info",
+            message:
+              `If the browser shows "Missing or invalid client_id", open this full URL manually (copy entire line):\n${url}`,
+          },
+        ],
+      });
+    },
+  });
+  if (!r.ok) {
+    notify(store, `xAI OAuth failed: ${r.error}`, "error");
+    return;
+  }
+  notify(store, "xAI OAuth connected — tokens saved (auto-refresh enabled)");
+  void onProviderConnected(store, ui, "xai");
+}
+
+async function runXaiImportGrokCli(
+  store: HarnessStore,
+  ui: TuiRenderer,
+): Promise<void> {
+  notify(store, "Importing ~/.grok/auth.json…");
+  const r = await importGrokCliAuth();
+  if (!r.ok) {
+    notify(store, `Grok CLI import failed: ${r.error}`, "error");
+    return;
+  }
+  notify(store, "Imported Grok CLI OAuth tokens into Libra");
+  void onProviderConnected(store, ui, "xai");
 }
 
 function promptApiKey(
@@ -633,7 +753,19 @@ async function openModelPicker(
   }
 
   notify(store, `fetching models from ${connected.join(", ")}...`, "info");
-  const { models, errors } = await fetchAllConnectedModels({ force: true });
+  const { models, byProvider, errors } = await fetchAllConnectedModels({
+    force: true,
+  });
+
+  // Surface per-provider status so missing xAI keys aren't silent
+  for (const p of connected) {
+    const n = byProvider[p]?.length ?? 0;
+    if (errors[p]) {
+      notify(store, `${p}: ${errors[p]}`, "warn");
+    } else {
+      notify(store, `${p}: ${n} models`, "info");
+    }
+  }
 
   if (models.length === 0) {
     const errText = Object.entries(errors)
@@ -643,10 +775,6 @@ async function openModelPicker(
     return;
   }
 
-  const errNote = Object.keys(errors).length
-    ? `  (! ${Object.keys(errors).join(",")})`
-    : "";
-
   const currentKey =
     loadConfig().modelKey ??
     modelKey({
@@ -655,16 +783,22 @@ async function openModelPicker(
     });
 
   ui.openPicker({
-    title: `Models  (${models.length} from ${connected.length} providers)${errNote}`,
+    title: `Models  (${models.length})`,
     current: currentKey,
+    searchable: true,
     options: models.map((m) => ({
       value: modelKey({ provider: m.provider, model: m.id }),
-      label: m.id,
-      description: `${m.provider}${m.reasoning ? "  reasoning" : ""}${m.description ? "  " + m.description : ""}`,
+      // Show provider prefix so multi-login lists are scannable
+      label: `${m.provider}/${m.id}`,
+      description: `${m.reasoning ? "reasoning  " : ""}${m.description ?? ""}`.trim(),
     })),
     onSelect: (value) => {
       const ref = parseModelKey(value);
-      if (!ref) return;
+      if (!ref) {
+        // openrouter ids can contain slashes — parseModelKey uses first segment
+        notify(store, `bad model key: ${value}`, "warn");
+        return;
+      }
       applyModel(store, ref.provider, ref.model);
     },
   });
@@ -691,102 +825,168 @@ function openReasoningPicker(
   ui: TuiRenderer,
   arg: string,
 ): void {
-  const cur = loadAgentSettings();
+  const provider = store.state.session.provider as ProviderId;
+  const model = store.state.session.model;
+  const hasModel =
+    Boolean(provider) &&
+    provider !== ("none" as ProviderId) &&
+    Boolean(model) &&
+    model !== "unset";
 
   if (arg) {
-    const effort = PROVIDER_EFFORT_OPTIONS.find((o) => o.value === arg);
     const custom = CUSTOM_REASONING_OPTIONS.find((o) => o.value === arg);
-    if (effort) {
-      saveAgentSettings({ reasoning: { effort: effort.value } });
-      notify(store, `reasoning effort → ${effort.value}`);
-      return;
-    }
     if (custom) {
       applyCustomReasoning(store, ui, custom.value);
+      return;
+    }
+    // Direct effort arg — only if active model supports it
+    if (hasModel) {
+      const opts = effortPickerOptions(provider, model);
+      const hit = opts.find((o) => o.value === arg);
+      if (hit) {
+        setEffortForModel(
+          provider,
+          model,
+          hit.value as EffortLevel | "default",
+        );
+        notify(
+          store,
+          `reasoning → ${effortLabel(hit.value as EffortLevel | "default")} for ${provider}/${model}`,
+        );
+        return;
+      }
+      notify(
+        store,
+        `"${arg}" not supported by ${model}. Supported: ${opts.map((o) => o.value).join(", ")}`,
+        "warn",
+      );
       return;
     }
     notify(store, `unknown reasoning mode: ${arg}`, "warn");
     return;
   }
 
-  ui.openPicker({
-    title: "Reasoning",
-    options: [
-      {
-        value: "menu:effort",
-        label: "Provider effort",
-        description: `current: ${cur.reasoning.effort}  (API thinking budget)`,
+  // Open effort modes directly for the active model (no submenu wrapper)
+  void openEffortModesPicker(store, ui);
+}
+
+/**
+ * Reasoning modes for the active model only — live supported_efforts.
+ * Root picker (Esc closes). Nested fusion/custom open via openPicker (Esc back).
+ */
+async function openEffortModesPicker(
+  store: HarnessStore,
+  ui: TuiRenderer,
+): Promise<void> {
+  const provider = store.state.session.provider as ProviderId;
+  const model = store.state.session.model;
+  const cur = loadAgentSettings();
+
+  if (
+    !provider ||
+    provider === ("none" as ProviderId) ||
+    !model ||
+    model === "unset"
+  ) {
+    // No model: show custom harness modes only
+    ui.openPickerRoot({
+      title: "Reasoning",
+      current: cur.reasoning.custom,
+      options: CUSTOM_REASONING_OPTIONS.map((o) => ({
+        value: `custom:${o.value}`,
+        label: o.label,
+        description: o.description,
+      })),
+      onSelect: (v) => {
+        const mode = v.replace(/^custom:/, "") as CustomReasoningMode;
+        applyCustomReasoning(store, ui, mode);
       },
-      {
-        value: "menu:custom",
-        label: "Libra custom mode",
-        description: `current: ${cur.reasoning.custom}`,
-      },
-      {
-        value: "menu:fusion",
-        label: "Ultra + Fusion setup",
-        description:
-          cur.reasoning.custom === "ultra-fusion"
-            ? `${cur.reasoning.fusion.modelKeys.length || "auto"} models · REASONING ONLY`
-            : "Select models, judge, instructions (activates ultra-fusion)",
-      },
-      {
-        value: "menu:instructions",
-        label: "Custom instructions",
-        description: cur.reasoning.customInstructions
-          ? truncate(cur.reasoning.customInstructions, 40)
-          : "(empty)",
-      },
-    ],
-    onSelect: (value) => {
-      if (value === "menu:effort") {
-        ui.openPicker({
-          title: "Provider reasoning effort",
-          current: cur.reasoning.effort,
-          options: PROVIDER_EFFORT_OPTIONS.map((o) => ({
-            value: o.value,
-            label: o.label,
-            description: o.description,
-          })),
-          onSelect: (v) => {
-            saveAgentSettings({
-              reasoning: { effort: v as ProviderReasoningEffort },
-            });
-            notify(store, `reasoning effort → ${v}`);
-          },
-        });
-      } else if (value === "menu:custom") {
-        ui.openPicker({
-          title: "Libra custom reasoning  (not provider-native)",
-          current: cur.reasoning.custom,
-          options: CUSTOM_REASONING_OPTIONS.map((o) => ({
-            value: o.value,
-            label: o.label,
-            description: o.description,
-          })),
-          onSelect: (v) => {
-            applyCustomReasoning(store, ui, v as CustomReasoningMode);
-          },
-        });
-      } else if (value === "menu:fusion") {
-        saveAgentSettings({ reasoning: { custom: "ultra-fusion" } });
-        openFusionConfig(store, ui);
-      } else if (value === "menu:instructions") {
-        ui.openModalInput({
-          title: "Custom reasoning instructions",
-          lines: [
-            "Injected for deep/swarm/ultra/ultra-fusion",
-            "Fusion also has separate analysis/fuse instruction fields",
-          ],
-          placeholder: cur.reasoning.customInstructions || "instructions...",
-          onSubmit: (text) => {
-            saveAgentSettings({
-              reasoning: { customInstructions: text.trim() },
-            });
-            ui.dismissModal();
-            notify(store, "custom reasoning instructions saved");
-          },
-        });
+    });
+    notify(store, "pick a model (/model) for per-model effort levels", "warn");
+    return;
+  }
+
+  // Always refresh catalog so supported_efforts are real, not stale heuristics
+  notify(store, `loading reasoning modes for ${provider}/${model}…`);
+  try {
+    await fetchModelsForProvider(provider, { force: true });
+  } catch {
+    /* caps may still be cached from a prior fetch */
+  }
+
+  const caps = getCachedReasoningCaps(provider, model);
+  const current = getEffortForModel(provider, model);
+  // Prefer API cache only — do not invent full effort lists
+  const effortOpts = effortPickerOptions(provider, model, {
+    allowHeuristic: caps?.source !== "api",
+  });
+
+  const options: { value: string; label: string; description?: string }[] = [];
+
+  for (const o of effortOpts) {
+    options.push({
+      value: `effort:${o.value}`,
+      label: o.label,
+      description: o.description,
+    });
+  }
+
+  // ultra / ultra-fusion (not API effort levels)
+  for (const o of CUSTOM_REASONING_OPTIONS) {
+    if (o.value === "none") continue;
+    options.push({
+      value: `custom:${o.value}`,
+      label: o.label,
+      description: o.description,
+    });
+  }
+
+  const currentKey =
+    current && current !== "default"
+      ? `effort:${current}`
+      : "effort:default";
+
+  const effortList =
+    caps?.efforts?.length
+      ? caps.efforts.join(", ")
+      : caps?.source === "api"
+        ? "none in catalog"
+        : "unknown";
+  const src = caps?.source ?? "none";
+
+  ui.openPickerRoot({
+    title: `Reasoning · ${model}  [${src}: ${effortList}]`,
+    current: currentKey,
+    options,
+    onSelect: (v) => {
+      if (v.startsWith("effort:")) {
+        const e = v.slice("effort:".length) as EffortLevel | "default";
+        // Reject efforts not in catalog when we have API caps
+        if (
+          e !== "default" &&
+          caps?.source === "api" &&
+          caps.efforts.length > 0 &&
+          !caps.efforts.includes(e)
+        ) {
+          notify(
+            store,
+            `${model} does not support "${e}" (catalog: ${caps.efforts.join(", ")})`,
+            "warn",
+          );
+          return;
+        }
+        setEffortForModel(provider, model, e);
+        notify(
+          store,
+          e === "default"
+            ? `${provider}/${model} → model default`
+            : `${provider}/${model} → ${effortLabel(e)} (native API)`,
+        );
+        return;
+      }
+      if (v.startsWith("custom:")) {
+        const mode = v.slice("custom:".length) as CustomReasoningMode;
+        applyCustomReasoning(store, ui, mode);
       }
     },
   });
@@ -798,73 +998,117 @@ function applyCustomReasoning(
   mode: CustomReasoningMode,
 ): void {
   saveAgentSettings({ reasoning: { custom: mode } });
-  let msg = `custom reasoning → ${mode}`;
   if (mode === "ultra" || mode === "ultra-fusion") {
-    msg +=
-      mode === "ultra-fusion"
-        ? "  (REASONING ONLY multi-model fuse)"
-        : "  (max effort + auto subagents)";
-    void fetchAllConnectedModels({ force: false }).then(({ models }) => {
-      const best = pickHighestReasoningModel(models);
-      if (best) {
-        applyModel(store, best.provider, best.id);
-        const a = loadAgentSettings();
-        saveAgentSettings({
-          subagents: {
-            ...a.subagents,
-            preferredModelKey: modelKey({
-              provider: best.provider,
-              model: best.id,
-            }),
-          },
-        });
-      }
+    void activateUltraNative(store, mode).then(() => {
+      if (mode === "ultra-fusion") openFusionConfig(store, ui);
     });
+    return;
   }
-  notify(store, msg);
-  if (mode === "ultra-fusion") {
-    openFusionConfig(store, ui);
-  }
+  notify(store, `harness mode → ${mode}`);
 }
 
-/** Configure fusion roster + judge (reasoning-only multi-model). */
+/**
+ * Ultra / ultra-fusion: select the strongest native-reasoning model from
+ * live provider catalogs and pin its highest supported API effort.
+ */
+async function activateUltraNative(
+  store: HarnessStore,
+  mode: "ultra" | "ultra-fusion",
+): Promise<void> {
+  notify(
+    store,
+    mode === "ultra-fusion"
+      ? "ultra-fusion: loading native reasoning catalogs…"
+      : "ultra: loading native reasoning catalogs…",
+  );
+  const { models, errors } = await fetchAllConnectedModels({ force: true });
+  if (models.length === 0) {
+    notify(
+      store,
+      `no models available${Object.keys(errors).length ? ` (${Object.values(errors).join("; ")})` : ""} — /login`,
+      "warn",
+    );
+    return;
+  }
+
+  const best = pickHighestNativeReasoningModel(models);
+  if (!best) {
+    notify(store, "could not pick a reasoning model", "warn");
+    return;
+  }
+
+  const caps = resolveCapsForModel(best.provider, best.id, best.reasoning === true);
+  const top = setMaxEffortForModel(best.provider, best.id);
+  applyModel(store, best.provider, best.id);
+
+  const a = loadAgentSettings();
+  saveAgentSettings({
+    reasoning: {
+      ...a.reasoning,
+      custom: mode,
+      // Global fallback also max so new models clamp high
+      effort: top ?? a.reasoning.effort,
+    },
+    subagents: {
+      ...a.subagents,
+      enabled: true,
+      autoSpawn: true,
+      preferredModelKey: modelKey({
+        provider: best.provider,
+        model: best.id,
+      }),
+    },
+  });
+
+  const effortNote = top
+    ? `native effort=${top}`
+    : caps.supported
+      ? "native reasoning (no effort enum)"
+      : "no native effort control on this model";
+  const source = caps.source === "api" ? "catalog" : caps.source;
+  notify(
+    store,
+    `${mode} → ${best.provider}/${best.id} (${effortNote}, ${source})` +
+      (mode === "ultra-fusion"
+        ? " · both reason → main compares & executes"
+        : " · auto subagents"),
+  );
+}
+
+/** Configure fusion: secondary reasoners + compare instructions. */
 function openFusionConfig(store: HarnessStore, ui: TuiRenderer): void {
   const cur = loadAgentSettings().reasoning.fusion;
+  const main = `${store.state.session.provider}/${store.state.session.model}`;
   ui.openPicker({
-    title: "Ultra + Fusion  (reasoning only)",
+    title: "Ultra + Fusion  (both reason · main compares & executes)",
     options: [
       {
         value: "models",
-        label: "Select models",
+        label: "Secondary reasoner models",
         description:
           cur.modelKeys.length > 0
-            ? `${cur.modelKeys.length} selected`
-            : "auto-pick top reasoning models across providers",
-      },
-      {
-        value: "judge",
-        label: "Judge / fuse model",
-        description: cur.judgeModelKey ?? "(highest reasoning)",
+            ? `${cur.modelKeys.length} selected (reason with main)`
+            : "auto-pick peers (main always reasons too)",
       },
       {
         value: "parallel",
-        label: `Max parallel: ${cur.maxParallel}`,
-        description: "Side-by-side streams",
+        label: `Max secondaries: ${cur.maxParallel}`,
+        description: "Parallel phase-1 reasoners (+ main)",
       },
       {
         value: "analysis",
-        label: "Analysis instructions",
+        label: "Phase-1 reasoning instructions",
         description: truncate(cur.analysisInstructions, 40),
       },
       {
         value: "fuse",
-        label: "Fuse instructions",
+        label: "Main compare instructions",
         description: truncate(cur.fuseInstructions, 40),
       },
       {
         value: "done",
         label: "Done",
-        description: "Keep ultra-fusion active",
+        description: `Main (reason + execute): ${main}`,
       },
     ],
     onSelect: (value) => {
@@ -873,18 +1117,14 @@ function openFusionConfig(store: HarnessStore, ui: TuiRenderer): void {
         void openFusionModelMultiSelect(store, ui);
         return;
       }
-      if (value === "judge") {
-        void openFusionJudgePicker(store, ui);
-        return;
-      }
       if (value === "parallel") {
         ui.openPicker({
-          title: "Max parallel fusion models",
+          title: "Max secondary reasoners",
           current: String(cur.maxParallel),
-          options: [2, 3, 4, 5, 6].map((n) => ({
+          options: [1, 2, 3, 4, 5, 6].map((n) => ({
             value: String(n),
             label: String(n),
-            description: n === 4 ? "default" : "",
+            description: n === 3 ? "default" : "",
           })),
           onSelect: (v) => {
             saveAgentSettings({
@@ -902,13 +1142,24 @@ function openFusionConfig(store: HarnessStore, ui: TuiRenderer): void {
         return;
       }
       if (value === "analysis" || value === "fuse") {
-        const field = value === "analysis" ? "analysisInstructions" : "fuseInstructions";
+        const field =
+          value === "analysis" ? "analysisInstructions" : "fuseInstructions";
         const live = loadAgentSettings().reasoning.fusion;
         ui.openModalInput({
-          title: field === "analysisInstructions" ? "Analysis instructions" : "Fuse instructions",
-          lines: [
-            "REASONING ONLY — models must not claim tool use or file edits",
-          ],
+          title:
+            field === "analysisInstructions"
+              ? "Phase-1 reasoning instructions"
+              : "Main compare instructions",
+          lines:
+            field === "analysisInstructions"
+              ? [
+                  "Sent to main + secondaries in the reason-only pass",
+                  "No tools or edits in phase 1",
+                ]
+              : [
+                  "Sent to main with both reasonings",
+                  "Main compares, merges, then executes with tools",
+                ],
           placeholder: live[field],
           onSubmit: (text) => {
             saveAgentSettings({
@@ -951,8 +1202,48 @@ async function openFusionModelMultiSelect(
   const show = (): void => {
     const fusion = loadAgentSettings().reasoning.fusion;
     const selected = new Set(fusion.modelKeys);
+    const toggle = (value: string) => {
+      if (value === "__done__") {
+        const n = loadAgentSettings().reasoning.fusion.modelKeys.length;
+        notify(
+          store,
+          n >= 1
+            ? `secondary reasoners: ${n}`
+            : "no secondaries selected — will auto-pick at runtime",
+        );
+        openFusionConfig(store, ui);
+        return;
+      }
+      if (value === "__clear__") {
+        saveAgentSettings({
+          reasoning: {
+            fusion: {
+              ...loadAgentSettings().reasoning.fusion,
+              modelKeys: [],
+            },
+          },
+        });
+        show();
+        return;
+      }
+      const live = loadAgentSettings().reasoning.fusion;
+      const set = new Set(live.modelKeys);
+      if (set.has(value)) set.delete(value);
+      else set.add(value);
+      saveAgentSettings({
+        reasoning: {
+          fusion: {
+            ...live,
+            modelKeys: [...set],
+          },
+        },
+      });
+      show();
+    };
     ui.openPicker({
-      title: `Fusion models  (${selected.size} selected, min ${fusion.minModels})`,
+      title: `Secondary reasoners  (${selected.size} selected · reason only)`,
+      searchable: true,
+      closeOnSelect: false,
       options: [
         {
           value: "__done__",
@@ -969,102 +1260,87 @@ async function openFusionModelMultiSelect(
           const on = selected.has(key);
           return {
             value: key,
-            label: `${on ? "*" : " "} ${m.id}`,
-            description: `${m.provider}${m.reasoning ? "  reasoning" : ""}`,
+            label: `${on ? "[on]" : "[  ]"} ${m.provider}/${m.id}`,
+            description: m.reasoning ? "reasoning" : "",
+            cycleValues: ["off", "on"],
+            cycleIndex: on ? 1 : 0,
           };
         }),
       ],
+      // Space / left / right toggle without leaving
+      onActivate: (value) => {
+        if (value === "__done__") {
+          ui.closePicker();
+          toggle(value);
+          return;
+        }
+        toggle(value);
+      },
+      onCycle: (value) => {
+        if (value.startsWith("__")) return;
+        toggle(value);
+      },
       onSelect: (value) => {
         if (value === "__done__") {
-          const n = loadAgentSettings().reasoning.fusion.modelKeys.length;
-          notify(
-            store,
-            n >= 2
-              ? `fusion roster: ${n} models`
-              : "fusion roster empty — will auto-pick at runtime",
-          );
-          openFusionConfig(store, ui);
+          ui.closePicker();
+          toggle(value);
           return;
         }
-        if (value === "__clear__") {
-          saveAgentSettings({
-            reasoning: {
-              fusion: {
-                ...loadAgentSettings().reasoning.fusion,
-                modelKeys: [],
-              },
-            },
-          });
-          show();
-          return;
-        }
-        const live = loadAgentSettings().reasoning.fusion;
-        const set = new Set(live.modelKeys);
-        if (set.has(value)) set.delete(value);
-        else set.add(value);
-        saveAgentSettings({
-          reasoning: {
-            fusion: {
-              ...live,
-              modelKeys: [...set],
-            },
-          },
-        });
-        show();
+        toggle(value);
       },
     });
   };
   show();
 }
 
-async function openFusionJudgePicker(
-  store: HarnessStore,
-  ui: TuiRenderer,
-): Promise<void> {
-  const { models } = await fetchAllConnectedModels({ force: false });
-  const fusion = loadAgentSettings().reasoning.fusion;
-  ui.openPicker({
-    title: "Fusion judge model",
-    current: fusion.judgeModelKey,
-    options: [
-      {
-        value: "",
-        label: "(auto) highest reasoning",
-        description: "Pick strongest available at run time",
-      },
-      ...models.map((m) => ({
-        value: modelKey({ provider: m.provider, model: m.id }),
-        label: m.id,
-        description: m.provider,
-      })),
-    ],
-    onSelect: (value) => {
-      saveAgentSettings({
-        reasoning: {
-          fusion: {
-            ...loadAgentSettings().reasoning.fusion,
-            judgeModelKey: value || undefined,
-          },
-        },
-      });
-      notify(store, value ? `fusion judge → ${value}` : "fusion judge → auto");
-      openFusionConfig(store, ui);
-    },
-  });
-}
-
-/** Route: fusion → live agent (if auth+model) → mock demo. */
+/** Route: ultra-fusion prep → live agent (if auth+model) → mock demo. */
 async function handleUserSubmit(
   text: string,
   store: HarnessStore,
   mock: MockAgent,
   live: AgentLoop,
 ): Promise<void> {
+  const provider = store.state.session.provider as ProviderId;
+  const model = store.state.session.model;
+  const hasAuth =
+    Boolean(getProvider(provider) && resolveToken(provider)) &&
+    model &&
+    model !== "unset" &&
+    model !== "libra-mock" &&
+    model !== "libra-demo";
+
   const mode = loadAgentSettings().reasoning.custom;
+
+  // Ultra + Fusion: secondaries reason only → main reviews & executes with tools
   if (mode === "ultra-fusion") {
-    store.appendUser(text);
+    if (!hasAuth) {
+      notify(
+        store,
+        "ultra-fusion needs a logged-in main model (/login + /model)",
+        "warn",
+      );
+      return;
+    }
     try {
-      await runFusionReasoning(store, text);
+      const settings = loadAgentSettings();
+      const prep = await prepareFusionForMain(
+        store,
+        text,
+        provider,
+        model,
+      );
+      notify(store, prep.summary);
+      const system =
+        buildSystemPrompt(settings.reasoning.customInstructions) +
+        "\n\n" +
+        prep.systemAddon;
+      await live.handle(text, {
+        provider,
+        model,
+        cwd: process.cwd(),
+        tools: true,
+        systemPrompt: system,
+      });
     } catch (err) {
       notify(
         store,
@@ -1075,15 +1351,6 @@ async function handleUserSubmit(
     }
     return;
   }
-
-  const provider = store.state.session.provider as ProviderId;
-  const model = store.state.session.model;
-  const hasAuth =
-    Boolean(getProvider(provider) && resolveToken(provider)) &&
-    model &&
-    model !== "unset" &&
-    model !== "libra-mock" &&
-    model !== "libra-demo";
 
   if (hasAuth) {
     await live.handle(text, {
@@ -1121,112 +1388,162 @@ function openSubagentMenu(
     return;
   }
 
-  ui.openPicker({
-    title: "Subagents",
-    options: [
-      {
-        value: "toggle",
-        label: cfg.subagents.enabled ? "Disable" : "Enable",
-        description: `currently ${cfg.subagents.enabled ? "on" : "off"}`,
-      },
-      {
-        value: "auto",
-        label: "Auto-spawn",
-        description: cfg.subagents.autoSpawn
-          ? "ON — spawn on complex tasks (ultra forces this)"
-          : "OFF — only when explicitly delegated",
-      },
-      {
-        value: "max",
-        label: `Max concurrent: ${cfg.subagents.maxConcurrent}`,
-        description: "Parallel child agents",
-      },
-      {
-        value: "roles",
-        label: "Roles",
-        description: `${cfg.subagents.roles.filter((r) => r.enabled).length}/${cfg.subagents.roles.length} enabled`,
-      },
-      {
-        value: "model",
-        label: "Preferred model",
-        description:
-          cfg.subagents.preferredModelKey ??
-          "(highest reasoning among connected)",
-      },
-      {
-        value: "reset",
-        label: "Reset defaults",
-        description: "Restore default roles and limits",
-      },
-    ],
-    onSelect: (value) => {
-      const live = loadAgentSettings();
-      if (value === "toggle") {
-        saveAgentSettings({
-          subagents: { ...live.subagents, enabled: !live.subagents.enabled },
-        });
-        notify(
-          store,
-          `subagents ${!live.subagents.enabled ? "enabled" : "disabled"}`,
-        );
-      } else if (value === "auto") {
-        saveAgentSettings({
-          subagents: {
-            ...live.subagents,
-            autoSpawn: !live.subagents.autoSpawn,
-            enabled: true,
-          },
-        });
-        notify(
-          store,
-          `auto-spawn ${!live.subagents.autoSpawn ? "on" : "off"}`,
-        );
-      } else if (value === "max") {
-        ui.openPicker({
-          title: "Max concurrent subagents",
-          current: String(live.subagents.maxConcurrent),
-          options: [1, 2, 3, 4, 6, 8].map((n) => ({
-            value: String(n),
-            label: String(n),
-            description: n === 4 ? "default" : "",
-          })),
-          onSelect: (v) => {
-            saveAgentSettings({
-              subagents: {
-                ...loadAgentSettings().subagents,
-                maxConcurrent: Number(v),
-              },
-            });
-            notify(store, `max concurrent → ${v}`);
-          },
-        });
-      } else if (value === "roles") {
-        openRoleEditor(store, ui);
-      } else if (value === "model") {
-        void openModelPicker(store, ui, "").then(() => {
-          const s = store.state.session;
+  const show = (): void => {
+    const live = loadAgentSettings();
+    ui.openPicker({
+      title: "Subagents",
+      closeOnSelect: false,
+      options: [
+        {
+          value: "toggle",
+          label: "Enabled",
+          description: live.subagents.enabled ? "on" : "off",
+          cycleValues: ["off", "on"],
+          cycleIndex: live.subagents.enabled ? 1 : 0,
+        },
+        {
+          value: "auto",
+          label: "Auto-spawn",
+          description: live.subagents.autoSpawn
+            ? "ON — complex tasks (ultra forces this)"
+            : "OFF — explicit only",
+          cycleValues: ["off", "on"],
+          cycleIndex: live.subagents.autoSpawn ? 1 : 0,
+        },
+        {
+          value: "max",
+          label: "Max concurrent",
+          description: String(live.subagents.maxConcurrent),
+          cycleValues: ["1", "2", "3", "4", "6", "8"],
+          cycleIndex: Math.max(
+            0,
+            ["1", "2", "3", "4", "6", "8"].indexOf(
+              String(live.subagents.maxConcurrent),
+            ),
+          ),
+        },
+        {
+          value: "roles",
+          label: "Roles",
+          description: `${live.subagents.roles.filter((r) => r.enabled).length}/${live.subagents.roles.length} enabled`,
+        },
+        {
+          value: "model",
+          label: "Preferred model",
+          description:
+            live.subagents.preferredModelKey ??
+            "(highest reasoning among connected)",
+        },
+        {
+          value: "reset",
+          label: "Reset defaults",
+          description: "Restore default roles and limits",
+        },
+        {
+          value: "done",
+          label: "Done",
+          description: "Close this menu",
+        },
+      ],
+      onActivate: (value) => applySubagentAction(store, ui, value, show),
+      onCycle: (value, dir) => {
+        const s = loadAgentSettings();
+        if (value === "toggle") {
+          saveAgentSettings({
+            subagents: { ...s.subagents, enabled: !s.subagents.enabled },
+          });
+          show();
+        } else if (value === "auto") {
           saveAgentSettings({
             subagents: {
-              ...loadAgentSettings().subagents,
-              preferredModelKey: `${s.provider}/${s.model}`,
+              ...s.subagents,
+              autoSpawn: !s.subagents.autoSpawn,
+              enabled: true,
             },
           });
-          notify(store, `subagent preferred model → ${s.provider}/${s.model}`);
-        });
-      } else if (value === "reset") {
-        saveAgentSettings({
-          subagents: {
-            enabled: true,
-            maxConcurrent: 4,
-            autoSpawn: false,
-            preferredModelKey: undefined,
-            roles: DEFAULT_SUBAGENT_ROLES.map((r) => ({ ...r })),
-          },
-        });
-        notify(store, "subagent config reset");
-      }
-    },
-  });
+          show();
+        } else if (value === "max") {
+          const vals = [1, 2, 3, 4, 6, 8];
+          const i = Math.max(0, vals.indexOf(s.subagents.maxConcurrent));
+          const next = vals[(i + dir + vals.length) % vals.length]!;
+          saveAgentSettings({
+            subagents: { ...s.subagents, maxConcurrent: next },
+          });
+          show();
+        }
+      },
+      onSelect: (value) => {
+        applySubagentAction(store, ui, value, show);
+      },
+    });
+  };
+  show();
+}
+
+function applySubagentAction(
+  store: HarnessStore,
+  ui: TuiRenderer,
+  value: string,
+  redraw: () => void,
+): void {
+  const live = loadAgentSettings();
+  if (value === "done") {
+    ui.closePicker();
+    notify(store, "subagent settings saved", "info");
+    return;
+  }
+  if (value === "toggle") {
+    saveAgentSettings({
+      subagents: { ...live.subagents, enabled: !live.subagents.enabled },
+    });
+    notify(store, `subagents ${!live.subagents.enabled ? "on" : "off"}`);
+    redraw();
+  } else if (value === "auto") {
+    saveAgentSettings({
+      subagents: {
+        ...live.subagents,
+        autoSpawn: !live.subagents.autoSpawn,
+        enabled: true,
+      },
+    });
+    notify(store, `auto-spawn ${!live.subagents.autoSpawn ? "on" : "off"}`);
+    redraw();
+  } else if (value === "max") {
+    // cycle handled by onCycle; activate bumps +1
+    const vals = [1, 2, 3, 4, 6, 8];
+    const i = Math.max(0, vals.indexOf(live.subagents.maxConcurrent));
+    const next = vals[(i + 1) % vals.length]!;
+    saveAgentSettings({
+      subagents: { ...live.subagents, maxConcurrent: next },
+    });
+    notify(store, `max concurrent → ${next}`);
+    redraw();
+  } else if (value === "roles") {
+    openRoleEditor(store, ui);
+  } else if (value === "model") {
+    void openModelPicker(store, ui, "").then(() => {
+      const s = store.state.session;
+      saveAgentSettings({
+        subagents: {
+          ...loadAgentSettings().subagents,
+          preferredModelKey: `${s.provider}/${s.model}`,
+        },
+      });
+      notify(store, `subagent preferred model → ${s.provider}/${s.model}`);
+    });
+  } else if (value === "reset") {
+    saveAgentSettings({
+      subagents: {
+        enabled: true,
+        maxConcurrent: 4,
+        autoSpawn: false,
+        preferredModelKey: undefined,
+        roles: DEFAULT_SUBAGENT_ROLES.map((r) => ({ ...r })),
+      },
+    });
+    notify(store, "subagent config reset");
+    redraw();
+  }
 }
 
 function openRoleEditor(store: HarnessStore, ui: TuiRenderer): void {

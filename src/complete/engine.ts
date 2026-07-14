@@ -16,6 +16,8 @@ import {
   type SessionTokens,
 } from "../memory/session-memory.js";
 import type { HarnessState } from "../core/types.js";
+import type { ProviderId } from "../auth/types.js";
+import { reasoningCompleteValues } from "../agent/reasoning.js";
 
 export type SuggestKind = "command" | "param" | "file" | "path-session";
 
@@ -64,7 +66,7 @@ export function complete(ctx: CompleteContext, limit = 12): CompleteResult {
         lastSpace === -1
           ? cursor - argText.length
           : cursor - argQuery.length;
-      const items = completeParams(cmd, argQuery, limit);
+      const items = completeParams(cmd, argQuery, limit, ctx);
       return {
         items,
         tokenStart,
@@ -192,8 +194,18 @@ function completeParams(
   cmd: SlashCommand,
   query: string,
   limit: number,
+  ctx?: CompleteContext,
 ): Suggestion[] {
-  const values = cmd.params?.flatMap((p) => p.values ?? []) ?? [];
+  // /reasoning — live per-model efforts from catalog cache (never static slop)
+  let values = cmd.params?.flatMap((p) => p.values ?? []) ?? [];
+  if (cmd.name === "reasoning" || cmd.aliases?.includes("reason")) {
+    const session = ctx?.state?.session;
+    values = reasoningCompleteValues(
+      session?.provider as ProviderId | undefined,
+      session?.model,
+    );
+  }
+
   if (values.length === 0) {
     // Freeform param — no enum list; return empty so UI doesn't show junk
     return [];

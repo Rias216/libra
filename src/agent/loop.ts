@@ -14,6 +14,7 @@ import {
 } from "../llm/client.js";
 import { OPENAI_TOOLS } from "../toolcalling/schema.js";
 import { ToolExecutor } from "../toolcalling/executor.js";
+import { resolveEffortForModel } from "./reasoning.js";
 
 const MAX_ROUNDS = 12;
 
@@ -69,9 +70,18 @@ export class AgentLoop {
       while (round < MAX_ROUNDS) {
         if (this.abort) break;
         round++;
+        const { effort, caps, clamped } = resolveEffortForModel(
+          opts.provider,
+          opts.model,
+        );
+        const effortLabel = effort
+          ? `${effort}${clamped ? " (clamped)" : ""}`
+          : "default";
         this.store.setPhase(
           round === 1 ? "streaming" : "tool",
-          round === 1 ? "thinking" : `tool round ${round}`,
+          round === 1
+            ? `streaming · reasoning=${effortLabel}`
+            : `tool round ${round}`,
         );
 
         const textPartId = newId("p");
@@ -82,6 +92,7 @@ export class AgentLoop {
         // Track tool call parts as they stream in
         const toolPartIds = new Map<number, string>();
 
+        // Native API reasoning only — never "please think step by step"
         const result = await chatComplete(
           {
             provider: opts.provider,
@@ -91,10 +102,7 @@ export class AgentLoop {
             tool_choice: opts.tools === false ? "none" : "auto",
             temperature: 0.2,
             stream: true,
-            reasoning_effort:
-              settings.reasoning.effort === "default"
-                ? undefined
-                : settings.reasoning.effort,
+            applyNativeReasoning: true,
           },
           {
             onText: (d) => {
@@ -251,7 +259,7 @@ export class AgentLoop {
   }
 }
 
-function buildSystemPrompt(extra?: string): string {
+export function buildSystemPrompt(extra?: string): string {
   const base = `You are Libra, a fast coding agent in the terminal.
 Use tools to read/search/edit the workspace. Prefer list_dir/grep/read_file before editing.
 Be concise. When done, summarize what you did.

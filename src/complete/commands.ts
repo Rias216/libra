@@ -5,10 +5,7 @@
 import { listThemes } from "../tui/theme.js";
 import { FONT_PROFILES } from "../tui/font.js";
 import { PROVIDERS } from "../auth/types.js";
-import {
-  CUSTOM_REASONING_OPTIONS,
-  PROVIDER_EFFORT_OPTIONS,
-} from "../agent/config.js";
+import { CUSTOM_REASONING_OPTIONS } from "../agent/config.js";
 
 export interface SlashParamValue {
   value: string;
@@ -53,12 +50,7 @@ export const ON_OFF: SlashParamValue[] = [
   { value: "off", description: "Disable" },
 ];
 
-export const REASONING_EFFORT_VALUES: SlashParamValue[] =
-  PROVIDER_EFFORT_OPTIONS.map((o) => ({
-    value: o.value,
-    description: o.description,
-  }));
-
+/** Static harness modes only — effort enums come from live model caps. */
 export const CUSTOM_REASONING_VALUES: SlashParamValue[] =
   CUSTOM_REASONING_OPTIONS.map((o) => ({
     value: o.value,
@@ -113,16 +105,17 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   {
     name: "reasoning",
     aliases: ["reason"],
-    description: "Effort + custom modes (ultra, ultra-fusion multi-model)",
+    description:
+      "Per-model API efforts (live catalog) + ultra / ultra-fusion",
     picker: "select",
     params: [
       {
         name: "mode",
-        description: "effort or custom mode",
-        values: [
-          ...REASONING_EFFORT_VALUES,
-          ...CUSTOM_REASONING_VALUES,
-        ],
+        description:
+          "effort from active model catalog, or ultra / ultra-fusion",
+        // Values filled dynamically in complete engine from supported_efforts
+        freeform: true,
+        values: [],
       },
     ],
   },
