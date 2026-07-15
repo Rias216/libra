@@ -118,6 +118,108 @@ export interface ChatRequest {
   label?: string;
 }
 
+/**
+ * Output token budget — best-of codex + opencode.
+ * OpenCode: min(model.limit.output, 32_000). Codex: large ceilings so reasoning
+ * models do not burn the whole budget on CoT and cut off the spoken answer.
+ * Free-tier models still get a generous floor (reasoning + tools + answer).
+ */
+export const OUTPUT_TOKEN_MAX = 32_000;
+/** Floor when tools are enabled (tool args + answer + some CoT). */
+export const OUTPUT_TOKEN_TOOLS = 16_384;
+/** Floor for free / rate-limited models (still >> old 1536). */
+export const OUTPUT_TOKEN_FREE = 8_192;
+/** Floor for pure chat without tools. */
+export const OUTPUT_TOKEN_CHAT = 8_192;
+/** Max auto-continuations after finish_reason=length (codex/opencode style). */
+export const MAX_LENGTH_CONTINUATIONS = 2;
+
+export function isFreeModelId(model: string): boolean {
+  return /:free$/i.test(model) || /\/free$/i.test(model);
+}
+
+/**
+ * Resolve completion max_tokens for an agent-loop call.
+ * Prefer explicit request override; otherwise pick generous defaults so
+ * reasoning tokens do not starve the answer channel.
+ */
+export function resolveMaxOutputTokens(opts: {
+  model: string;
+  tools?: boolean;
+  explicit?: number;
+  /** When continuing after a length cut-off, bump budget. */
+  lengthContinuation?: boolean;
+}): number {
+  if (opts.explicit != null && opts.explicit > 0) {
+    return Math.min(opts.explicit, OUTPUT_TOKEN_MAX);
+  }
+  const free = isFreeModelId(opts.model);
+  let n = free
+    ? OUTPUT_TOKEN_FREE
+    : opts.tools
+      ? OUTPUT_TOKEN_TOOLS
+      : OUTPUT_TOKEN_CHAT;
+  if (opts.lengthContinuation) {
+    n = Math.min(OUTPUT_TOKEN_MAX, Math.max(n * 2, OUTPUT_TOKEN_TOOLS));
+  }
+  return n;
+}
+
+/** True when the provider hit the output token cap mid-response. */
+export function isLengthFinish(finish: string | null | undefined): boolean {
+  if (!finish) return false;
+  const f = finish.toLowerCase();
+  return f === "length" || f === "max_tokens" || f === "max_output_tokens";
+}
+
+/**
+ * User-side continuation nudge after a length cut-off.
+ * OpenCode/Codex keep the loop alive; we ask the model to resume speaking
+ * without redoing tools when the prior content is already partial.
+ */
+export function lengthContinuationNudge(partialContent: string): string {
+  const tail = partialContent.trim().slice(-200);
+  if (tail) {
+    return (
+      "Your previous response was cut off by the output token limit. " +
+      "Continue EXACTLY from where you left off — do not restart, do not repeat prior text, " +
+      "do not call tools unless essential. Last visible tail:\n" +
+      `"""${tail}"""`
+    );
+  }
+  return (
+    "Your previous response was cut off by the output token limit " +
+    "(often because reasoning used the whole budget). " +
+    "Continue with the final user-facing answer now. Prefer brief reasoning. Do not call tools unless essential."
+  );
+}
+
+/**
+ * True when tool_call.function.arguments is empty or not valid JSON.
+ * Common when finish_reason=length mid-stream before the arg object closed.
+ */
+export function isIncompleteToolArguments(
+  args: string | null | undefined,
+): boolean {
+  const a = (args ?? "").trim();
+  if (!a) return true;
+  try {
+    JSON.parse(a);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** Any tool call in the batch has incomplete/truncated arguments. */
+export function hasBrokenToolCallArgs(
+  toolCalls: Array<{ function?: { arguments?: string } }>,
+): boolean {
+  return toolCalls.some((tc) =>
+    isIncompleteToolArguments(tc.function?.arguments),
+  );
+}
+
 let toolIdSeq = 0;
 function ensureToolId(id: string | undefined, index: number): string {
   if (id && id.length > 0) return id;
@@ -234,30 +336,139 @@ function joinReasoningChunks(...parts: string[]): string {
 /**
  * Keep reasoning out of the final answer channel.
  * - Strips think tags from content into reasoning
- * - Drops content that is an exact (or near-exact) copy of reasoning
+ * - Drops content that is an exact copy of reasoning
+ * - Drops pure plan-speak ("The user wants…") so it never stays as the answer
+ * - Keeps short/answer-like content that merely appears inside longer CoT
  */
 export function partitionModelOutput(
   content: string | null | undefined,
   reasoning: string | null | undefined,
+  opts?: { preservePartialAnswer?: boolean },
 ): { content: string; reasoning: string } {
   const peeled = peelThinkTags(content ?? "");
   let c = peeled.content;
   let r = joinReasoningChunks(reasoning ?? "", peeled.reasoning);
 
-  const ct = c.trim();
-  const rt = r.trim();
+  let ct = c.trim();
+  let rt = r.trim();
 
   // Exact duplicate: model echoed CoT into content
   if (ct && rt && ct === rt) {
+    // Plan-speak echo is never a "partial answer" — always strip from answer channel
+    if (isAllPlanSpeak(ct)) {
+      return { content: "", reasoning: rt };
+    }
+    // When the stream was cut mid-answer, keep text visible (better than empty)
+    if (opts?.preservePartialAnswer) {
+      return { content: c, reasoning: rt };
+    }
     return { content: "", reasoning: rt };
   }
 
-  // Content is a long prefix/suffix of reasoning (common leak pattern)
-  if (ct.length > 80 && rt.length > ct.length && rt.includes(ct)) {
+  // Content fully contained in longer reasoning + plan-speak = CoT leak
+  if (
+    !opts?.preservePartialAnswer &&
+    ct.length > 40 &&
+    rt.length > ct.length &&
+    rt.includes(ct) &&
+    (looksLikePlanSpeak(ct) || isAllPlanSpeak(ct))
+  ) {
     return { content: "", reasoning: rt };
+  }
+
+  // Drop leading plan-speak lines when a real answer follows
+  if (ct) {
+    const afterPeel = peelLeadingPlanSpeak(c, { dropPurePlanSpeak: true });
+    if (afterPeel !== c) {
+      const leaked = c
+        .slice(0, Math.max(0, c.length - afterPeel.length))
+        .trim();
+      if (leaked) r = joinReasoningChunks(r, leaked);
+      c = afterPeel;
+      ct = c.trim();
+      rt = r.trim();
+    }
+  }
+
+  // Entire remaining content is plan-speak → answer channel empty
+  if (ct && isAllPlanSpeak(ct)) {
+    // Preserve real partial answers mid length-cut only when not plan-speak
+    if (!(opts?.preservePartialAnswer && !looksLikePlanSpeak(ct))) {
+      r = joinReasoningChunks(r, ct);
+      c = "";
+    }
   }
 
   return { content: c, reasoning: r };
+}
+
+/** Heuristic: internal planning prose vs user-facing answer. */
+export function looksLikePlanSpeak(text: string): boolean {
+  const t = text.trim();
+  if (t.length < 12) return false;
+  return /^(i (should|will|need|am going|am going to)|let me|first[, ]|okay[, ]|ok[, ]|the user|so i|plan:|steps?:|i'll |i am |i'm )/i.test(
+    t,
+  );
+}
+
+/** True when every non-empty line is plan-speak (no user-facing answer). */
+export function isAllPlanSpeak(text: string): boolean {
+  const lines = text
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines.every(
+    (line) =>
+      looksLikePlanSpeak(line) ||
+      /^(let me|i will|i need to|i'll|okay|ok[,.])/i.test(line),
+  );
+}
+
+/** User-facing answer worth keeping on the text part (not pure CoT). */
+export function isMeaningfulAnswer(text: string | null | undefined): boolean {
+  const t = (text ?? "").trim();
+  if (!t) return false;
+  if (isAllPlanSpeak(t)) return false;
+  return true;
+}
+
+/**
+ * Remove leading plan-speak lines from content, keeping the spoken answer.
+ * When every line is plan-speak and dropPurePlanSpeak, returns "" (answer channel empty).
+ */
+export function peelLeadingPlanSpeak(
+  content: string,
+  opts?: { dropPurePlanSpeak?: boolean },
+): string {
+  const raw = content ?? "";
+  if (!raw.trim()) return raw;
+  const lines = raw.split(/\n/);
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!.trim();
+    if (!line) {
+      i++;
+      continue;
+    }
+    if (
+      looksLikePlanSpeak(line) ||
+      /^(let me|i will|i need to|i'll)\b/i.test(line)
+    ) {
+      i++;
+      continue;
+    }
+    break;
+  }
+  if (i === 0) {
+    // No leading peel, but whole blob may still be one plan-speak paragraph
+    if (opts?.dropPurePlanSpeak !== false && isAllPlanSpeak(raw)) return "";
+    return raw;
+  }
+  const rest = lines.slice(i).join("\n").replace(/^\s+/, "");
+  if (rest.trim()) return rest;
+  // Ate everything
+  return opts?.dropPurePlanSpeak === false ? raw : "";
 }
 
 /**
@@ -312,14 +523,22 @@ export function extractLikelyAnswer(reasoning: string): string {
 export function ensureAnswerChannel(
   content: string | null | undefined,
   reasoning: string | null | undefined,
-  opts?: { rawContentEmpty?: boolean },
+  opts?: {
+    rawContentEmpty?: boolean;
+    /** finish_reason=length / max_tokens — promote a usable answer from CoT */
+    lengthCut?: boolean;
+  },
 ): { content: string; reasoning: string } {
   const c = (content ?? "").trimEnd();
   const r = (reasoning ?? "").trim();
   if (c.trim()) return { content: c, reasoning: r };
   if (!r) return { content: "", reasoning: "" };
-  if (!opts?.rawContentEmpty) return { content: "", reasoning: r };
-  return { content: extractLikelyAnswer(r), reasoning: r };
+  // After a hard length cut with empty answer channel, surface best of CoT
+  // so the UI is not blank and the next continuation has something to extend.
+  if (opts?.lengthCut || opts?.rawContentEmpty) {
+    return { content: extractLikelyAnswer(r), reasoning: r };
+  }
+  return { content: "", reasoning: r };
 }
 
 /**
@@ -523,14 +742,13 @@ async function chatOpenAI(
     body.tools = req.tools;
     body.tool_choice = req.tool_choice ?? "auto";
   }
-  // Free / small models often default to tiny completions; give room for tools
-  if (req.max_tokens != null) {
-    body.max_tokens = req.max_tokens;
-  } else if (req.tools?.length) {
-    body.max_tokens = 4096;
-  } else {
-    body.max_tokens = 2048;
-  }
+  // Generous output budget (opencode 32k cap / codex large ceilings).
+  // Old 2k–4k defaults starved reasoning models and cut off spoken answers.
+  body.max_tokens = resolveMaxOutputTokens({
+    model: req.model,
+    tools: Boolean(req.tools?.length),
+    explicit: req.max_tokens,
+  });
 
   // Native reasoning control (per-model capabilities) — not prompt text.
   if (req.applyNativeReasoning !== false) {
@@ -627,13 +845,17 @@ async function chatOpenAI(
     };
   };
   const msg = json.choices?.[0]?.message;
+  const finishReason = json.choices?.[0]?.finish_reason ?? "stop";
   const rawContent = typeof msg?.content === "string" ? msg.content : "";
   const rawReasoning = extractReasoningFromMessage(msg);
-  const partitioned = partitionModelOutput(rawContent, rawReasoning);
+  const lengthCut = isLengthFinish(finishReason);
+  const partitioned = partitionModelOutput(rawContent, rawReasoning, {
+    preservePartialAnswer: lengthCut,
+  });
   const { content, reasoning } = ensureAnswerChannel(
     partitioned.content,
     partitioned.reasoning,
-    { rawContentEmpty: !rawContent.trim() },
+    { rawContentEmpty: !rawContent.trim(), lengthCut },
   );
   if (content && handlers?.onText) handlers.onText(content);
   if (reasoning && handlers?.onReasoning) handlers.onReasoning(reasoning);
@@ -666,7 +888,7 @@ async function chatOpenAI(
     content: content ?? "",
     reasoning: reasoning || undefined,
     tool_calls,
-    finish_reason: json.choices?.[0]?.finish_reason ?? "stop",
+    finish_reason: finishReason,
     usage,
     ttftMs: durationMs,
     durationMs,
@@ -858,15 +1080,25 @@ async function consumeOpenAIStream(
   emitText(tail.text);
   emitReasoning(tail.reasoning);
 
-  // Final partition: drop content that is a pure reasoning echo
+  // Final partition: drop pure CoT echoes, but keep partial answers on length cuts
   const rawContentEmpty = !content.trim();
-  const partitioned = partitionModelOutput(content, reasoning);
+  const lengthCut = isLengthFinish(finish);
+  const partitioned = partitionModelOutput(content, reasoning, {
+    preservePartialAnswer: lengthCut,
+  });
   content = partitioned.content;
   reasoning = partitioned.reasoning;
-  // Reasoning-only completions (hy3:free) → fill answer only if no content
-  // was ever streamed (not when partition stripped a CoT echo).
-  const ensured = ensureAnswerChannel(content, reasoning, { rawContentEmpty });
-  if (rawContentEmpty && ensured.content.trim() && handlers?.onText) {
+  // Reasoning-only / length-cut completions → fill answer from CoT when needed
+  const ensured = ensureAnswerChannel(content, reasoning, {
+    rawContentEmpty,
+    lengthCut,
+  });
+  if (
+    (rawContentEmpty || lengthCut) &&
+    ensured.content.trim() &&
+    ensured.content !== content &&
+    handlers?.onText
+  ) {
     handlers.onText(ensured.content);
   }
   content = ensured.content;

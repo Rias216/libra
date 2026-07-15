@@ -33,6 +33,8 @@ export interface ToolPart {
   status: ToolStatus;
   result?: string;
   error?: string;
+  /** Provider tool_call id — required for proper multi-turn wire history */
+  callId?: string;
   startedAt?: number;
   finishedAt?: number;
   collapsed?: boolean;

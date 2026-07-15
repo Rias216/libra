@@ -11,10 +11,22 @@ import {
   normalizeToolCalls,
   ensureAnswerChannel,
   extractLikelyAnswer,
+  hasBrokenToolCallArgs,
+  isFreeModelId,
+  isIncompleteToolArguments,
+  isLengthFinish,
+  lengthContinuationNudge,
+  OUTPUT_TOKEN_FREE,
+  OUTPUT_TOKEN_MAX,
+  OUTPUT_TOKEN_TOOLS,
   partitionModelOutput,
+  isAllPlanSpeak,
+  isMeaningfulAnswer,
+  peelLeadingPlanSpeak,
   peelThinkTags,
+  resolveMaxOutputTokens,
 } from "../../../src/llm/client.js";
-import { Suite, assert, assertEq, assertIncludes } from "../runner.js";
+import { Suite, assert, assertEq, assertIncludes, assertGte } from "../runner.js";
 
 export function suiteLlm(): Suite {
   const s = new Suite("llm-helpers");
@@ -206,6 +218,113 @@ export function suiteLlm(): Suite {
     assertEq(msg.tool_calls?.[0]?.function.name, "read_file");
     assertEq(msg.reasoning, "Need file contents before edit");
     assertEq(msg.reasoning_content, "Need file contents before edit");
+  });
+
+  // codex/opencode: generous output budgets so CoT cannot starve the answer
+  s.test("resolveMaxOutputTokens is generous (not 1.5k/4k)", () => {
+    assertEq(isFreeModelId("tencent/hy3:free"), true);
+    assertEq(isFreeModelId("gpt-5"), false);
+    const free = resolveMaxOutputTokens({ model: "tencent/hy3:free", tools: true });
+    assertGte(free, OUTPUT_TOKEN_FREE);
+    assert(free >= 8192, `free budget ${free} too small`);
+    const tools = resolveMaxOutputTokens({ model: "gpt-5", tools: true });
+    assertGte(tools, OUTPUT_TOKEN_TOOLS);
+    assert(tools >= 16384, `tools budget ${tools} too small`);
+    const cont = resolveMaxOutputTokens({
+      model: "gpt-5",
+      tools: true,
+      lengthContinuation: true,
+    });
+    assertGte(cont, tools);
+    assert(cont <= OUTPUT_TOKEN_MAX, String(cont));
+    // explicit override respected but capped
+    assertEq(
+      resolveMaxOutputTokens({ model: "x", tools: true, explicit: 1000 }),
+      1000,
+    );
+  });
+
+  s.test("isLengthFinish + lengthContinuationNudge", () => {
+    assert(isLengthFinish("length"));
+    assert(isLengthFinish("max_tokens"));
+    assert(!isLengthFinish("stop"));
+    const n = lengthContinuationNudge("Hello world this is partial");
+    assertIncludes(n, "cut off");
+    assertIncludes(n, "Continue");
+    assertIncludes(n, "Hello world");
+  });
+
+  s.test("partition keeps short answer even if also in reasoning", () => {
+    // Old code wiped any content fully contained in longer reasoning
+    const r = partitionModelOutput(
+      "Done. Updated loop.ts.",
+      "I should edit the file.\nPlan: change max_tokens.\nDone. Updated loop.ts.\nThen verify.",
+    );
+    assertIncludes(r.content, "Done");
+    assertIncludes(r.reasoning, "Plan");
+  });
+
+  s.test("ensureAnswerChannel promotes on length cut", () => {
+    const cot =
+      "The completion hit max_tokens while I was still thinking.\n" +
+      'I should finish by saying "pong" to the user.\n';
+    const r = ensureAnswerChannel("", cot, { lengthCut: true });
+    assertEq(r.content, "pong");
+    assertIncludes(r.reasoning, "max_tokens");
+  });
+
+  s.test("partition preservePartialAnswer keeps exact echo on length cut", () => {
+    const same = "partial answer cut mid-sente";
+    const r = partitionModelOutput(same, same, { preservePartialAnswer: true });
+    assertIncludes(r.content, "partial answer");
+  });
+
+  s.test("isIncompleteToolArguments / hasBrokenToolCallArgs", () => {
+    assert(isIncompleteToolArguments('{"target_directory":'));
+    assert(isIncompleteToolArguments(""));
+    assert(isIncompleteToolArguments(null));
+    assert(!isIncompleteToolArguments("{}"));
+    assert(
+      !isIncompleteToolArguments('{"target_directory":"."}'),
+    );
+    assert(
+      hasBrokenToolCallArgs([
+        { function: { arguments: '{"a":' } },
+        { function: { arguments: "{}" } },
+      ]),
+    );
+    assert(
+      !hasBrokenToolCallArgs([{ function: { arguments: "{}" } }]),
+    );
+  });
+
+  s.test("peelLeadingPlanSpeak drops The-user-wants prefix", () => {
+    const raw =
+      "The user wants me to list files then answer briefly.\n" +
+      "Top-level: src, package.json";
+    const p = peelLeadingPlanSpeak(raw);
+    assertIncludes(p, "Top-level");
+    assert(!/^the user wants/i.test(p.trim()), p);
+    // via partition
+    const part = partitionModelOutput(raw, "planning…");
+    assertIncludes(part.content, "Top-level");
+    assert(!/^the user wants/i.test(part.content.trim()), part.content);
+  });
+
+  s.test("pure plan-speak is stripped from answer channel", () => {
+    const plan = "The user wants me to use list_dir on the current directory.";
+    assert(isAllPlanSpeak(plan), "isAllPlanSpeak");
+    assert(!isMeaningfulAnswer(plan), "not meaningful");
+    // exact content=reasoning plan-speak echo
+    const r = partitionModelOutput(plan, plan);
+    assertEq(r.content, "");
+    assertIncludes(r.reasoning, "list_dir");
+    // content-only plan-speak (no separate reasoning)
+    const r2 = partitionModelOutput(plan, "");
+    assertEq(r2.content, "");
+    assertIncludes(r2.reasoning, "The user wants");
+    // peel pure plan-speak → empty
+    assertEq(peelLeadingPlanSpeak(plan, { dropPurePlanSpeak: true }), "");
   });
 
   return s;

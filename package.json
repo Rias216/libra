@@ -32,6 +32,8 @@
     "bench:fusion:hy3": "tsx scripts/benchmark-fusion-hy3.ts",
     "bench:fusion-local": "tsx scripts/benchmark-fusion-local.ts",
     "smoke:agent": "tsx scripts/smoke-agent.ts",
+    "smoke:reasoning": "tsx scripts/smoke-reasoning.ts",
+    "headless:debug": "tsx scripts/headless-debug.ts",
     "bench:tools:hy3": "tsx scripts/benchmark-tools-hy3.ts"
   },
 

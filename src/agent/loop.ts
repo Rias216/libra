@@ -18,7 +18,18 @@ import {
   attachInTurnReasoning,
   buildAssistantToolRoundMessage,
   chatComplete,
+  extractLikelyAnswer,
+  isFreeModelId,
+  hasBrokenToolCallArgs,
+  isLengthFinish,
+  isMeaningfulAnswer,
+  lengthContinuationNudge,
+  MAX_LENGTH_CONTINUATIONS,
+  resolveMaxOutputTokens,
   type ChatMessage,
+  type ChatResult,
+  type ChatRequest,
+  type StreamHandlers,
   type ToolCall,
 } from "../llm/client.js";
 import {
@@ -42,9 +53,11 @@ import {
 
 export { buildSystemPrompt } from "./prompt.js";
 
-const MAX_ROUNDS = 12;
+const MAX_ROUNDS = 24;
 /** After this many fully-cached tool rounds, stop tools and demand text */
 const MAX_CACHED_TOOL_ROUNDS = 1;
+/** Tool result snippet size in multi-turn history (opencode keeps more context). */
+const HISTORY_TOOL_SNIPPET = 2_000;
 
 export interface AgentLoopOptions {
   provider: ProviderId;
@@ -81,6 +94,14 @@ export interface AgentLoopOptions {
    * Set false to force single-agent even in ultra.
    */
   subagents?: boolean;
+  /**
+   * Test injection: replace chatComplete (offline loop tests for length_continue /
+   * length_broken_tools). Production callers omit this.
+   */
+  chatImpl?: (
+    req: ChatRequest,
+    handlers?: StreamHandlers,
+  ) => Promise<ChatResult>;
 }
 
 export class AgentLoop {
@@ -191,14 +212,33 @@ export class AgentLoop {
         ...historyToMessages(this.store),
       ];
 
+      // lightReasoning: fusion execute path only — do NOT cripple free models
+      // (old path forced low effort + 1.5k max_tokens → CoT ate the budget).
       const light =
         opts.lightReasoning ?? Boolean(opts.seedReasoning?.trim());
-      const isFree =
-        /:free$/i.test(opts.model) || /\/free$/i.test(opts.model);
+      const isFree = isFreeModelId(opts.model);
 
       let cachedToolRounds = 0;
-      /** After duplicate-only tool round, force tool_choice=none once */
+      /** After duplicate-only tool round OR text length-continue, force tool_choice=none */
       let forceFinalAnswer = false;
+      /** Auto-continue after finish_reason=length (text-only path; tools off). */
+      let lengthContinuations = 0;
+      /**
+       * Broken tool-arg length retries — MUST keep tools enabled.
+       * Separate from lengthContinuations so toolsEnabled is not gated off.
+       */
+      let brokenToolRetries = 0;
+      /** Accumulated spoken text for this turn (for length-continue nudges). */
+      let spokenSoFar = "";
+
+      // One text + reasoning part for the whole turn (not per-round).
+      // Per-round parts left plan-speak permanently in the final answer.
+      const textPartId = newId("p");
+      let textStarted = false;
+      const reasoningPartId = newId("p");
+      let reasoningStarted = false;
+
+      const chat = opts.chatImpl ?? chatComplete;
 
       /** Coalesce high-frequency token events before hitting the store/TUI */
       const streamBatch = createStreamBatcher();
@@ -210,26 +250,36 @@ export class AgentLoop {
         }
         round++;
 
-        const appliedEffort =
-          light || isFree
-            ? "low/fast"
-            : (() => {
-                const { effort, clamped } = resolveEffortForModel(
-                  opts.provider,
-                  opts.model,
-                );
-                return effort
-                  ? `${effort}${clamped ? " (clamped)" : ""}`
-                  : "default";
-              })();
+        const appliedEffort = light
+          ? "low/fast"
+          : (() => {
+              const { effort, clamped } = resolveEffortForModel(
+                opts.provider,
+                opts.model,
+              );
+              return effort
+                ? `${effort}${clamped ? " (clamped)" : ""}`
+                : "default";
+            })();
+
+        const maxTokens = resolveMaxOutputTokens({
+          model: opts.model,
+          tools: opts.tools !== false && !forceFinalAnswer,
+          lengthContinuation:
+            lengthContinuations > 0 || brokenToolRetries > 0,
+        });
 
         this.store.setPhase(
           round === 1 ? "streaming" : "tool",
           forceFinalAnswer
             ? `finalizing · round ${round}`
-            : round === 1
-              ? `streaming · reasoning=${appliedEffort}`
-              : `tool round ${round}`,
+            : brokenToolRetries > 0
+              ? `retry tools · round ${round}`
+              : lengthContinuations > 0
+                ? `continuing · round ${round}`
+                : round === 1
+                  ? `streaming · reasoning=${appliedEffort}`
+                  : `tool round ${round}`,
         );
 
         dbg("agent", `round.${round}.start`, {
@@ -238,27 +288,38 @@ export class AgentLoop {
           light,
           isFree,
           forceFinalAnswer,
+          maxTokens,
+          lengthContinuations,
+          brokenToolRetries,
           cacheSize: toolCache.size,
         });
 
-        const textPartId = newId("p");
-        let textStarted = false;
-        const reasoningPartId = newId("p");
-        let reasoningStarted = false;
         const toolPartIds = new Map<number, string>();
 
         const roundSpan = span("agent", `round.${round}`, {
           model: opts.model,
         });
 
-        const toolsEnabled = opts.tools !== false && !forceFinalAnswer;
+        // Reset the turn text part before each new stream so textDelta does not
+        // append onto prior-round plan-speak (we overwrite after result).
+        if (textStarted && round > 1) {
+          this.store.patchPart(mid, textPartId, {
+            content: "",
+            streaming: true,
+          } as never);
+        }
+
+        // Text length-continue: tools OFF (forceFinalAnswer).
+        // Broken-arg tool retry: tools ON (only forceFinalAnswer gates tools).
+        const toolsEnabled =
+          opts.tools !== false && !forceFinalAnswer;
         const toolSchemas = toolsEnabled
           ? mergeToolSchemas(
               this.runner.registry.schemas(),
               this.subRuntime?.schemas() ?? [],
             )
           : undefined;
-        const result = await chatComplete(
+        const result = await chat(
           {
             provider: opts.provider,
             model: opts.model,
@@ -267,11 +328,14 @@ export class AgentLoop {
             tool_choice: !toolsEnabled
               ? "none"
               : (opts.toolChoice ?? "auto"),
-            temperature: 0.2,
+            // Mild default; leave room for reasoning models (opencode often omits)
+            temperature: light ? 0.2 : 0.4,
             stream: true,
-            applyNativeReasoning: !(light || isFree),
-            reasoning_effort: light || isFree ? "low" : undefined,
-            max_tokens: isFree ? 1536 : 4096,
+            // Native reasoning for all models including free — only skip when
+            // fusion light path explicitly wants a cheap execute step.
+            applyNativeReasoning: !light,
+            reasoning_effort: light ? "low" : undefined,
+            max_tokens: maxTokens,
             signal: opts.abortSignal,
             label: `${label}.r${round}`,
           },
@@ -328,12 +392,18 @@ export class AgentLoop {
                   type: "tool",
                   toolName: partial.function.name,
                   args,
+                  callId: partial.id,
                   status: "pending",
                 });
                 dbg("agent", "tool.pending", {
                   index,
                   name: partial.function.name,
+                  callId: partial.id,
                 });
+              } else if (toolPartIds.has(index) && partial.id) {
+                this.store.patchPart(mid, toolPartIds.get(index)!, {
+                  callId: partial.id,
+                } as never);
               }
             },
             onFirstToken: (kind, ms) => {
@@ -345,31 +415,65 @@ export class AgentLoop {
         // Flush any coalesced stream text before reconciling with result
         streamBatch.flush();
 
-        // Client partitions think-tags / reasoning echoes out of content.
-        // Overwrite store parts so escaped CoT never remains as the answer.
+        // Going to tools this round? (may still be broken-arg recovery)
+        const willRunTools =
+          result.tool_calls.length > 0 &&
+          !forceFinalAnswer &&
+          !(
+            isLengthFinish(result.finish_reason) &&
+            hasBrokenToolCallArgs(result.tool_calls) &&
+            brokenToolRetries < MAX_LENGTH_CONTINUATIONS
+          );
+
+        // spokenSoFar is ONLY for finish_reason=length text continuations.
+        // Never append mid-tool chatter ("AgentLoop") — that prefixes the final
+        // answer when the loop later does spokenSoFar || result.content.
+        //
+        // Mid-tool rounds: clear the answer channel (tools are not the final text).
+        // Length-continue: accumulate in the length_continue branch below.
+        // Natural final: replace with this round's content only.
+        const displayText = willRunTools
+          ? ""
+          : spokenSoFar ||
+            (isMeaningfulAnswer(result.content) ? result.content : "");
+
+        // Overwrite the ONE turn text part (never stack per-round leftovers)
         if (textStarted) {
           this.store.patchPart(mid, textPartId, {
-            content: result.content,
+            content: displayText,
             streaming: false,
           } as never);
-        } else if (result.content) {
+        } else if (displayText) {
           this.store.appendPart(mid, {
             id: textPartId,
             type: "text",
-            content: result.content,
+            content: displayText,
           });
           textStarted = true;
         }
+
+        // Merge reasoning into the single turn reasoning part
+        const reasonText = result.reasoning ?? "";
         if (reasoningStarted) {
+          // Append new reasoning chunks for multi-round turns
+          const prev = this.store.state.messages
+            .find((m) => m.id === mid)
+            ?.parts.find((p) => p.id === reasoningPartId);
+          const prevR =
+            prev && prev.type === "reasoning" ? prev.content : "";
+          const merged =
+            prevR && reasonText && !prevR.includes(reasonText)
+              ? `${prevR}\n\n${reasonText}`
+              : reasonText || prevR;
           this.store.patchPart(mid, reasoningPartId, {
-            content: result.reasoning ?? "",
+            content: merged,
             streaming: false,
           } as never);
-        } else if (result.reasoning?.trim()) {
+        } else if (reasonText.trim()) {
           this.store.appendPart(mid, {
             id: reasoningPartId,
             type: "reasoning",
-            content: result.reasoning,
+            content: reasonText,
             streaming: false,
           });
           reasoningStarted = true;
@@ -387,42 +491,180 @@ export class AgentLoop {
           ttftMs: result.ttftMs,
           tools: result.tool_calls.map((t) => t.function.name),
           contentLen: result.content.length,
+          reasoningLen: result.reasoning?.length ?? 0,
+          displayTextLen: displayText.length,
+          maxTokens,
+          toolsEnabled,
           usage: result.usage,
         });
 
+        // ---- finish_reason=length (text only): tools OFF next round
+        if (
+          isLengthFinish(result.finish_reason) &&
+          !result.tool_calls.length &&
+          lengthContinuations < MAX_LENGTH_CONTINUATIONS
+        ) {
+          lengthContinuations++;
+          // Only place we accumulate spokenSoFar (partial → continue → final)
+          if (isMeaningfulAnswer(result.content)) {
+            spokenSoFar = spokenSoFar
+              ? `${spokenSoFar}${result.content}`
+              : result.content;
+          }
+          if (textStarted) {
+            this.store.patchPart(mid, textPartId, {
+              content: spokenSoFar,
+              streaming: false,
+            } as never);
+          } else if (spokenSoFar) {
+            this.store.appendPart(mid, {
+              id: textPartId,
+              type: "text",
+              content: spokenSoFar,
+            });
+            textStarted = true;
+          }
+          messages.push(
+            attachInTurnReasoning(
+              {
+                role: "assistant",
+                content: isMeaningfulAnswer(result.content)
+                  ? result.content
+                  : null,
+              },
+              result.reasoning,
+            ),
+          );
+          messages.push({
+            role: "user",
+            content: lengthContinuationNudge(
+              spokenSoFar || result.content || result.reasoning || "",
+            ),
+          });
+          forceFinalAnswer = true; // text continue only — tools stay off
+          dbg("agent", `round.${round}.length_continue`, {
+            attempt: lengthContinuations,
+            max: MAX_LENGTH_CONTINUATIONS,
+            toolsEnabledNext: false,
+            partialContent: result.content.length,
+            partialReasoning: result.reasoning?.length ?? 0,
+            spokenSoFarLen: spokenSoFar.length,
+          });
+          continue;
+        }
+
+        // Truncated tool args — retry WITH tools still enabled
+        if (
+          isLengthFinish(result.finish_reason) &&
+          result.tool_calls.length > 0 &&
+          brokenToolRetries < MAX_LENGTH_CONTINUATIONS &&
+          hasBrokenToolCallArgs(result.tool_calls)
+        ) {
+          brokenToolRetries++;
+          // Do NOT set forceFinalAnswer; do NOT bump lengthContinuations for tools gate
+          messages.push(
+            attachInTurnReasoning(
+              {
+                role: "assistant",
+                content: isMeaningfulAnswer(result.content)
+                  ? result.content
+                  : null,
+              },
+              result.reasoning,
+            ),
+          );
+          messages.push({
+            role: "user",
+            content:
+              "Your previous tool call JSON was cut off by the output token limit and is invalid. " +
+              "Retry the needed tool call(s) with complete JSON arguments, or answer without tools if you already can.",
+          });
+          dbg("agent", `round.${round}.length_broken_tools`, {
+            tools: result.tool_calls.map((t) => t.function.name),
+            attempt: brokenToolRetries,
+            toolsEnabledNext: true,
+            forceFinalAnswer: false,
+          });
+          continue;
+        }
+
         // Forced final (or natural stop)
         if (!result.tool_calls.length || forceFinalAnswer) {
-          if (!textStarted && result.content) {
-            this.store.appendPart(mid, {
-              id: newId("p"),
-              type: "text",
-              content: result.content,
-            });
+          let finalText = "";
+          if (spokenSoFar) {
+            // Length-continue path: append this round's final chunk only
+            if (
+              isMeaningfulAnswer(result.content) &&
+              !spokenSoFar.endsWith(result.content)
+            ) {
+              spokenSoFar = `${spokenSoFar}${result.content}`;
+            }
+            finalText = spokenSoFar;
+          } else if (isMeaningfulAnswer(result.content)) {
+            // Natural stop after tools: REPLACE — never prefix mid-tool chatter
+            finalText = result.content;
           }
+          // Reasoning-only stop: promote best answer from CoT (never a stub)
           if (
-            !textStarted &&
-            !result.content &&
-            result.reasoning &&
+            !finalText.trim() &&
+            result.reasoning?.trim() &&
             !result.tool_calls.length
           ) {
-            this.store.appendPart(mid, {
-              id: newId("p"),
-              type: "text",
-              content: "(model produced reasoning only — no final answer)",
-            });
+            const promoted = extractLikelyAnswer(result.reasoning);
+            if (promoted.trim() && isMeaningfulAnswer(promoted)) {
+              finalText = promoted;
+              dbg("agent", `round.${round}.promote_reasoning`, {
+                chars: promoted.length,
+              });
+            }
           }
           // If we forced final but model still emitted tools, drop them
-          if (forceFinalAnswer && result.tool_calls.length && !result.content) {
-            this.store.appendPart(mid, {
-              id: newId("p"),
-              type: "text",
-              content: summarizeFromCache(toolCache),
-            });
+          if (
+            forceFinalAnswer &&
+            result.tool_calls.length &&
+            !finalText.trim()
+          ) {
+            finalText = summarizeFromCache(toolCache);
+          }
+          if (finalText.trim()) {
+            if (textStarted) {
+              this.store.patchPart(mid, textPartId, {
+                content: finalText,
+                streaming: false,
+              } as never);
+            } else {
+              this.store.appendPart(mid, {
+                id: textPartId,
+                type: "text",
+                content: finalText,
+              });
+              textStarted = true;
+            }
+          } else if (textStarted) {
+            this.store.patchPart(mid, textPartId, {
+              content: "",
+              streaming: false,
+            } as never);
           }
           dbg("agent", `round.${round}.stop`, {
-            reason: forceFinalAnswer ? "force_final" : result.finish_reason,
+            reason: forceFinalAnswer
+              ? "force_final"
+              : isLengthFinish(result.finish_reason)
+                ? "length_exhausted"
+                : result.finish_reason,
+            lengthContinuations,
+            brokenToolRetries,
+            finalTextLen: finalText.length,
           });
           break;
+        }
+
+        // Continuing to tools: ensure answer channel is empty (no tool-round leftovers)
+        if (textStarted) {
+          this.store.patchPart(mid, textPartId, {
+            content: "",
+            streaming: false,
+          } as never);
         }
 
         // Normalize tool call args for the wire format
@@ -459,7 +701,7 @@ export class AgentLoop {
           names: validated.map((t) => t.function.name),
         });
 
-        // Ensure UI parts exist before path-aware waves
+        // Ensure UI parts exist before path-aware waves; persist callId for history wire
         for (let i = 0; i < validated.length; i++) {
           const tc = validated[i]!;
           const pid = toolPartIds.get(i) ?? newId("p");
@@ -470,13 +712,17 @@ export class AgentLoop {
               type: "tool",
               toolName: tc.function.name,
               args,
+              callId: tc.id,
               status: "running",
               startedAt: Date.now(),
             });
             toolPartIds.set(i, pid);
           } else {
             this.store.toolStatus(mid, pid, "running");
-            this.store.patchPart(mid, pid, { args } as never);
+            this.store.patchPart(mid, pid, {
+              args,
+              callId: tc.id,
+            } as never);
           }
         }
 
@@ -710,6 +956,10 @@ function summarizeFromCache(cache: Map<string, string>): string {
  * Convert store messages to OpenAI chat messages.
  * Skips the empty assistant shell we just opened for this turn.
  * Reasoning parts are attached (codex/opencode: usable CoT context on wire).
+ *
+ * Tool turns use real tool_calls + tool-role results (not flattened notes),
+ * matching OpenCode MessageV2 / Codex Responses item reconstruction so
+ * multi-turn continuity keeps structured tool context.
  */
 function historyToMessages(store: HarnessStore): ChatMessage[] {
   const out: ChatMessage[] = [];
@@ -742,24 +992,50 @@ function historyToMessages(store: HarnessStore): ChatMessage[] {
         .join("\n\n");
       const tools = m.parts.filter((p) => p.type === "tool");
       if (tools.length) {
-        const notes = tools
-          .map((p) => {
-            if (p.type !== "tool") return "";
-            const snippet =
-              p.status === "completed" && p.result
-                ? String(p.result).slice(0, 400)
-                : p.status;
-            return `[${p.toolName} → ${snippet}]`;
+        const toolCalls: ToolCall[] = tools
+          .map((p, i) => {
+            if (p.type !== "tool") return null;
+            const id =
+              p.callId && p.callId.length > 0
+                ? p.callId
+                : `hist_${m.id}_${i}`;
+            return {
+              id,
+              type: "function" as const,
+              function: {
+                name: p.toolName,
+                arguments: JSON.stringify(p.args ?? {}),
+              },
+            };
           })
-          .filter(Boolean);
-        const content = [text, ...notes].filter(Boolean).join("\n");
-        if (content || reasoning) {
-          out.push(
-            attachInTurnReasoning(
-              { role: "assistant", content: content || null },
-              reasoning,
-            ),
-          );
+          .filter((x): x is ToolCall => x != null);
+
+        out.push(
+          attachInTurnReasoning(
+            {
+              role: "assistant",
+              content: text.trim() ? text : null,
+              tool_calls: toolCalls,
+            },
+            reasoning,
+          ),
+        );
+
+        for (let i = 0; i < tools.length; i++) {
+          const p = tools[i]!;
+          if (p.type !== "tool") continue;
+          const tc = toolCalls[i]!;
+          const body =
+            p.status === "completed" && p.result != null
+              ? String(p.result).slice(0, HISTORY_TOOL_SNIPPET)
+              : p.status === "error" && p.error
+                ? `ERROR: ${String(p.error).slice(0, HISTORY_TOOL_SNIPPET)}`
+                : `[${p.status}]`;
+          out.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: body,
+          });
         }
       } else if (text || reasoning) {
         out.push(

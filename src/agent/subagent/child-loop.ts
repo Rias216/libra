@@ -92,7 +92,9 @@ export async function runChildLoop(
           stream: true,
           applyNativeReasoning: !(opts.lightReasoning || isFree),
           reasoning_effort: opts.lightReasoning || isFree ? "low" : undefined,
-          max_tokens: opts.maxTokens ?? (isFree ? 1024 : 3072),
+          max_tokens:
+            opts.maxTokens ??
+            (isFree ? 8_192 : 16_384),
           signal: opts.signal,
           label: `${label}.r${round}`,
         },
