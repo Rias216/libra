@@ -28,6 +28,11 @@ import {
   toolFingerprint,
 } from "./normalize.js";
 import { resolveToolName } from "./tool.js";
+import {
+  shellDisciplineAdvisory,
+  type ToolTraceCall,
+} from "./discipline.js";
+import { globalLatency } from "./latency.js";
 
 export interface ToolRunnerOptions extends ToolExecutorOptions {
   permissions?: PermissionRules;
@@ -39,6 +44,10 @@ export interface ToolRunnerOptions extends ToolExecutorOptions {
   registry?: ToolRegistry;
   /** In-turn result cache (fingerprint → output) */
   cache?: Map<string, string>;
+  /** Soft [libra:discipline] notes on redundant shell (default true). */
+  disciplineAdvisory?: boolean;
+  /** Record timings into globalLatency (default true). */
+  trackLatency?: boolean;
 }
 
 export interface PreparedCall {
@@ -62,6 +71,8 @@ export class ToolRunner {
   readonly permissions: PermissionChecker;
   readonly registry: ToolRegistry;
   readonly cache: Map<string, string>;
+  /** Prior tool traces this runner instance (for discipline advisory). */
+  readonly history: ToolTraceCall[] = [];
 
   constructor(
     cwd: string = process.cwd(),
@@ -76,6 +87,10 @@ export class ToolRunner {
     );
     this.registry = opts.registry ?? createDefaultRegistry(opts.toolsets);
     this.cache = opts.cache ?? new Map();
+  }
+
+  clearHistory(): void {
+    this.history.length = 0;
   }
 
   setSignal(signal: AbortSignal | undefined): void {
@@ -105,12 +120,16 @@ export class ToolRunner {
     // Cache hit
     const cached = this.cache.get(fp);
     if (cached != null) {
+      const durationMs = Date.now() - t0;
+      if (this.opts.trackLatency !== false) {
+        globalLatency.recordTool(name, durationMs, true);
+      }
       return {
         ok: true,
         output:
           cached +
           "\n\n[cache] Same tool+args already ran this turn — use this result; do not re-request.",
-        durationMs: Date.now() - t0,
+        durationMs,
         name,
         args: normalized,
         fingerprint: fp,
@@ -191,22 +210,51 @@ export class ToolRunner {
 
     const exec = await this.executor.run(name, args);
 
+    let output = exec.output;
+    // Soft discipline advisory for redundant shell / wrong specialized tool
+    if (this.opts.disciplineAdvisory !== false) {
+      const note = shellDisciplineAdvisory(
+        args.command ?? args.cmd,
+        this.history,
+      );
+      if (
+        note &&
+        (name === "run_terminal_command" || name === "bash")
+      ) {
+        output = output + note;
+      }
+    }
+
     await this.registry.runHooks("after", {
       name,
       args,
       result: {
         ok: exec.ok,
-        output: exec.output,
+        output,
         durationMs: exec.durationMs,
       },
     });
 
     if (exec.ok) {
-      this.cache.set(fp, exec.output);
+      this.cache.set(fp, output);
     }
+
+    const durationMs = exec.durationMs ?? Date.now() - t0;
+    if (this.opts.trackLatency !== false) {
+      globalLatency.recordTool(name, durationMs, exec.ok);
+    }
+    this.history.push({
+      name,
+      args,
+      output,
+      ok: exec.ok,
+      durationMs,
+    });
 
     return {
       ...exec,
+      output,
+      durationMs,
       name,
       args,
       fingerprint: fp,

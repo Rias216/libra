@@ -3,6 +3,8 @@
  * Supports both Libra-native names and Fusion catalog aliases.
  */
 
+import { parseToolArgumentsLoose } from "./compat.js";
+
 /** Stable JSON with sorted keys (for fingerprints). */
 export function stableJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
@@ -218,34 +220,7 @@ export function toolFingerprint(
   return `${canonicalToolName(name)}:${stableJson(n)}`;
 }
 
-/** Parse tool arguments JSON with repair (trailing commas, mild fixes). */
+/** Parse tool arguments JSON with multi-model repair (see toolcalling/compat). */
 export function parseToolArgs(raw: string | undefined): Record<string, unknown> {
-  if (!raw || !raw.trim()) return {};
-  const attempts = [
-    raw,
-    // Trailing commas
-    raw.replace(/,\s*([}\]])/g, "$1"),
-    // Single-quoted keys/strings (common model slip) — only when no double quotes
-    !raw.includes('"')
-      ? raw.replace(/'/g, '"')
-      : null,
-    // Truncated trailing junk after final }
-    (() => {
-      const i = raw.lastIndexOf("}");
-      return i > 0 ? raw.slice(0, i + 1).replace(/,\s*([}\]])/g, "$1") : null;
-    })(),
-  ];
-  for (const attempt of attempts) {
-    if (!attempt) continue;
-    try {
-      const v = JSON.parse(attempt);
-      if (v && typeof v === "object" && !Array.isArray(v)) {
-        return v as Record<string, unknown>;
-      }
-      return { _value: v };
-    } catch {
-      /* try next */
-    }
-  }
-  return { _raw: raw };
+  return parseToolArgumentsLoose(raw);
 }

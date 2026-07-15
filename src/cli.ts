@@ -153,6 +153,10 @@ After install:  npm run link   (from the libra repo)
       mockAgent.cancel();
       liveAgent.cancel();
     },
+    // OpenCode-style: click reasoning / tool headers to expand or collapse
+    onTogglePart: (messageId, partId) => {
+      togglePartCollapsed(store, messageId, partId);
+    },
   });
 
   store.subscribe((_event, state) => {
@@ -172,6 +176,47 @@ After install:  npm run link   (from the libra repo)
   process.on("SIGTERM", shutdown);
 
   await ui.start();
+}
+
+/**
+ * OpenCode-style expand/collapse for reasoning, tool, and diff parts.
+ * Pure click on the header row (no drag) invokes this via the renderer.
+ */
+function togglePartCollapsed(
+  store: HarnessStore,
+  messageId: string,
+  partId: string,
+): void {
+  const msg = store.state.messages.find((m) => m.id === messageId);
+  const part = msg?.parts.find((p) => p.id === partId);
+  if (!part) return;
+
+  if (part.type === "reasoning") {
+    // Default: expanded while streaming, folded when done
+    const collapsed =
+      part.collapsed != null ? part.collapsed : !part.streaming;
+    store.patchPart(messageId, partId, {
+      collapsed: !collapsed,
+    } as never);
+    return;
+  }
+
+  if (part.type === "tool") {
+    const collapsed =
+      part.collapsed != null
+        ? part.collapsed
+        : !store.state.showToolDetails;
+    store.patchPart(messageId, partId, {
+      collapsed: !collapsed,
+    } as never);
+    return;
+  }
+
+  if (part.type === "diff") {
+    store.patchPart(messageId, partId, {
+      collapsed: !part.collapsed,
+    } as never);
+  }
 }
 
 function handleCommand(
@@ -201,7 +246,9 @@ function handleCommand(
               "- `/reasoning` — official model effort modes + ultra / ultra-fusion\n" +
               "- `/subagent` — subagent config\n" +
               "- `/verify [provider]` — live model list proves the key\n" +
-              "- `/theme` `/font` `/whoami` `/logout`\n\n" +
+              "- `/theme` `/font` `/whoami` `/logout`\n" +
+              "- `Ctrl+T` — show/hide all thinking blocks\n" +
+              "- **Click** a Thought / tool header to expand or collapse\n\n" +
               "### Reasoning\n\n" +
               "Effort levels are **per model** (from the provider catalog). Esc goes **back** in nested pickers.\n\n" +
               "- **ultra** — max effort + Codex multi-agent (spawn/wait, proactive)\n" +

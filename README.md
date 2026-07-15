@@ -240,6 +240,49 @@ src/
 - **OpenCode** — part polymorphism, tool status machine, UI decoupled from agent loop, frame-diff mindset ([OpenTUI](https://github.com/anomalyco/opentui))
 - **Grok CLI** — themed scrollback + prompt chrome, compact mode, thinking folds, semantic color roles, terminal capability detection
 
+## Profiles & per-model system prompts (OpenCode-style)
+
+Routing mirrors OpenCode `system.ts` → prompt packs in `src/agent/prompts/packs.ts`:
+
+| Pack | When |
+| --- | --- |
+| `anthropic` | Claude |
+| `beast` | gpt-4* / o1 / o3 |
+| `codex` | *codex* models |
+| `gpt` | other GPT |
+| `gemini` | Gemini |
+| `grok` | xAI / Grok |
+| `kimi` | Kimi / Moonshot |
+| `default` | fallback |
+| `slim` | light turns |
+
+```ts
+buildSystemPrompt({ provider: "xai", model: "grok-4.5", cwd });
+// → grok pack + env block + optional AGENTS.md
+
+buildSystemPrompt({ profile: "slim" });
+registry.schemas({ slim: true });
+// TurnOptions: { promptProfile: "slim", slimTools: true }
+```
+
+### Multi-model tool calling
+
+| Provider API | Tools |
+| --- | --- |
+| OpenAI-compatible (OpenAI, xAI, OpenRouter, …) | native `tools` / `tool_calls` |
+| Anthropic | `tools` + `tool_use` / `tool_result` blocks |
+| Gemini | `functionDeclarations` + `functionCall` / `functionResponse` |
+
+Compat helpers (`src/toolcalling/compat.ts`): arg JSON repair, alias normalization, per-model caps (parallel, max tools), Anthropic/Gemini schema conversion.
+
+### Tool discipline
+
+`ToolRunner` appends a soft `[libra:discipline]` note when shell is used to echo a prior tool result or replace list_dir/read_file/grep. See `src/toolcalling/discipline.ts`.
+
+### Latency
+
+Tool timings accumulate in `globalLatency` (`src/toolcalling/latency.ts`). Live runs write `latency.json` (case p50/p95 + shell buckets).
+
 ## License
 
 MIT

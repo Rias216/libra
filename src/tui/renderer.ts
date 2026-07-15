@@ -48,7 +48,13 @@ import {
   promptSubmit,
   type PromptState,
 } from "./prompt.js";
-import { renderDivider, renderHeader, renderStatus } from "./chrome.js";
+import {
+  reasoningModeDisplay,
+  renderDivider,
+  renderHeader,
+  renderStatus,
+} from "./chrome.js";
+import type { RowHit } from "./components/parts.js";
 import { computeScrollbar, scrollPercent } from "./scrollbar.js";
 import { decodeInput, type KeyEvent } from "./input.js";
 import {
@@ -85,7 +91,6 @@ import {
 } from "./modal-input.js";
 import { copyText } from "./clipboard.js";
 import type { Row } from "./components/parts.js";
-import { loadAgentSettings } from "../agent/config.js";
 
 export interface RendererOptions {
   theme?: string;
@@ -94,6 +99,11 @@ export interface RendererOptions {
   onSubmit?: (text: string) => void;
   onCommand?: (cmd: string, args: string) => void;
   onQuit?: () => void;
+  /**
+   * Toggle collapse on a reasoning / tool / diff part (OpenCode-style).
+   * Click on the part header when selection is empty (pure click).
+   */
+  onTogglePart?: (messageId: string, partId: string) => void;
 }
 
 export class TuiRenderer {
@@ -145,6 +155,8 @@ export class TuiRenderer {
   private lastScrollH = 0;
   /** Plain-text lines of last painted scrollback document (for selection copy) */
   private lastDocPlain: string[] = [];
+  /** Per-line click targets (reasoning/tool headers) for expand/collapse */
+  private lastDocHits: (RowHit | null)[] = [];
   /** Geometry of last paint (for mouse hit-testing) */
   private layout = {
     padX: 2,
@@ -152,6 +164,12 @@ export class TuiRenderer {
     scrollH: 0,
     contentWidth: 80,
   };
+  /** Track pure click vs drag so we can expand/collapse without selecting */
+  private mouseDown: {
+    docLine: number;
+    col: number;
+    moved: boolean;
+  } | null = null;
   /** Text selection in document coords (line + column in plain text) */
   private selection: {
     active: boolean;
@@ -399,7 +417,7 @@ export class TuiRenderer {
       if (
         this.state.phase !== "idle" ||
         this.hasStreaming() ||
-        this.hasUltraGlow() ||
+        this.hasReasoningModeGlow() ||
         this.copyFlash
       ) {
         this.requestPaint();
@@ -455,14 +473,10 @@ export class TuiRenderer {
     return false;
   }
 
-  /** True when bottom-right Ultra glow should animate. */
-  private hasUltraGlow(): boolean {
-    try {
-      const c = loadAgentSettings().reasoning.custom;
-      return c === "ultra" || c === "ultra-fusion";
-    } catch {
-      return false;
-    }
+  /** True when bottom-right reasoning-mode label should animate. */
+  private hasReasoningModeGlow(): boolean {
+    if (!this.state) return false;
+    return reasoningModeDisplay(this.state) != null;
   }
 
   private refreshComplete(): void {
@@ -593,6 +607,7 @@ export class TuiRenderer {
   /**
    * Left-drag in the scrollback pane selects plain message text and
    * auto-copies on release (no header/prompt/status chrome).
+   * Pure click (no drag) on a reasoning/tool header toggles collapse.
    */
   private handleMouse(ev: KeyEvent): void {
     // Don't fight pickers/modals
@@ -610,15 +625,17 @@ export class TuiRenderer {
       if (ev.release && this.selection?.active) {
         this.finishSelectionCopy();
       }
+      this.mouseDown = null;
       return;
     }
 
     const docLine = this.scrollOffset + (y - scrollTop);
     const col = Math.max(0, x - padX);
-    const line = Math.max(0, Math.min(docLine, this.lastDocPlain.length - 1));
+    const line = Math.max(0, docLine);
 
     if (!ev.release && !ev.drag) {
-      // Press — start selection
+      // Press — remember for click vs drag; start soft selection
+      this.mouseDown = { docLine: line, col, moved: false };
       this.selection = {
         active: true,
         anchorLine: line,
@@ -632,6 +649,13 @@ export class TuiRenderer {
     }
 
     if (ev.drag && this.selection) {
+      if (
+        this.mouseDown &&
+        (Math.abs(line - this.mouseDown.docLine) > 0 ||
+          Math.abs(col - this.mouseDown.col) > 1)
+      ) {
+        this.mouseDown.moved = true;
+      }
       this.selection.focusLine = line;
       this.selection.focusCol = col;
       this.selection.active = true;
@@ -639,10 +663,30 @@ export class TuiRenderer {
       return;
     }
 
-    if (ev.release && this.selection) {
-      this.selection.focusLine = line;
-      this.selection.focusCol = col;
-      this.finishSelectionCopy();
+    if (ev.release) {
+      const wasClick =
+        this.mouseDown &&
+        !this.mouseDown.moved &&
+        Math.abs(line - this.mouseDown.docLine) === 0 &&
+        Math.abs(col - this.mouseDown.col) <= 1;
+      this.mouseDown = null;
+
+      // Pure click on a collapsible header → expand/collapse (OpenCode)
+      if (wasClick) {
+        const hit = this.lastDocHits[line];
+        if (hit?.action === "toggle-collapse") {
+          this.selection = null;
+          this.opts.onTogglePart?.(hit.messageId, hit.partId);
+          this.paint();
+          return;
+        }
+      }
+
+      if (this.selection) {
+        this.selection.focusLine = line;
+        this.selection.focusCol = col;
+        this.finishSelectionCopy();
+      }
     }
   }
 
@@ -1254,7 +1298,7 @@ export class TuiRenderer {
 
     // Plain text only when selecting (copy) — skip join cost during stream
     const needPlain = Boolean(this.selection) || this.focus === "scrollback";
-    const { rows: doc, plain } = buildScrollDocument(
+    const { rows: doc, plain, hits } = buildScrollDocument(
       state,
       this.theme,
       contentWidth,
@@ -1263,6 +1307,7 @@ export class TuiRenderer {
     );
     this.lastDocLen = doc.length;
     this.lastScrollH = scrollH;
+    this.lastDocHits = hits;
     if (needPlain) this.lastDocPlain = plain;
 
     if (this.following) {

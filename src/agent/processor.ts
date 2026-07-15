@@ -239,27 +239,36 @@ export function createSampleProcessor(
 
       const reasonText = sample.reasoning ?? "";
       if (reasoningStarted) {
-        store.patchPart(messageId, reasoningPartId, {
-          streaming: false,
-        } as never);
-        // If stream missed reasoning but result has it, merge
-        if (reasonText) {
-          const msg = store.state.messages.find((m) => m.id === messageId);
-          const part = msg?.parts.find((p) => p.id === reasoningPartId);
-          const cur =
-            part && part.type === "reasoning" ? part.content : "";
-          if (reasonText.length > cur.length && !cur.includes(reasonText)) {
-            store.patchPart(messageId, reasoningPartId, {
-              content: cur ? `${cur}\n\n${reasonText}` : reasonText,
-              streaming: false,
-            } as never);
-          }
+        const msg = store.state.messages.find((m) => m.id === messageId);
+        const part = msg?.parts.find((p) => p.id === reasoningPartId);
+        const cur =
+          part && part.type === "reasoning" ? part.content : "";
+        // OpenCode: fold thoughts when the stream ends unless the user
+        // explicitly expanded (collapsed === false) mid-stream.
+        const keepOpen =
+          part &&
+          part.type === "reasoning" &&
+          part.collapsed === false;
+        const patch: {
+          streaming: false;
+          collapsed?: boolean;
+          content?: string;
+        } = { streaming: false };
+        if (!keepOpen) patch.collapsed = true;
+        if (
+          reasonText &&
+          reasonText.length > cur.length &&
+          !cur.includes(reasonText)
+        ) {
+          patch.content = cur ? `${cur}\n\n${reasonText}` : reasonText;
         }
+        store.patchPart(messageId, reasoningPartId, patch as never);
       } else if (reasonText.trim()) {
         store.appendPart(messageId, {
           id: reasoningPartId,
           type: "reasoning",
           content: reasonText,
+          collapsed: true,
         });
         reasoningStarted = true;
       }

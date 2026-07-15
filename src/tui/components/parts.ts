@@ -17,10 +17,19 @@ import type {
   ToolPart,
 } from "../../core/types.js";
 
+/** Click / keyboard target for collapsible rows (reasoning, tools, diffs). */
+export interface RowHit {
+  action: "toggle-collapse";
+  messageId: string;
+  partId: string;
+}
+
 export interface Row {
   segments: { text: string; style: Style }[];
   /** Optional full-line background */
   bg?: Style["bg"];
+  /** When set, a click on this row toggles the part (OpenCode-style). */
+  hit?: RowHit;
 }
 
 const SPINNER = ["|", "/", "-", "\\"];
@@ -37,6 +46,8 @@ export function renderPart(
     showToolDetails: boolean;
     showThinking: boolean;
     tick: number;
+    /** Required for click-to-expand hit targets */
+    messageId?: string;
   },
 ): Row[] {
   switch (part.type) {
@@ -44,12 +55,12 @@ export function renderPart(
       return renderText(part, theme, opts.width);
     case "reasoning":
       return opts.showThinking
-        ? renderReasoning(part, theme, opts.width, opts.tick)
+        ? renderReasoning(part, theme, opts.width, opts.tick, opts.messageId)
         : [];
     case "tool":
       return renderTool(part, theme, opts);
     case "diff":
-      return renderDiff(part, theme, opts.width);
+      return renderDiff(part, theme, opts.width, opts.messageId);
     case "file":
       return renderFile(part, theme, opts.width);
     case "status":
@@ -57,6 +68,20 @@ export function renderPart(
     default:
       return [];
   }
+}
+
+/** OpenCode default: expanded while streaming, folded when finished. */
+export function isReasoningCollapsed(part: ReasoningPart): boolean {
+  if (part.collapsed != null) return part.collapsed;
+  return !part.streaming;
+}
+
+export function isToolCollapsed(
+  part: ToolPart,
+  showToolDetails: boolean,
+): boolean {
+  if (part.collapsed != null) return part.collapsed;
+  return !showToolDetails;
 }
 
 function segsToRows(lines: RenderLine[]): Row[] {
@@ -135,24 +160,46 @@ function renderReasoning(
   theme: Theme,
   width: number,
   tick: number,
+  messageId?: string,
 ): Row[] {
   const rows: Row[] = [];
-  const icon = part.streaming ? spinnerFrame(tick) : "*";
-  const label = part.streaming ? "thinking" : "thought";
-  const collapsed = part.collapsed ?? (!part.streaming && part.content.length > 400);
+  const collapsed = isReasoningCollapsed(part);
+  // OpenCode-style chevron: collapsed ▶ / expanded ▼ (ASCII fallback)
+  const chevron = part.streaming
+    ? spinnerFrame(tick)
+    : collapsed
+      ? ">"
+      : "v";
+  const label = part.streaming ? "Thinking" : "Thought";
+  const sizeHint = formatSizeHint(part.content);
+  const meta = part.streaming
+    ? " streaming"
+    : collapsed
+      ? sizeHint
+        ? `  ${sizeHint}  click to expand`
+        : "  click to expand"
+      : sizeHint
+        ? `  ${sizeHint}  click to collapse`
+        : "  click to collapse";
+
+  const hit: RowHit | undefined =
+    messageId && !part.streaming
+      ? { action: "toggle-collapse", messageId, partId: part.id }
+      : undefined;
 
   rows.push({
     segments: [
-      { text: `${icon} `, style: { fg: theme.thinking } },
+      { text: `${chevron} `, style: { fg: theme.thinking, bold: true } },
       {
         text: label,
-        style: { fg: theme.thinking, italic: true, dim: true },
+        style: { fg: theme.thinking, italic: true },
       },
       {
-        text: collapsed ? "  (folded)" : "",
+        text: meta,
         style: { fg: theme.fgFaint, dim: true },
       },
     ],
+    hit,
   });
 
   if (collapsed) return rows;
@@ -197,6 +244,14 @@ function renderReasoning(
   return rows;
 }
 
+function formatSizeHint(content: string): string {
+  const n = content.length;
+  if (n <= 0) return "";
+  if (n < 1000) return `${n} chars`;
+  if (n < 10_000) return `${(n / 1000).toFixed(1)}k chars`;
+  return `${Math.round(n / 1000)}k chars`;
+}
+
 function renderTool(
   part: ToolPart,
   theme: Theme,
@@ -204,6 +259,7 @@ function renderTool(
     width: number;
     showToolDetails: boolean;
     tick: number;
+    messageId?: string;
   },
 ): Row[] {
   const rows: Row[] = [];
@@ -217,9 +273,25 @@ function renderTool(
         : "";
 
   const summary = toolSummary(part);
-  const header = `${icon} ${part.toolName}`;
+  const collapsed = isToolCollapsed(part, opts.showToolDetails);
+  const chevron =
+    part.status === "running"
+      ? ""
+      : collapsed
+        ? "> "
+        : "v ";
+  const header = `${chevron}${icon} ${part.toolName}`;
   const rest = summary ? `  ${summary}` : "";
   const trail = `${duration}`;
+
+  const hit: RowHit | undefined =
+    opts.messageId && part.status !== "running" && part.status !== "pending"
+      ? {
+          action: "toggle-collapse",
+          messageId: opts.messageId,
+          partId: part.id,
+        }
+      : undefined;
 
   rows.push({
     segments: [
@@ -227,9 +299,9 @@ function renderTool(
       { text: rest, style: { fg: theme.fgMuted } },
       { text: trail, style: { fg: theme.fgFaint } },
     ],
+    hit,
   });
 
-  const collapsed = part.collapsed ?? !opts.showToolDetails;
   if (collapsed && part.status !== "error") return rows;
 
   // Args preview
@@ -379,15 +451,26 @@ function formatArgs(
   return lines;
 }
 
-function renderDiff(part: DiffPart, theme: Theme, width: number): Row[] {
+function renderDiff(
+  part: DiffPart,
+  theme: Theme,
+  width: number,
+  messageId?: string,
+): Row[] {
   const rows: Row[] = [];
   const stats = `+${part.additions} -${part.deletions}`;
+  const chevron = part.collapsed ? "> " : "v ";
+  const hit: RowHit | undefined = messageId
+    ? { action: "toggle-collapse", messageId, partId: part.id }
+    : undefined;
   rows.push({
     segments: [
+      { text: chevron, style: { fg: theme.diffMeta } },
       { text: "# ", style: { fg: theme.diffMeta } },
       { text: part.path, style: { fg: theme.fg, bold: true } },
       { text: `  ${stats}`, style: { fg: theme.fgMuted } },
     ],
+    hit,
   });
 
   if (part.collapsed) return rows;

@@ -12,8 +12,13 @@
 import type { HarnessStore } from "../core/store.js";
 import type { ProviderId } from "../auth/types.js";
 import {
+  attachInTurnReasoning,
   buildAssistantToolRoundMessage,
   chatComplete,
+  hasBrokenToolCallArgs,
+  isLengthFinish,
+  lengthContinuationNudge,
+  MAX_LENGTH_CONTINUATIONS,
   type ChatMessage,
   type ChatResult,
   type ChatRequest,
@@ -96,6 +101,10 @@ export interface TurnOptions {
   ) => Promise<ChatResult>;
   headless?: boolean;
   headlessMessages?: ChatMessage[];
+  /** full | slim system prompt (ignored when systemPrompt is set). */
+  promptProfile?: "full" | "slim";
+  /** Short tool descriptions to save prompt tokens. */
+  slimTools?: boolean;
 }
 
 export interface TurnResult {
@@ -192,6 +201,8 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
   let finalText = "";
   let step = 0;
   let cancelled = false;
+  /** Auto-continues after finish_reason=length / broken mid-stream tool args */
+  let lengthContinues = 0;
 
   const compactBudget = hooks.compactBudget ?? COMPACT_TOKEN_BUDGET;
   const keepRecent = hooks.compactKeepRecent ?? 16;
@@ -202,6 +213,23 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
     tools: Boolean(toolSchemas?.length) && toolsEnabledInitially,
     maxSteps,
   });
+
+  /** Finalize mid-stream UI parts even when the sample throws. */
+  const endSample = (
+    stepNo: number,
+    result: ChatResult | null,
+    handlers: StreamHandlers | undefined,
+  ) => {
+    hooks.onSampleEnd?.(
+      stepNo,
+      result ?? {
+        content: "",
+        tool_calls: [],
+        finish_reason: "error",
+      },
+      handlers,
+    );
+  };
 
   try {
     while (step < maxSteps) {
@@ -241,7 +269,9 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         "streaming",
         isLast
           ? `finalizing · step ${step}`
-          : `streaming · step ${step}`,
+          : lengthContinues > 0
+            ? `continuing · step ${step}`
+            : `streaming · step ${step}`,
       );
 
       dbg(ns, `step.${step}.start`, {
@@ -251,44 +281,51 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         maxStepsPrompt: isLast,
         tokensApprox: approxTokensFromMessages(sampleMessages),
         effort,
+        lengthContinues,
       });
 
       const sampleHandlers = hooks.onSampleStart?.(step);
       const roundSpan = span(ns, `step.${step}`, { model });
 
-      const result = await withRetry(
-        () =>
-          chat(
-            {
-              provider,
-              model,
-              messages: sampleMessages,
-              tools: toolsEnabled ? toolSchemas : undefined,
-              tool_choice: !toolsEnabled
-                ? "none"
-                : (toolChoice ?? "auto"),
-              temperature: lightReasoning ? 0.2 : 0.4,
-              stream: true,
-              applyNativeReasoning: true,
-              // No max_tokens — unlimited generation; effort only via API fields
-              signal: abortSignal,
-              label: `${label}.s${step}`,
+      let result: ChatResult;
+      try {
+        result = await withRetry(
+          () =>
+            chat(
+              {
+                provider,
+                model,
+                messages: sampleMessages,
+                tools: toolsEnabled ? toolSchemas : undefined,
+                tool_choice: !toolsEnabled
+                  ? "none"
+                  : (toolChoice ?? "auto"),
+                temperature: lightReasoning ? 0.2 : 0.4,
+                stream: true,
+                applyNativeReasoning: true,
+                // No max_tokens — unlimited generation; effort only via API fields
+                signal: abortSignal,
+                label: `${label}.s${step}`,
+              },
+              sampleHandlers,
+            ),
+          {
+            signal: abortSignal,
+            onRetry: (attempt, err, delayMs) => {
+              dbg(ns, "llm.retry", {
+                attempt,
+                delayMs,
+                error: err instanceof Error ? err.message : String(err),
+              });
             },
-            sampleHandlers,
-          ),
-        {
-          signal: abortSignal,
-          onRetry: (attempt, err, delayMs) => {
-            dbg(ns, "llm.retry", {
-              attempt,
-              delayMs,
-              error: err instanceof Error ? err.message : String(err),
-            });
           },
-        },
-      );
-
-      hooks.onSampleEnd?.(step, result, sampleHandlers);
+        );
+        endSample(step, result, sampleHandlers);
+      } catch (err) {
+        // Clear streaming flags so the UI does not freeze mid-stream
+        endSample(step, null, sampleHandlers);
+        throw err;
+      }
 
       if (result.usage) {
         const p = result.usage.prompt_tokens ?? 0;
@@ -300,82 +337,160 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
 
       // OpenCode: tool_calls present ⇒ continue even if finish_reason=stop
       const openTools = result.tool_calls.filter((t) => t.function?.name);
+      const lengthCut = isLengthFinish(result.finish_reason);
+      const brokenTools =
+        openTools.length > 0 && hasBrokenToolCallArgs(openTools);
+
       roundSpan.end({
         finish: result.finish_reason,
         tools: openTools.map((t) => t.function.name),
         contentLen: result.content.length,
         reasoningLen: result.reasoning?.length ?? 0,
+        lengthCut,
+        brokenTools,
       });
 
-      if (!openTools.length || isLast) {
-        finalText =
+      // Truncated tool args (often finish_reason=length mid JSON): do not
+      // execute — ask the model to re-emit complete calls with tools still on.
+      if (
+        brokenTools &&
+        !isLast &&
+        !cancelled &&
+        lengthContinues < MAX_LENGTH_CONTINUATIONS
+      ) {
+        lengthContinues++;
+        if (result.content?.trim() || result.reasoning?.trim()) {
+          messages.push(
+            attachInTurnReasoning(
+              {
+                role: "assistant",
+                content: result.content?.trim() || null,
+              },
+              result.reasoning,
+            ),
+          );
+        }
+        messages.push({
+          role: "user",
+          content:
+            "Your previous tool call was truncated (incomplete JSON arguments). " +
+            "Retry the tool call(s) with complete, valid JSON. " +
+            "Do not invent results — call the tool again.",
+        });
+        finalText = result.content?.trim() || finalText;
+        dbg(ns, `step.${step}.length_broken_tools`, {
+          lengthContinues,
+          tools: openTools.map((t) => t.function.name),
+        });
+        continue;
+      }
+
+      // Valid tool calls → execute and loop (never on last step)
+      if (openTools.length && !isLast && !brokenTools) {
+        const wireTools = normalizeToolCallsForWire(openTools);
+        const dispatchCalls = buildDispatchCalls(openTools);
+
+        messages.push(
+          buildAssistantToolRoundMessage({
+            content: result.content || null,
+            tool_calls: wireTools,
+            reasoning: result.reasoning,
+          }),
+        );
+
+        hooks.onPhase?.("tool", `running ${dispatchCalls.length} tool(s)`);
+        hooks.onToolsStart?.(dispatchCalls);
+
+        const toolSpan = span(ns, `step.${step}.tools`, {
+          count: dispatchCalls.length,
+          names: dispatchCalls.map((d) => d.name),
+        });
+
+        const outputs = await runtime.dispatchAll(dispatchCalls, {
+          signal: abortSignal,
+          isCustomTool: hooks.isCustomTool,
+          customDispatch: hooks.customDispatch,
+        });
+
+        for (let i = 0; i < outputs.length; i++) {
+          const out = outputs[i]!;
+          const d = dispatchCalls[i]!;
+          toolsUsed.push(out.name);
+          dbg(ns, out.cached ? "tool.cache_hit" : "tool.done", {
+            id: out.callId,
+            name: out.name,
+            ok: out.ok,
+            ms: out.durationMs,
+            cached: out.cached,
+            doomLoop: out.doomLoop,
+            outLen: out.output.length,
+          });
+          hooks.onToolDone?.(i, d, out);
+          messages.push({
+            role: "tool",
+            tool_call_id: out.callId,
+            content: out.output || "(empty)",
+          });
+        }
+
+        toolSpan.end({
+          ok: outputs.filter((o) => o.ok).length,
+          fail: outputs.filter((o) => !o.ok).length,
+        });
+
+        finalText = result.content?.trim() || finalText;
+        continue;
+      }
+
+      // No tools (or last step). Auto-continue when the provider hit its
+      // output token cap mid-answer so responses are not frozen truncated.
+      if (
+        lengthCut &&
+        !isLast &&
+        !cancelled &&
+        lengthContinues < MAX_LENGTH_CONTINUATIONS
+      ) {
+        lengthContinues++;
+        const partial =
           result.content?.trim() ||
           result.reasoning?.trim() ||
-          finalText;
-        dbg(ns, `step.${step}.stop`, {
-          reason: isLast
-            ? "max_steps"
-            : cancelled
-              ? "aborted"
-              : result.finish_reason,
-          tools: openTools.length,
-        });
-        // Last step: never run tools even if model emitted them
-        break;
-      }
-
-      const wireTools = normalizeToolCallsForWire(openTools);
-      const dispatchCalls = buildDispatchCalls(openTools);
-
-      messages.push(
-        buildAssistantToolRoundMessage({
-          content: result.content || null,
-          tool_calls: wireTools,
-          reasoning: result.reasoning,
-        }),
-      );
-
-      hooks.onPhase?.("tool", `running ${dispatchCalls.length} tool(s)`);
-      hooks.onToolsStart?.(dispatchCalls);
-
-      const toolSpan = span(ns, `step.${step}.tools`, {
-        count: dispatchCalls.length,
-        names: dispatchCalls.map((d) => d.name),
-      });
-
-      const outputs = await runtime.dispatchAll(dispatchCalls, {
-        signal: abortSignal,
-        isCustomTool: hooks.isCustomTool,
-        customDispatch: hooks.customDispatch,
-      });
-
-      for (let i = 0; i < outputs.length; i++) {
-        const out = outputs[i]!;
-        const d = dispatchCalls[i]!;
-        toolsUsed.push(out.name);
-        dbg(ns, out.cached ? "tool.cache_hit" : "tool.done", {
-          id: out.callId,
-          name: out.name,
-          ok: out.ok,
-          ms: out.durationMs,
-          cached: out.cached,
-          doomLoop: out.doomLoop,
-          outLen: out.output.length,
-        });
-        hooks.onToolDone?.(i, d, out);
+          finalText ||
+          "";
+        messages.push(
+          attachInTurnReasoning(
+            {
+              role: "assistant",
+              content: result.content?.trim() || null,
+            },
+            result.reasoning,
+          ),
+        );
         messages.push({
-          role: "tool",
-          tool_call_id: out.callId,
-          content: out.output || "(empty)",
+          role: "user",
+          content: lengthContinuationNudge(partial),
         });
+        finalText = result.content?.trim() || finalText;
+        dbg(ns, `step.${step}.length_continue`, {
+          lengthContinues,
+          partialLen: partial.length,
+        });
+        continue;
       }
 
-      toolSpan.end({
-        ok: outputs.filter((o) => o.ok).length,
-        fail: outputs.filter((o) => !o.ok).length,
+      finalText =
+        result.content?.trim() ||
+        result.reasoning?.trim() ||
+        finalText;
+      dbg(ns, `step.${step}.stop`, {
+        reason: isLast
+          ? "max_steps"
+          : cancelled
+            ? "aborted"
+            : result.finish_reason,
+        tools: openTools.length,
+        lengthContinues,
       });
-
-      finalText = result.content?.trim() || finalText;
+      break;
     }
 
     if (!finalText.trim()) {
@@ -475,6 +590,7 @@ export async function runStoreTurn(
       model: opts.model,
       provider: opts.provider,
       cwd: ctx.store.state.session.cwd,
+      profile: opts.promptProfile ?? "full",
     });
 
   if (subRuntime?.canSpawn) {
@@ -496,7 +612,7 @@ export async function runStoreTurn(
   const toolSchemas =
     opts.tools !== false
       ? mergeToolSchemas(
-          runner.registry.schemas(),
+          runner.registry.schemas({ slim: opts.slimTools === true }),
           subRuntime?.schemas() ?? [],
         )
       : undefined;
@@ -599,7 +715,20 @@ export async function runHeadlessTurn(
     signal: opts.abortSignal,
   });
   const runtime = new ToolCallRuntime(runner);
+  // If caller did not inject a system message, build one with profile.
   const messages: ChatMessage[] = [...opts.headlessMessages];
+  if (!messages.some((m) => m.role === "system")) {
+    messages.unshift({
+      role: "system",
+      content: buildSystemPrompt({
+        model: opts.model,
+        provider: opts.provider,
+        cwd,
+        profile: opts.promptProfile ?? "full",
+        extra: opts.systemPrompt,
+      }),
+    });
+  }
   const chat = opts.chatImpl ?? chatComplete;
   const light = Boolean(opts.lightReasoning);
 
@@ -609,7 +738,9 @@ export async function runHeadlessTurn(
       model: opts.model,
       messages,
       toolSchemas:
-        opts.tools !== false ? runner.registry.schemas() : undefined,
+        opts.tools !== false
+          ? runner.registry.schemas({ slim: opts.slimTools === true })
+          : undefined,
       runner,
       runtime,
       maxSteps,

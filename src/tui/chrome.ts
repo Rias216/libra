@@ -1,18 +1,19 @@
 /**
  * Header + status bar chrome.
  * Top-right: plain main / peer models (no rainbow badges).
- * Bottom-right: theme-accent glow for Ultra / Ultra + Fusion when active.
+ * Bottom-right: theme-colored glow for active reasoning mode
+ * (effort levels + Ultra / Ultra + Fusion).
  */
 
 import type { HarnessState } from "../core/types.js";
+import type { ProviderId } from "../auth/types.js";
 import { stringWidth } from "./ansi.js";
 import type { Rgb, Theme } from "./theme.js";
 import type { Row } from "./components/parts.js";
 import { spinnerFrame } from "./components/parts.js";
 import { loadAgentSettings } from "../agent/config.js";
+import { getEffortForModel } from "../agent/reasoning.js";
 import { parseModelKey } from "../auth/models.js";
-
-
 
 export function renderHeader(
   state: HarnessState,
@@ -135,7 +136,7 @@ export function renderStatus(
     phaseStyle = { fg: theme.spinner };
   }
 
-  const modeLabel = ultraModeLabel();
+  const mode = reasoningModeDisplay(state);
   const tokens = `${state.tokens.input + state.tokens.output} tok`;
   const focusHint = focus === "prompt" ? "PROMPT" : "SCROLL";
   const scroll = extra?.scroll ? `  |  ${extra.scroll}` : "";
@@ -157,10 +158,10 @@ export function renderStatus(
   const used = stringWidth(left + mid);
   const room = width - used - 1;
   if (room > 8) {
-    const glowSegs = modeLabel
-      ? animatedGlowSegments(modeLabel, tick, theme)
+    const glowSegs = mode
+      ? animatedGlowSegments(mode.label, mode.kind, tick, theme)
       : [];
-    const glowW = modeLabel ? stringWidth(modeLabel) + 2 : 0;
+    const glowW = mode ? stringWidth(mode.label) + 2 : 0;
     const keysRoom = Math.max(0, room - glowW);
     const keysShown = keys.slice(0, keysRoom);
     const pad = Math.max(
@@ -169,7 +170,7 @@ export function renderStatus(
     );
     segs.push({ text: " ".repeat(Math.min(pad, room)), style: {} });
     segs.push(...glowSegs);
-    if (modeLabel) {
+    if (mode) {
       segs.push({ text: "  ", style: {} });
     }
     if (keysShown) {
@@ -183,25 +184,96 @@ export function renderStatus(
   return { segments: segs };
 }
 
-/**
- * Bottom-right label — plain "Ultra + Fusion" / "Ultra" (no model suffix).
- */
-function ultraModeLabel(): string {
-  try {
-    const custom = loadAgentSettings().reasoning.custom;
-    if (custom === "ultra-fusion") return "Ultra + Fusion";
-    if (custom === "ultra") return "Ultra";
-  } catch {
-    /* ignore */
-  }
-  return "";
+/** Status-bar reasoning mode: harness profile or native effort. */
+export type ReasoningModeKind =
+  | "ultra-fusion"
+  | "ultra"
+  | "max"
+  | "xhigh"
+  | "high"
+  | "medium"
+  | "low"
+  | "minimal"
+  | "none"
+  | "off"
+  | "default"
+  | string;
+
+export interface ReasoningModeDisplay {
+  label: string;
+  kind: ReasoningModeKind;
 }
 
 /**
- * Seamless soft sheen across Ultra / Ultra + Fusion.
+ * Bottom-right label for the active reasoning mode.
+ * Ultra / Ultra + Fusion take priority over native effort.
+ * Effort levels (Max, High, Medium, …) show when no harness profile is on.
+ * Hidden only for model-default (omit) effort.
+ */
+export function reasoningModeDisplay(
+  state: HarnessState,
+): ReasoningModeDisplay | null {
+  try {
+    const cfg = loadAgentSettings();
+    const custom = cfg.reasoning.custom;
+    if (custom === "ultra-fusion") {
+      return { label: "Ultra + Fusion", kind: "ultra-fusion" };
+    }
+    if (custom === "ultra") {
+      return { label: "Ultra", kind: "ultra" };
+    }
+
+    const provider = state.session.provider;
+    const model = state.session.model;
+    let effort: string;
+    if (
+      provider &&
+      provider !== "none" &&
+      model &&
+      model !== "unset"
+    ) {
+      effort = getEffortForModel(provider as ProviderId, model);
+    } else {
+      effort = cfg.reasoning.effort ?? "default";
+    }
+
+    if (!effort || effort === "default") return null;
+    return { label: statusEffortLabel(effort), kind: effort };
+  } catch {
+    return null;
+  }
+}
+
+/** Compact status-bar labels (shorter than full picker labels). */
+function statusEffortLabel(effort: string): string {
+  switch (effort) {
+    case "none":
+      return "None";
+    case "off":
+      return "Off";
+    case "minimal":
+      return "Minimal";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Medium";
+    case "high":
+      return "High";
+    case "xhigh":
+      return "XHigh";
+    case "max":
+      return "Max";
+    default:
+      // Title-case unknown tokens
+      return effort.charAt(0).toUpperCase() + effort.slice(1);
+  }
+}
+
+/**
+ * Seamless soft sheen across the reasoning-mode label.
  *
- * Traveling cosine lobe over theme accent colors — continuous gradients
- * between neighboring characters, mild bright tip (not pure white).
+ * Traveling cosine lobe over theme-derived colors for that mode —
+ * continuous gradients between neighboring characters, mild bright tip.
  * ~0.9s per loop at 30fps for a 14-char label.
  */
 const GLOW_SPEED = 0.39; // chars / tick (~25% slower than 0.52)
@@ -209,6 +281,7 @@ const GLOW_HALF = 2.6; // half-width of the soft lobe (chars)
 
 function animatedGlowSegments(
   label: string,
+  kind: ReasoningModeKind,
   tick: number,
   theme: Theme,
 ): Row["segments"] {
@@ -216,7 +289,7 @@ function animatedGlowSegments(
   const n = chars.length;
   if (n === 0) return [];
 
-  const { dim, peak } = ultraGlowPalette(theme);
+  const { dim, peak } = modeGlowPalette(kind, theme);
   const head = ((tick * GLOW_SPEED) % n + n) % n;
   const segs: Row["segments"] = [];
 
@@ -242,13 +315,102 @@ function animatedGlowSegments(
   return segs;
 }
 
-/** Theme-based dim + peak (accent lifted lightly toward white). */
-function ultraGlowPalette(theme: Theme): { dim: Rgb; peak: Rgb } {
-  const base = theme.thinking ?? theme.accent;
-  const dim = lerpRgb(theme.fgFaint, base, 0.55);
-  // Peak: brighter accent, only a light lift toward white (~30%)
-  const peak = lerpRgb(theme.accent, { r: 255, g: 255, b: 255 }, 0.3);
+/**
+ * Per-mode color pairs drawn from the active theme so every palette
+ * (night, day, tokyo, catppuccin, …) stays coherent.
+ *
+ * Intensity ladder (quiet → loud):
+ *   off/none → minimal → low → medium → high → xhigh/max → ultra → ultra-fusion
+ */
+function modeGlowPalette(
+  kind: ReasoningModeKind,
+  theme: Theme,
+): { dim: Rgb; peak: Rgb } {
+  const base = modeBaseColor(kind, theme);
+  // Quieter modes sit closer to faint; louder modes sit closer to base
+  const dimMix = modeDimMix(kind);
+  const dim = lerpRgb(theme.fgFaint, base, dimMix);
+  // Peak: lift base toward white; louder modes get a brighter tip
+  const peakLift = modePeakLift(kind);
+  const peak = lerpRgb(base, { r: 255, g: 255, b: 255 }, peakLift);
   return { dim, peak };
+}
+
+function modeBaseColor(kind: ReasoningModeKind, theme: Theme): Rgb {
+  switch (kind) {
+    case "ultra-fusion":
+      // Multi-model: thinking (reasoning) accent — most distinctive
+      return theme.thinking ?? theme.accent;
+    case "ultra":
+      return theme.accent;
+    case "max":
+      return theme.accentAssistant ?? theme.accent;
+    case "xhigh":
+      return theme.accentAssistant ?? theme.thinking ?? theme.accent;
+    case "high":
+      return theme.thinking ?? theme.accent;
+    case "medium":
+      return theme.info;
+    case "low":
+      return theme.tool;
+    case "minimal":
+      return theme.fgMuted;
+    case "none":
+    case "off":
+      return theme.fgFaint;
+    default:
+      return theme.fgMuted;
+  }
+}
+
+/** How strongly dim leans toward the mode color (0–1). */
+function modeDimMix(kind: ReasoningModeKind): number {
+  switch (kind) {
+    case "ultra-fusion":
+    case "ultra":
+      return 0.55;
+    case "max":
+    case "xhigh":
+      return 0.5;
+    case "high":
+      return 0.48;
+    case "medium":
+      return 0.45;
+    case "low":
+      return 0.4;
+    case "minimal":
+      return 0.35;
+    case "none":
+    case "off":
+      return 0.25;
+    default:
+      return 0.4;
+  }
+}
+
+/** How much peak lifts toward white (0–1). */
+function modePeakLift(kind: ReasoningModeKind): number {
+  switch (kind) {
+    case "ultra-fusion":
+    case "ultra":
+      return 0.3;
+    case "max":
+    case "xhigh":
+      return 0.28;
+    case "high":
+      return 0.25;
+    case "medium":
+      return 0.22;
+    case "low":
+      return 0.18;
+    case "minimal":
+      return 0.12;
+    case "none":
+    case "off":
+      return 0.08;
+    default:
+      return 0.2;
+  }
 }
 
 function lerpRgb(a: Rgb, b: Rgb, t: number): Rgb {

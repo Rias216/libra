@@ -45,7 +45,7 @@ export function buildScrollDocument(
   contentWidth: number,
   tick: number,
   opts?: { needPlain?: boolean },
-): { rows: Row[]; plain: string[] } {
+): { rows: Row[]; plain: string[]; hits: (import("./components/parts.js").RowHit | null)[] } {
   const needPlain = opts?.needPlain ?? false;
   const liveIds = new Set<string>();
   const layoutOpts = {
@@ -59,7 +59,11 @@ export function buildScrollDocument(
 
   if (state.messages.length === 0) {
     const rows = emptyStateRows(theme, contentWidth);
-    return { rows, plain: needPlain ? rowsToPlain(rows) : [] };
+    return {
+      rows,
+      plain: needPlain ? rowsToPlain(rows) : [],
+      hits: rows.map(() => null),
+    };
   }
 
   const split = findLiveSplit(state);
@@ -128,13 +132,15 @@ export function buildScrollDocument(
   const rows =
     tailRows.length === 0 ? prefixRows : prefixRows.concat(tailRows);
 
-  if (!needPlain) return { rows, plain: [] };
+  const hits = rows.map((r) => r.hit ?? null);
+
+  if (!needPlain) return { rows, plain: [], hits };
 
   const plain =
     tailRows.length === 0
       ? prefixPlain
       : prefixPlain.concat(rowsToPlain(tailRows));
-  return { rows, plain };
+  return { rows, plain, hits };
 }
 
 function makePrefixKey(
@@ -183,11 +189,11 @@ function partQuickSig(p: Part): string {
     case "text":
       return `t${p.content.length}:${hashStr(p.content)}`;
     case "reasoning":
-      return `r${p.content.length}:${hashStr(p.content)}`;
+      return `r${p.content.length}:${p.collapsed === true ? 1 : p.collapsed === false ? 0 : "d"}:${hashStr(p.content)}`;
     case "tool":
-      return `T${p.status}:${p.result?.length ?? 0}:${p.error?.length ?? 0}`;
+      return `T${p.status}:${p.collapsed === true ? 1 : p.collapsed === false ? 0 : "d"}:${p.result?.length ?? 0}:${p.error?.length ?? 0}`;
     case "diff":
-      return `d${p.path}:${p.additions}`;
+      return `d${p.path}:${p.additions}:${p.collapsed ? 1 : 0}`;
     case "file":
       return `f${p.path}`;
     case "status":
@@ -226,7 +232,9 @@ function appendMessage(
 
   for (const part of msg.parts) {
     liveIds.add(part.id);
-    rows.push(...renderPartCached(part, theme, opts));
+    rows.push(
+      ...renderPartCached(part, theme, { ...opts, messageId: msg.id }),
+    );
   }
 }
 
@@ -239,6 +247,7 @@ function renderPartCached(
     showThinking: boolean;
     tick: number;
     themeName: string;
+    messageId?: string;
   },
 ): Row[] {
   const streaming =
@@ -273,18 +282,20 @@ function partSignature(
     showToolDetails: boolean;
     showThinking: boolean;
     themeName: string;
+    messageId?: string;
   },
 ): string {
-  const base = `${opts.themeName}|${opts.width}|${opts.showToolDetails ? 1 : 0}|${opts.showThinking ? 1 : 0}`;
+  const base = `${opts.themeName}|${opts.width}|${opts.showToolDetails ? 1 : 0}|${opts.showThinking ? 1 : 0}|${opts.messageId ?? ""}`;
   switch (part.type) {
     case "text":
       return `${base}|t|${part.content.length}|${hashStr(part.content)}`;
     case "reasoning":
-      return `${base}|r|${part.collapsed ? 1 : 0}|${part.content.length}|${hashStr(part.content)}`;
+      // Include effective collapsed default (undefined → fold when done)
+      return `${base}|r|${part.collapsed === true ? 1 : part.collapsed === false ? 0 : "d"}|${part.content.length}|${hashStr(part.content)}`;
     case "tool":
-      return `${base}|tool|${part.toolName}|${part.status}|${part.collapsed ? 1 : 0}|${part.result?.length ?? 0}|${part.error?.length ?? 0}|${hashStr(JSON.stringify(part.args ?? {}))}`;
+      return `${base}|tool|${part.toolName}|${part.status}|${part.collapsed === true ? 1 : part.collapsed === false ? 0 : "d"}|${part.result?.length ?? 0}|${part.error?.length ?? 0}|${hashStr(JSON.stringify(part.args ?? {}))}`;
     case "diff":
-      return `${base}|diff|${part.path}|${part.additions}|${part.deletions}|${part.hunks?.length ?? 0}`;
+      return `${base}|diff|${part.path}|${part.additions}|${part.deletions}|${part.hunks?.length ?? 0}|${part.collapsed ? 1 : 0}`;
     case "file":
       return `${base}|file|${part.path}|${part.excerpt?.length ?? 0}`;
     case "status":
@@ -320,7 +331,7 @@ function emptyStateRows(theme: Theme, width: number): Row[] {
   const hints = [
     "Type a message and press Enter to send",
     "Tab  focus scrollback   Ctrl+C  quit   Ctrl+L  clear",
-    "/help  slash commands   Ctrl+T  toggle thinking",
+    "/help  slash commands   Ctrl+T  toggle thinking   click Thought to expand",
   ];
   const rows: Row[] = [
     { segments: [] },

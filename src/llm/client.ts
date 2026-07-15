@@ -8,6 +8,14 @@ import { getProvider } from "../auth/types.js";
 import { resolveTokenFresh } from "../auth/api-key.js";
 import { getCredential } from "../auth/store.js";
 import type { OpenAITool } from "../toolcalling/schema.js";
+import {
+  limitToolsForModel,
+  repairToolArgumentsJson,
+  resolveModelToolCaps,
+  toAnthropicTools,
+  toGeminiFunctionDeclarations,
+} from "../toolcalling/compat.js";
+import { resolveToolName } from "../toolcalling/tool.js";
 import { buildReasoningApiFields } from "../agent/reasoning.js";
 import { dbg, dbgTrace, modelTag, span } from "../agent/debug.js";
 
@@ -217,21 +225,22 @@ function ensureToolId(id: string | undefined, index: number): string {
   return `call_${Date.now().toString(36)}_${index}_${toolIdSeq}`;
 }
 
-/** Normalize provider tool_calls (fill missing ids, coerce type). */
+/** Normalize provider tool_calls (fill missing ids, repair args, resolve aliases). */
 export function normalizeToolCalls(
   raw: Array<Partial<ToolCall> & { function?: { name?: string; arguments?: string } }> | undefined,
 ): ToolCall[] {
   if (!raw?.length) return [];
   return raw
     .map((tc, i) => {
-      const name = tc.function?.name ?? "";
-      if (!name) return null;
+      const rawName = tc.function?.name ?? "";
+      if (!rawName) return null;
+      const name = resolveToolName(rawName);
       return {
         id: ensureToolId(tc.id, i),
         type: "function" as const,
         function: {
           name,
-          arguments: tc.function?.arguments ?? "{}",
+          arguments: repairToolArgumentsJson(tc.function?.arguments),
         },
       };
     })
@@ -350,6 +359,11 @@ export function partitionModelOutput(
     }
     // When the stream was cut mid-answer, keep text visible (better than empty)
     if (opts?.preservePartialAnswer) {
+      return { content: c, reasoning: rt };
+    }
+    // Meaningful user-facing answers sometimes land in BOTH channels (esp. high
+    // reasoning models). Keep the answer — blanking yields empty UI / bench fails.
+    if (isMeaningfulAnswer(ct)) {
       return { content: c, reasoning: rt };
     }
     return { content: "", reasoning: rt };
@@ -527,6 +541,14 @@ export function ensureAnswerChannel(
   // so the UI is not blank and the next continuation has something to extend.
   if (opts?.lengthCut || opts?.rawContentEmpty) {
     return { content: extractLikelyAnswer(r), reasoning: r };
+  }
+  // Last resort: answer channel empty after partition but reasoning holds a
+  // real user-facing answer (not pure plan-speak). Prefer that over blank UI.
+  if (isMeaningfulAnswer(r) && !isAllPlanSpeak(r)) {
+    const promoted = extractLikelyAnswer(r);
+    if (promoted.trim() && isMeaningfulAnswer(promoted)) {
+      return { content: promoted, reasoning: r };
+    }
   }
   return { content: "", reasoning: r };
 }
@@ -729,7 +751,12 @@ async function chatOpenAI(
     stream: req.stream !== false,
   };
   if (req.tools?.length) {
-    body.tools = req.tools;
+    const caps = resolveModelToolCaps({
+      provider,
+      model: req.model,
+      modelsStyle: "openai",
+    });
+    body.tools = limitToolsForModel(req.tools, caps);
     body.tool_choice = req.tool_choice ?? "auto";
   }
   // Never impose a max_tokens ceiling — omit unless the caller set one explicitly.
@@ -1126,61 +1153,232 @@ async function consumeOpenAIStream(
   };
 }
 
+/** Convert OpenAI-style chat messages to Gemini contents with functionCall/functionResponse. */
+function toGeminiContents(messages: ChatMessage[]): Array<{ role: string; parts: unknown[] }> {
+  const contents: Array<{ role: string; parts: unknown[] }> = [];
+  const idToName = new Map<string, string>();
+  for (const m of messages) {
+    if (m.role === "system") continue;
+    if (m.role === "user") {
+      contents.push({ role: "user", parts: [{ text: m.content ?? "" }] });
+      continue;
+    }
+    if (m.role === "assistant") {
+      const parts: unknown[] = [];
+      if (m.content?.trim()) parts.push({ text: m.content });
+      for (const tc of m.tool_calls ?? []) {
+        idToName.set(tc.id, tc.function.name);
+        let args: Record<string, unknown> = {};
+        try {
+          args = JSON.parse(repairToolArgumentsJson(tc.function.arguments));
+        } catch {
+          args = {};
+        }
+        parts.push({
+          functionCall: {
+            name: tc.function.name,
+            args,
+          },
+        });
+      }
+      if (!parts.length) parts.push({ text: "" });
+      contents.push({ role: "model", parts });
+      continue;
+    }
+    if (m.role === "tool") {
+      // Gemini expects functionResponse on a user turn
+      const name =
+        m.name ||
+        (m.tool_call_id ? idToName.get(m.tool_call_id) : undefined) ||
+        "tool";
+      let response: unknown = m.content ?? "";
+      try {
+        response = JSON.parse(String(m.content));
+      } catch {
+        response = { result: m.content ?? "" };
+      }
+      contents.push({
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              name,
+              response:
+                typeof response === "object" && response
+                  ? response
+                  : { result: response },
+            },
+          },
+        ],
+      });
+    }
+  }
+  return contents;
+}
+
 async function chatGemini(
   base: string,
   token: string,
   req: ChatRequest,
   handlers?: StreamHandlers,
 ): Promise<ChatResult> {
-  // Fail closed: Gemini adapter does not implement function calling yet.
-  // Silent tool drop was a hard agent-loop bug (tools appeared to "work" but never ran).
-  if (req.tools?.length && req.tool_choice !== "none") {
-    throw new Error(
-      "Gemini tool calling is not implemented in this client — pick an OpenAI-compatible provider (OpenRouter/xAI/OpenAI) for agent tools",
-    );
-  }
   const id = req.model.replace(/^models\//, "");
   const url = `${base}/models/${id}:generateContent?key=${encodeURIComponent(token)}`;
   const system = req.messages.find((m) => m.role === "system")?.content ?? "";
-  const contents = req.messages
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content ?? "" }],
-    }));
+  const contents = toGeminiContents(req.messages);
   const native = buildReasoningApiFields(req.provider, req.model);
-  const genCfg = native.generationConfig as Record<string, unknown> | undefined;
+  const genCfg = (native.generationConfig as Record<string, unknown> | undefined) ?? {};
+  const caps = resolveModelToolCaps({
+    provider: req.provider,
+    model: req.model,
+    modelsStyle: "gemini",
+  });
   const t0 = Date.now();
+
+  const body: Record<string, unknown> = {
+    systemInstruction: system ? { parts: [{ text: system }] } : undefined,
+    contents,
+    generationConfig: genCfg,
+  };
+
+  if (req.tools?.length && req.tool_choice !== "none") {
+    const tools = limitToolsForModel(req.tools, caps);
+    body.tools = [
+      {
+        functionDeclarations: toGeminiFunctionDeclarations(tools),
+      },
+    ];
+    const mode = req.tool_choice === "required" ? "ANY" : "AUTO";
+    body.toolConfig = { functionCallingConfig: { mode } };
+  }
 
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: system ? { parts: [{ text: system }] } : undefined,
-      contents,
-      ...(genCfg ? { generationConfig: genCfg } : {}),
-    }),
+    body: JSON.stringify(body),
     signal: req.signal ?? AbortSignal.timeout(120_000),
   });
   if (!res.ok) {
     throw new Error(
-      `Gemini HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`,
+      `Gemini HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`,
     );
   }
   const json = (await res.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{
+          text?: string;
+          functionCall?: { name?: string; args?: Record<string, unknown> };
+        }>;
+      };
+      finishReason?: string;
+    }>;
+    usageMetadata?: {
+      promptTokenCount?: number;
+      candidatesTokenCount?: number;
+      totalTokenCount?: number;
+    };
   };
-  const text =
-    json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ??
-    "";
-  handlers?.onText?.(text);
+  const parts = json.candidates?.[0]?.content?.parts ?? [];
+  let text = "";
+  const tool_calls: ToolCall[] = [];
+  for (const p of parts) {
+    if (p.text) text += p.text;
+    if (p.functionCall?.name) {
+      tool_calls.push({
+        id: ensureToolId(undefined, tool_calls.length),
+        type: "function",
+        function: {
+          name: resolveToolName(p.functionCall.name),
+          arguments: JSON.stringify(p.functionCall.args ?? {}),
+        },
+      });
+    }
+  }
+  if (text) handlers?.onText?.(text);
+  for (const tc of tool_calls) {
+    handlers?.onToolCallDelta?.(0, tc);
+  }
+  const usage = json.usageMetadata
+    ? {
+        prompt_tokens: json.usageMetadata.promptTokenCount,
+        completion_tokens: json.usageMetadata.candidatesTokenCount,
+        total_tokens: json.usageMetadata.totalTokenCount,
+      }
+    : undefined;
   return {
     content: text,
-    tool_calls: [],
-    finish_reason: "stop",
+    tool_calls: normalizeToolCalls(tool_calls),
+    finish_reason: tool_calls.length
+      ? "tool_calls"
+      : (json.candidates?.[0]?.finishReason?.toLowerCase() ?? "stop"),
+    usage,
     durationMs: Date.now() - t0,
     ttftMs: Date.now() - t0,
   };
+}
+
+/** Convert OpenAI messages to Anthropic content blocks (incl. tool_use / tool_result). */
+function toAnthropicMessages(
+  messages: ChatMessage[],
+): Array<{ role: "user" | "assistant"; content: unknown }> {
+  const out: Array<{ role: "user" | "assistant"; content: unknown }> = [];
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i]!;
+    if (m.role === "system") {
+      i++;
+      continue;
+    }
+    if (m.role === "user") {
+      out.push({ role: "user", content: m.content ?? "" });
+      i++;
+      continue;
+    }
+    if (m.role === "assistant") {
+      const blocks: unknown[] = [];
+      if (m.content?.trim()) {
+        blocks.push({ type: "text", text: m.content });
+      }
+      for (const tc of m.tool_calls ?? []) {
+        let input: Record<string, unknown> = {};
+        try {
+          input = JSON.parse(repairToolArgumentsJson(tc.function.arguments));
+        } catch {
+          input = {};
+        }
+        blocks.push({
+          type: "tool_use",
+          id: tc.id,
+          name: tc.function.name,
+          input,
+        });
+      }
+      out.push({
+        role: "assistant",
+        content: blocks.length ? blocks : [{ type: "text", text: "" }],
+      });
+      i++;
+      continue;
+    }
+    if (m.role === "tool") {
+      // Group consecutive tool results into one user message
+      const results: unknown[] = [];
+      while (i < messages.length && messages[i]!.role === "tool") {
+        const tm = messages[i]!;
+        results.push({
+          type: "tool_result",
+          tool_use_id: tm.tool_call_id ?? "tool",
+          content: tm.content ?? "",
+        });
+        i++;
+      }
+      out.push({ role: "user", content: results });
+      continue;
+    }
+    i++;
+  }
+  return out;
 }
 
 async function chatAnthropic(
@@ -1189,25 +1387,43 @@ async function chatAnthropic(
   req: ChatRequest,
   handlers?: StreamHandlers,
 ): Promise<ChatResult> {
-  // Fail closed: Anthropic adapter does not implement tools/tool_use yet.
-  if (req.tools?.length && req.tool_choice !== "none") {
-    throw new Error(
-      "Anthropic tool calling is not implemented in this client — pick an OpenAI-compatible provider (OpenRouter/xAI/OpenAI) for agent tools",
-    );
-  }
   const system =
     req.messages
       .filter((m) => m.role === "system")
       .map((m) => m.content)
       .join("\n") || undefined;
-  const messages = req.messages
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({ role: m.role, content: m.content ?? "" }));
+  const messages = toAnthropicMessages(req.messages);
   const native = buildReasoningApiFields(req.provider, req.model);
   const thinking = native.thinking as
     | { type: string; budget_tokens: number }
     | undefined;
+  const caps = resolveModelToolCaps({
+    provider: req.provider,
+    model: req.model,
+    modelsStyle: "anthropic",
+  });
   const t0 = Date.now();
+
+  const body: Record<string, unknown> = {
+    model: req.model,
+    max_tokens:
+      req.max_tokens != null && req.max_tokens > 0
+        ? req.max_tokens
+        : ANTHROPIC_REQUIRED_MAX_TOKENS,
+    system,
+    messages,
+    ...(thinking ? { thinking } : {}),
+  };
+
+  if (req.tools?.length && req.tool_choice !== "none") {
+    const tools = limitToolsForModel(req.tools, caps);
+    body.tools = toAnthropicTools(tools);
+    if (req.tool_choice === "required") {
+      body.tool_choice = { type: "any" };
+    } else if (req.tool_choice === "auto" || !req.tool_choice) {
+      body.tool_choice = { type: "auto" };
+    }
+  }
 
   const res = await fetch(`${base}/v1/messages`, {
     method: "POST",
@@ -1216,36 +1432,54 @@ async function chatAnthropic(
       "anthropic-version": "2023-06-01",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: req.model,
-      // Anthropic requires this field; use explicit value or a non-capping default.
-      max_tokens:
-        req.max_tokens != null && req.max_tokens > 0
-          ? req.max_tokens
-          : ANTHROPIC_REQUIRED_MAX_TOKENS,
-      system,
-      messages,
-      ...(thinking ? { thinking } : {}),
-    }),
+    body: JSON.stringify(body),
     signal: req.signal ?? AbortSignal.timeout(180_000),
   });
   if (!res.ok) {
     throw new Error(
-      `Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`,
+      `Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`,
     );
   }
   const json = (await res.json()) as {
-    content?: Array<{ type?: string; text?: string }>;
+    content?: Array<{
+      type?: string;
+      text?: string;
+      id?: string;
+      name?: string;
+      input?: Record<string, unknown>;
+    }>;
+    stop_reason?: string;
+    usage?: { input_tokens?: number; output_tokens?: number };
   };
-  const text = (json.content ?? [])
-    .filter((c) => c.type === "text")
-    .map((c) => c.text ?? "")
-    .join("");
-  handlers?.onText?.(text);
+  let text = "";
+  const tool_calls: ToolCall[] = [];
+  for (const c of json.content ?? []) {
+    if (c.type === "text" && c.text) text += c.text;
+    if (c.type === "tool_use" && c.name) {
+      tool_calls.push({
+        id: c.id || ensureToolId(undefined, tool_calls.length),
+        type: "function",
+        function: {
+          name: resolveToolName(c.name),
+          arguments: JSON.stringify(c.input ?? {}),
+        },
+      });
+    }
+  }
+  if (text) handlers?.onText?.(text);
   return {
     content: text,
-    tool_calls: [],
-    finish_reason: "end_turn",
+    tool_calls: normalizeToolCalls(tool_calls),
+    finish_reason:
+      json.stop_reason === "tool_use" || tool_calls.length
+        ? "tool_calls"
+        : (json.stop_reason ?? "end_turn"),
+    usage: json.usage
+      ? {
+          prompt_tokens: json.usage.input_tokens,
+          completion_tokens: json.usage.output_tokens,
+        }
+      : undefined,
     durationMs: Date.now() - t0,
     ttftMs: Date.now() - t0,
   };

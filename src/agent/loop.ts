@@ -104,6 +104,7 @@ export class AgentLoop {
           type: "reasoning",
           content: opts.seedReasoning.trim(),
           streaming: false,
+          collapsed: true, // OpenCode: folded until user expands
         });
         dbg("agent", "seed_reasoning", {
           chars: opts.seedReasoning.trim().length,

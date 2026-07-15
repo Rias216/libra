@@ -6,6 +6,7 @@
 import type { OpenAITool } from "./schema.js";
 import { OPENAI_TOOLS } from "./schema.js";
 import { CATALOG_TOOLS } from "./catalog.js";
+import { slimToolSchemas } from "./slim-schema.js";
 
 /** Logical groups — enable/disable like Hermes toolsets. */
 export type ToolsetId =
@@ -238,8 +239,11 @@ export class ToolRegistry {
     return this.enabled.has(e.toolset);
   }
 
-  /** OpenAI tool defs for the model (filtered). */
-  schemas(): OpenAITool[] {
+  /**
+   * OpenAI tool defs for the model (filtered).
+   * @param opts.slim short descriptions (fewer prompt tokens)
+   */
+  schemas(opts?: { slim?: boolean }): OpenAITool[] {
     const out: OpenAITool[] = [];
     const seen = new Set<string>();
     for (const t of OPENAI_TOOLS) {
@@ -254,7 +258,7 @@ export class ToolRegistry {
       out.push(t);
       seen.add(t.function.name);
     }
-    return out;
+    return opts?.slim ? slimToolSchemas(out) : out;
   }
 
   listEntries(): RegistryEntry[] {

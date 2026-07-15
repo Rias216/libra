@@ -20,10 +20,7 @@
     "typecheck": "tsc --noEmit",
     "demo": "tsx src/cli.ts",
     "link": "npm run build && npm link",
-    "unlink": "npm unlink -g libra",
-    "test": "tsx src/tui/buffer.test.ts && tsx src/auth/auth.test.ts && tsx src/agent/turn.test.ts",
-    "test:auth": "tsx src/auth/auth.test.ts",
-    "test:auth:live": "tsx src/auth/auth.test.ts --live"
+    "unlink": "npm unlink -g libra"
   },
 
   "keywords": [
