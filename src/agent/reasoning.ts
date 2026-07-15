@@ -243,10 +243,23 @@ function parseCapsFromRaw(
     return { ...DEFAULT_CAPS, source: "api" };
   }
 
-  if (
-    (provider === "openai" || provider === "xai" || provider === "codex") &&
-    efforts.length > 0
-  ) {
+  const openaiFamily =
+    provider === "openai" ||
+    provider === "xai" ||
+    provider === "codex" ||
+    provider === "opencode" ||
+    provider === "opencode-go" ||
+    provider === "deepseek" ||
+    provider === "groq" ||
+    provider === "together" ||
+    provider === "mistral" ||
+    provider === "fireworks" ||
+    provider === "cerebras" ||
+    provider === "moonshot" ||
+    provider === "deepinfra" ||
+    provider === "custom";
+
+  if (openaiFamily && efforts.length > 0) {
     return {
       supported: true,
       efforts,
@@ -256,10 +269,7 @@ function parseCapsFromRaw(
   }
 
   // Direct provider catalogs rarely list effort enums — only then use id heuristics
-  if (
-    (provider === "openai" || provider === "xai" || provider === "codex") &&
-    hasReasoningParam
-  ) {
+  if (openaiFamily && hasReasoningParam) {
     return {
       supported: true,
       efforts: defaultEffortsFor(provider, modelId),
@@ -311,23 +321,144 @@ function defaultEffortsFor(provider: ProviderId, modelId: string): EffortLevel[]
   ) {
     return ["low", "medium", "high"];
   }
-  // GPT-5.x often exposes broader sets including max/xhigh
-  if (/gpt-5|xhigh/.test(id)) {
+  // GPT-5.x / Codex often exposes broader sets including max/xhigh
+  if (/gpt-5|codex|xhigh/.test(id)) {
     return ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
   }
   if (provider === "xai" || /grok/.test(id)) {
-    // xAI Grok: commonly low–high; some accept max
-    if (/grok-4|grok-3-mini|reasoning/.test(id)) {
-      return ["low", "medium", "high"];
-    }
+    // xAI Grok: low–high (console); some gateways also accept none
     return ["low", "medium", "high"];
   }
   if (provider === "openrouter") {
     // Hy3 family: none / low / high only (no medium/max/xhigh)
     if (/hy3|tencent/.test(id)) return ["none", "low", "high"];
+    if (/claude|anthropic/.test(id)) return ["low", "medium", "high", "max"];
+    if (/gemini/.test(id)) return ["low", "medium", "high"];
     return ["none", "low", "medium", "high", "xhigh", "max"];
   }
+  // OpenCode Zen curated models — match family, not invent openrouter max enums
+  if (provider === "opencode") {
+    if (/gpt-5|codex/.test(id)) {
+      return ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    }
+    if (/claude|opus|sonnet|haiku|qwen3\.[567]|qwen3\.7/.test(id)) {
+      return ["low", "medium", "high", "max"];
+    }
+    if (/gemini/.test(id)) return ["low", "medium", "high"];
+    if (/grok/.test(id)) return ["low", "medium", "high"];
+    if (/kimi|glm|deepseek|minimax|mimo|nemotron|pickle|north/.test(id)) {
+      return ["low", "medium", "high"];
+    }
+    return ["low", "medium", "high"];
+  }
+  // OpenCode Go — open coding models via openai-compatible gateway
+  if (provider === "opencode-go") {
+    if (/qwen|minimax/.test(id)) return ["low", "medium", "high", "max"];
+    return ["low", "medium", "high"];
+  }
+  // DeepSeek: reasoner models are thinking-native; chat is not
+  if (provider === "deepseek" || /deepseek/.test(id)) {
+    if (/reasoner|r1|thinking/.test(id)) return ["high"];
+    return [];
+  }
+  // Groq / Together / Fireworks / Cerebras / DeepInfra: only when model id is thinking
+  if (
+    provider === "groq" ||
+    provider === "together" ||
+    provider === "fireworks" ||
+    provider === "cerebras" ||
+    provider === "deepinfra"
+  ) {
+    if (/r1|reason|thinking|qwq|o1|o3|o4|gpt-5/.test(id)) {
+      return ["low", "medium", "high"];
+    }
+    return [];
+  }
+  // Mistral: magistral / reasoning variants
+  if (provider === "mistral") {
+    if (/magistral|reason|thinking/.test(id)) return ["low", "medium", "high"];
+    return [];
+  }
+  // Moonshot / Kimi
+  if (provider === "moonshot" || /kimi/.test(id)) {
+    if (/thinking|reason|k2/.test(id)) return ["low", "medium", "high"];
+    return ["low", "medium", "high"];
+  }
+  if (provider === "anthropic") return ["low", "medium", "high", "max"];
+  if (provider === "gemini") return ["low", "medium", "high"];
   return ["low", "medium", "high"];
+}
+
+/** API style that matches how Libra sends native reasoning fields. */
+function styleForProvider(
+  provider: ProviderId,
+  modelId: string,
+): ReasoningApiStyle {
+  const id = modelId.toLowerCase();
+  if (provider === "anthropic") return "anthropic_thinking";
+  if (provider === "gemini") return "gemini_thinking";
+  if (provider === "openrouter") return "openrouter_reasoning";
+  // Zen routes Claude/Qwen-messages models via thinking budgets when id matches
+  if (provider === "opencode") {
+    if (/claude|opus|sonnet|haiku|qwen3\.[567]|qwen3\.7/.test(id)) {
+      // Zen Claude/Qwen often use Anthropic-compatible messages; Libra chat path
+      // still sends openai effort for chat/completions — prefer openai_effort
+      // for chat/completions models and anthropic style only for claude ids
+      // when the client may map later. Keep openai_effort for gateway unity.
+      return "openai_effort";
+    }
+    return "openai_effort";
+  }
+  if (provider === "opencode-go") return "openai_effort";
+  return "openai_effort";
+}
+
+function modelLooksReasoning(
+  provider: ProviderId,
+  modelId: string,
+  flaggedReasoning: boolean,
+): boolean {
+  const id = modelId.toLowerCase();
+  if (/non[-_]?reason|no[-_]?think|instant|base(?!-reason)|flash-lite/i.test(id)) {
+    return false;
+  }
+  if (flaggedReasoning) return true;
+  // DeepSeek chat is non-reasoning; reasoner is
+  if (provider === "deepseek") {
+    return /reasoner|r1|thinking/.test(id);
+  }
+  if (
+    provider === "groq" ||
+    provider === "together" ||
+    provider === "fireworks" ||
+    provider === "cerebras" ||
+    provider === "deepinfra" ||
+    provider === "mistral"
+  ) {
+    return /r1|reason|thinking|qwq|o1|o3|o4|gpt-5|magistral/.test(id);
+  }
+  if (provider === "opencode" || provider === "opencode-go") {
+    // Curated coding models: most flagship ids support some control
+    if (/free$|flash-free|nano(?!-)|haiku/.test(id) && !/reason|think/.test(id)) {
+      // free/fast variants may still accept effort on Zen — keep true for flagship free too
+    }
+    return (
+      /gpt-5|claude|opus|sonnet|gemini|grok|kimi|glm|deepseek|minimax|mimo|qwen|reason|think|codex|pickle|north|nemotron/.test(
+        id,
+      ) || flaggedReasoning
+    );
+  }
+  if (provider === "anthropic") {
+    return /claude|opus|sonnet|haiku/.test(id);
+  }
+  if (provider === "gemini") {
+    return /gemini|thinking/.test(id);
+  }
+  return (
+    /reason|thinking|o1|o3|o4|r1|opus|gpt-5|hy3|qwq|deepseek-r|codex/i.test(id) ||
+    (/grok/i.test(id) && /reason|4|3-mini|think/i.test(id)) ||
+    (/kimi|moonshot/i.test(id) && /k2|think|reason/i.test(id))
+  );
 }
 
 function heuristicCaps(
@@ -340,30 +471,32 @@ function heuristicCaps(
   if (/non[-_]?reason|no[-_]?think|instant|base(?!-reason)/i.test(id)) {
     return { ...DEFAULT_CAPS, source: "heuristic" };
   }
-  const looks =
-    flaggedReasoning ||
-    /reason|thinking|o1|o3|o4|r1|opus|gpt-5|hy3|qwq|deepseek-r/i.test(id) ||
-    // Grok: only flag when name suggests reasoning / flagship (not all grok ids)
-    (/grok/i.test(id) && /reason|4|3-mini|think/i.test(id));
 
-  if (!looks) {
+  if (!modelLooksReasoning(provider, modelId, flaggedReasoning)) {
     return { ...DEFAULT_CAPS, source: "heuristic" };
   }
 
-  if (provider === "anthropic") {
+  const efforts = defaultEffortsFor(provider, modelId);
+  if (efforts.length === 0) {
+    return { ...DEFAULT_CAPS, source: "heuristic" };
+  }
+
+  const style = styleForProvider(provider, modelId);
+
+  if (style === "anthropic_thinking" || provider === "anthropic") {
     return {
       supported: true,
-      efforts: ["low", "medium", "high", "max"],
+      efforts: efforts.length ? efforts : ["low", "medium", "high", "max"],
       style: "anthropic_thinking",
       maxThinkingTokens: 200_000,
       supportsMaxTokens: true,
       source: "heuristic",
     };
   }
-  if (provider === "gemini") {
+  if (style === "gemini_thinking" || provider === "gemini") {
     return {
       supported: true,
-      efforts: ["low", "medium", "high"],
+      efforts: efforts.length ? efforts : ["low", "medium", "high"],
       style: "gemini_thinking",
       maxThinkingTokens: 200_000,
       source: "heuristic",
@@ -372,14 +505,14 @@ function heuristicCaps(
   if (provider === "openrouter") {
     return {
       supported: true,
-      efforts: defaultEffortsFor(provider, modelId),
+      efforts,
       style: "openrouter_reasoning",
       source: "heuristic",
     };
   }
   return {
     supported: true,
-    efforts: defaultEffortsFor(provider, modelId),
+    efforts,
     style: "openai_effort",
     source: "heuristic",
   };
@@ -596,6 +729,17 @@ export function buildReasoningApiFields(
   return fieldsForEffort(provider, caps, effort);
 }
 
+/**
+ * OpenCode Zen routes many free models through OpenRouter-compatible
+ * backends. Prefer a single effort field to avoid dual-shape 400s:
+ * "Error from provider (Console): Upstream request failed".
+ */
+function opencodeReasoningFields(effort: EffortLevel): Record<string, unknown> {
+  // Nested openrouter-style effort is the safest default for Zen chat/completions
+  // models (deepseek free, mimo, pickle, kimi, glm, grok via Zen).
+  return { reasoning: { effort } };
+}
+
 function fieldsForEffort(
   provider: ProviderId,
   caps: ModelReasoningCaps,
@@ -628,11 +772,19 @@ function fieldsForEffort(
 
     case "openai_effort": {
       const e = effort;
+      // xAI accepts both shapes. OpenCode Zen/Go free models are often
+      // OpenRouter-backed — dual reasoning_effort + reasoning:{effort}
+      // has caused upstream 400s on some models, so send a single shape:
+      //   Zen free / open models → nested reasoning.effort (OR-compatible)
+      //   Zen GPT/Claude-ish ids → top-level reasoning_effort only
       if (provider === "xai") {
         return {
           reasoning_effort: e,
           reasoning: { effort: e },
         };
+      }
+      if (provider === "opencode" || provider === "opencode-go") {
+        return opencodeReasoningFields(e);
       }
       return { reasoning_effort: e };
     }

@@ -23,6 +23,11 @@ export interface ReasoningPart {
   content: string;
   collapsed?: boolean;
   streaming?: boolean;
+  /**
+   * Optional UI label override (e.g. "Main · opencode/…", "Peer · …")
+   * so Ultra+Fusion dual traces are distinguishable.
+   */
+  title?: string;
 }
 
 export interface ToolPart {
@@ -161,8 +166,11 @@ export interface HarnessState {
   draft: string;
   /** Live spinner label while the agent is busy */
   activityLabel?: string;
-  /** Token totals for the session */
-  tokens: { input: number; output: number };
+  /**
+   * Token totals for the session.
+   * `lastPrompt` is the most recent request's prompt_tokens (context fill).
+   */
+  tokens: { input: number; output: number; lastPrompt?: number };
   /** Whether tool details are expanded by default */
   showToolDetails: boolean;
   /** Whether reasoning/thinking blocks are visible */

@@ -6,6 +6,7 @@
 import type { SubagentRole } from "../config.js";
 import type { ToolsetId } from "../../toolcalling/registry.js";
 import type { PermissionRules } from "../../toolcalling/permissions.js";
+import type { CapabilityMode } from "./types.js";
 
 export type RoleSandbox = "read-only" | "workspace-write";
 
@@ -22,11 +23,99 @@ export interface ResolvedRole {
   permissions: PermissionRules;
 }
 
+const DENY_WRITE: PermissionRules = {
+  "*": "allow",
+  write: "deny",
+  write_file: "deny",
+  search_replace: "deny",
+  edit_file: "deny",
+  run_terminal_command: "deny",
+  run_shell: "deny",
+  process: "deny",
+};
+
+const DENY_SHELL_ONLY: PermissionRules = {
+  "*": "allow",
+  run_terminal_command: "deny",
+  run_shell: "deny",
+  process: "deny",
+};
+
+const FULL_WRITE: PermissionRules = {
+  "*": "allow",
+  run_terminal_command: {
+    "*": "allow",
+    "rm -rf *": "deny",
+    "git push --force *": "deny",
+  },
+};
+
+/**
+ * Map Grok capability_mode onto toolsets + permissions.
+ * Explicit spawn override wins over role sandbox.
+ */
+export function applyCapabilityMode(
+  role: ResolvedRole,
+  mode?: CapabilityMode | string | null,
+): ResolvedRole {
+  const m = normalizeCapabilityMode(mode);
+  if (!m) return role;
+
+  switch (m) {
+    case "read-only":
+      return {
+        ...role,
+        sandbox: "read-only",
+        toolsets: ["fs", "search", "web", "meta"],
+        permissions: { ...DENY_WRITE },
+      };
+    case "read-write":
+      return {
+        ...role,
+        sandbox: "workspace-write",
+        toolsets: ["fs", "search", "web", "meta"],
+        permissions: { ...DENY_SHELL_ONLY },
+      };
+    case "execute":
+    case "all":
+      return {
+        ...role,
+        sandbox: "workspace-write",
+        toolsets: ["fs", "search", "shell", "web", "meta", "process"],
+        permissions: { ...FULL_WRITE },
+      };
+    default:
+      return role;
+  }
+}
+
+export function normalizeCapabilityMode(
+  mode?: string | null,
+): CapabilityMode | undefined {
+  if (!mode || typeof mode !== "string") return undefined;
+  const k = mode.trim().toLowerCase().replace(/_/g, "-");
+  if (
+    k === "read-only" ||
+    k === "read-write" ||
+    k === "execute" ||
+    k === "all"
+  ) {
+    return k;
+  }
+  return undefined;
+}
+
+/** Default capability label for role (for tool descriptions). */
+export function defaultCapabilityForRole(role: ResolvedRole): CapabilityMode {
+  return role.sandbox === "read-only" ? "read-only" : "execute";
+}
+
 /** Codex-compatible built-ins (always available when multi-agent is on). */
 export const CODEX_BUILTIN_ROLES: Array<
   SubagentRole & {
     description: string;
     sandbox: RoleSandbox;
+    reasoningEffort?: string;
   }
 > = [
   {
@@ -37,6 +126,17 @@ export const CODEX_BUILTIN_ROLES: Array<
     instructions:
       "You are a general-purpose coding subagent. Complete the assigned task thoroughly. Prefer specialized file tools over shell. Return a concise summary of findings and changes for the parent agent.",
     sandbox: "workspace-write",
+    enabled: true,
+  },
+  {
+    id: "reason",
+    name: "Reason",
+    description:
+      "Deep multi-angle reasoning specialist (read-only). Extends parent thinking.",
+    instructions:
+      "You are a deep-reasoning specialist. Do NOT implement. Think step-by-step from first principles. Cover goals, constraints, alternatives, risks, edge cases, and a concrete recommended plan. Prefer codebase evidence when tools allow. Return a structured brief (Findings | Plan | Risks | Open questions) — no code dumps.",
+    sandbox: "read-only",
+    reasoningEffort: "max",
     enabled: true,
   },
   {
@@ -68,6 +168,8 @@ const ALIASES: Record<string, string> = {
   explorer: "explorer",
   worker: "worker",
   default: "default",
+  reason: "reason",
+  think: "reason",
 };
 
 export function canonicalRoleId(id: string): string {
@@ -113,7 +215,11 @@ function fromConfigRole(
   const id = canonicalRoleId(r.id);
   const sandbox: RoleSandbox =
     r.sandbox ??
-    (id === "explorer" || id === "explore" || id === "review" || id === "security"
+    (id === "explorer" ||
+    id === "explore" ||
+    id === "reason" ||
+    id === "review" ||
+    id === "security"
       ? "read-only"
       : "workspace-write");
 
@@ -123,25 +229,7 @@ function fromConfigRole(
       : ["fs", "search", "shell", "web", "meta", "process"];
 
   const permissions: PermissionRules =
-    sandbox === "read-only"
-      ? {
-          "*": "allow",
-          write: "deny",
-          write_file: "deny",
-          search_replace: "deny",
-          edit_file: "deny",
-          run_terminal_command: "deny",
-          run_shell: "deny",
-          process: "deny",
-        }
-      : {
-          "*": "allow",
-          run_terminal_command: {
-            "*": "allow",
-            "rm -rf *": "deny",
-            "git push --force *": "deny",
-          },
-        };
+    sandbox === "read-only" ? { ...DENY_WRITE } : { ...FULL_WRITE };
 
   return {
     id,

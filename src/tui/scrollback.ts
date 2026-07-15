@@ -129,21 +129,9 @@ export function buildScrollDocument(
     );
   }
 
-  if (state.phase !== "idle" && state.phase !== "error") {
-    tailRows.push({ segments: [] });
-    tailRows.push({
-      segments: [
-        {
-          text: activityGlyph(state.phase, tick),
-          style: { fg: theme.spinner },
-        },
-        {
-          text: ` ${state.activityLabel ?? phaseLabel(state.phase)}`,
-          style: { fg: theme.fgMuted, italic: true },
-        },
-      ],
-    });
-  }
+  // Phase/activity (e.g. "streaming · step 1") lives only in chrome
+  // renderStatus — do not mirror it into the scroll document or it
+  // appears twice (transcript footer + status bar) for no reason.
 
   if (partCache.size > liveIds.size + 32) {
     for (const id of partCache.keys()) {
@@ -403,8 +391,8 @@ function partSignature(
     case "text":
       return `${base}|t|${part.content.length}|${hashStr(part.content)}`;
     case "reasoning":
-      // Include effective collapsed default (undefined → fold when done)
-      return `${base}|r|${part.collapsed === true ? 1 : part.collapsed === false ? 0 : "d"}|${part.content.length}|${hashStr(part.content)}`;
+      // Include effective collapsed default (undefined → fold when done) + title
+      return `${base}|r|${part.collapsed === true ? 1 : part.collapsed === false ? 0 : "d"}|${part.title ?? ""}|${part.content.length}|${hashStr(part.content)}`;
     case "tool":
       return `${base}|tool|${part.toolName}|${part.status}|${part.collapsed === true ? 1 : part.collapsed === false ? 0 : "d"}|${part.result?.length ?? 0}|${part.error?.length ?? 0}|${hashStr(JSON.stringify(part.args ?? {}))}`;
     case "diff":
@@ -476,27 +464,6 @@ function emptyStateRows(theme: Theme, width: number): Row[] {
     });
   }
   return rows;
-}
-
-function activityGlyph(phase: string, tick: number): string {
-  const frames = ["|", "/", "-", "\\"];
-  if (phase === "waiting") return "...";
-  return frames[tick % frames.length]!;
-}
-
-function phaseLabel(phase: string): string {
-  switch (phase) {
-    case "thinking":
-      return "thinking…";
-    case "streaming":
-      return "streaming…";
-    case "tool":
-      return "running tools…";
-    case "waiting":
-      return "waiting…";
-    default:
-      return phase;
-  }
 }
 
 export function clampOffset(

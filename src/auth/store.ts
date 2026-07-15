@@ -11,6 +11,7 @@ import {
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { AuthFile, ProviderId, StoredCredential } from "./types.js";
+import { canonicalizeProviderId } from "./types.js";
 
 function authPath(): string {
   return process.env.LIBRA_AUTH ?? join(homedir(), ".libra", "auth.json");
@@ -35,20 +36,24 @@ export function saveAuth(file: AuthFile): void {
 }
 
 export function getCredential(provider: ProviderId): StoredCredential | undefined {
-  return loadAuth().credentials.find((c) => c.provider === provider);
+  const id = canonicalizeProviderId(provider) ?? provider;
+  return loadAuth().credentials.find((c) => c.provider === id);
 }
 
 export function upsertCredential(cred: StoredCredential): void {
   const file = loadAuth();
-  const idx = file.credentials.findIndex((c) => c.provider === cred.provider);
-  if (idx >= 0) file.credentials[idx] = cred;
-  else file.credentials.push(cred);
+  const id = canonicalizeProviderId(cred.provider) ?? cred.provider;
+  const normalized = { ...cred, provider: id };
+  const idx = file.credentials.findIndex((c) => c.provider === id);
+  if (idx >= 0) file.credentials[idx] = normalized;
+  else file.credentials.push(normalized);
   saveAuth(file);
 }
 
 export function removeCredential(provider: ProviderId): void {
+  const id = canonicalizeProviderId(provider) ?? provider;
   const file = loadAuth();
-  file.credentials = file.credentials.filter((c) => c.provider !== provider);
+  file.credentials = file.credentials.filter((c) => c.provider !== id);
   saveAuth(file);
 }
 

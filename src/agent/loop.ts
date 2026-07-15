@@ -27,6 +27,15 @@ export {
 } from "../toolcalling/normalize.js";
 export { historyToMessages };
 
+/** One pre-seeded Thought block (Ultra+Fusion dual traces). */
+export interface SeedReasoningPart {
+  content: string;
+  /** Label after "Thought ·" (e.g. "Main · opencode/…") */
+  title?: string;
+  /** Default false so dual fusion traces stay visible */
+  collapsed?: boolean;
+}
+
 export interface AgentLoopOptions {
   provider: ProviderId;
   model: string;
@@ -41,10 +50,20 @@ export interface AgentLoopOptions {
    */
   seedReasoning?: string;
   /**
+   * Multiple Thought parts (preferred for Ultra+Fusion Main + Peer).
+   * When set, overrides single seedReasoning for UI seeding.
+   */
+  seedReasoningParts?: SeedReasoningPart[];
+  /**
    * After fusion phase-1, skip heavy native reasoning on execute.
    * Default true when seedReasoning set.
    */
   lightReasoning?: boolean;
+  /**
+   * When set, skip appendUser / startAssistant — caller already created
+   * the user + assistant messages (e.g. fusion streamed phase-1 into them).
+   */
+  existingAssistantId?: string;
   /** Force tool_choice (e.g. required for smoke tests) */
   toolChoice?: "auto" | "none" | "required";
   /** Debug label prefix */
@@ -92,29 +111,59 @@ export class AgentLoop {
     this.abort = false;
 
     const label = opts.label ?? "agent";
+    const multiSeed = (opts.seedReasoningParts ?? []).filter((p) =>
+      p.content?.trim(),
+    );
+    const singleSeed = opts.seedReasoning?.trim() ?? "";
+    const seeded =
+      multiSeed.length > 0 || Boolean(singleSeed);
     const turn = span("agent", `${label}.handle`, {
       model: `${opts.provider}/${opts.model}`,
       promptLen: userText.length,
       tools: opts.tools !== false,
-      seeded: Boolean(opts.seedReasoning?.trim()),
+      seeded,
+      seedParts: multiSeed.length,
     });
 
     try {
-      this.store.appendUser(userText);
-      const assistant = this.store.startAssistant();
-      const mid = assistant.id;
+      let mid = opts.existingAssistantId;
+      if (!mid) {
+        this.store.appendUser(userText);
+        mid = this.store.startAssistant().id;
+      }
 
-      if (opts.seedReasoning?.trim()) {
-        this.store.appendPart(mid, {
-          id: newId("p"),
-          type: "reasoning",
-          content: opts.seedReasoning.trim(),
-          streaming: false,
-          collapsed: true, // OpenCode: folded until user expands
-        });
-        dbg("agent", "seed_reasoning", {
-          chars: opts.seedReasoning.trim().length,
-        });
+      // Only append seed Thought parts when we own the assistant shell.
+      // Fusion live-streams Main/Peer into an existing message first.
+      if (!opts.existingAssistantId) {
+        if (multiSeed.length > 0) {
+          for (const part of multiSeed) {
+            this.store.appendPart(mid, {
+              id: newId("p"),
+              type: "reasoning",
+              content: part.content.trim(),
+              streaming: false,
+              // Dual fusion traces: expanded so both models are visible
+              collapsed: part.collapsed ?? false,
+              title: part.title,
+            });
+          }
+          dbg("agent", "seed_reasoning_parts", {
+            count: multiSeed.length,
+            chars: multiSeed.reduce((n, p) => n + p.content.length, 0),
+          });
+        } else if (singleSeed) {
+          this.store.appendPart(mid, {
+            id: newId("p"),
+            type: "reasoning",
+            content: singleSeed,
+            streaming: false,
+            // Fusion single-block seed stays expanded so dual traces are readable
+            collapsed: false,
+          });
+          dbg("agent", "seed_reasoning", {
+            chars: singleSeed.length,
+          });
+        }
       }
 
       const turnOpts: TurnOptions = {
@@ -124,7 +173,10 @@ export class AgentLoop {
         systemPrompt: opts.systemPrompt,
         tools: opts.tools,
         abortSignal: opts.abortSignal,
-        seedReasoning: opts.seedReasoning,
+        seedReasoning:
+          multiSeed.length > 0
+            ? multiSeed.map((p) => p.content).join("\n\n")
+            : opts.seedReasoning,
         lightReasoning: opts.lightReasoning,
         toolChoice: opts.toolChoice,
         label,

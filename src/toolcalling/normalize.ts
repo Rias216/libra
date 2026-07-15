@@ -5,6 +5,27 @@
 
 import { parseToolArgumentsLoose } from "./compat.js";
 
+/**
+ * Strip pasted read_file line-number prefixes (`N→` or padded `N|`) so
+ * models that copy numbered read output into search_replace still match file text.
+ * Only strips when the line matches the numbered-read pattern; plain content is unchanged.
+ */
+export function stripLineNumberPrefixes(text: string): string {
+  if (!text || typeof text !== "string") return text;
+  // Match Grok-style `12→` and legacy Libra `  12|` prefixes at line start
+  const re = /^(\d+)(→|\|)/;
+  const lines = text.split("\n");
+  let any = false;
+  const out = lines.map((line) => {
+    // Preserve CRLF content: only strip from start of logical line
+    const m = line.match(re);
+    if (!m) return line;
+    any = true;
+    return line.slice(m[0].length);
+  });
+  return any ? out.join("\n") : text;
+}
+
 /** Stable JSON with sorted keys (for fingerprints). */
 export function stableJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
@@ -174,10 +195,22 @@ export function normalizeToolArgs(
       }
       break;
     }
-    case "write":
+    case "write": {
+      if (typeof out.file_path === "string") {
+        out.file_path = out.file_path.replace(/\\/g, "/");
+      }
+      break;
+    }
     case "search_replace": {
       if (typeof out.file_path === "string") {
         out.file_path = out.file_path.replace(/\\/g, "/");
+      }
+      // Models often paste numbered read_file output into old/new_string
+      if (typeof out.old_string === "string") {
+        out.old_string = stripLineNumberPrefixes(out.old_string);
+      }
+      if (typeof out.new_string === "string") {
+        out.new_string = stripLineNumberPrefixes(out.new_string);
       }
       break;
     }

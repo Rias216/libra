@@ -1,11 +1,11 @@
 /**
- * System prompts — OpenCode-style per provider/model packs + env injection.
+ * System prompts — per provider/model style packs + env injection.
  *
- * Routing (see prompts/packs.ts) mirrors OpenCode system.ts:
- *   claude → anthropic, gpt-4/o1/o3 → beast, codex → codex, gpt → gpt,
- *   gemini → gemini, kimi → kimi, grok/xai → grok, else → default
+ * Routing (see prompts/packs.ts):
+ *   claude → anthropic, gpt-4/o1/o3 → beast, codex-model → codex style pack,
+ *   gpt → gpt, gemini → gemini, kimi → kimi, grok/xai → grok, else → default
  *
- * Product-neutral (no OpenCode/Libra branding). Tool names are Libra-native.
+ * Product-neutral: no product/brand identity in system text.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -86,8 +86,8 @@ function buildEnvBlock(
 ): string {
   const modelLine = o.model?.trim()
     ? o.provider?.trim()
-      ? `You are powered by the model named ${o.model}. The exact model ID is ${o.provider}/${o.model}`
-      : `You are powered by the model named ${o.model}`
+      ? `Active model: ${o.model} (${o.provider}/${o.model})`
+      : `Active model: ${o.model}`
     : undefined;
   return [
     modelLine,

@@ -406,19 +406,22 @@ Prefer small, correct, verifiable upgrades over grand rewrites.
 1. **Working directory is the Libra install root above.** Do not edit the user's other projects.
 2. Prefer tools: list_dir, grep, read_file, search_replace / write_file, run_terminal_command.
 3. Do **not** delete session \`.libe\` files or the backup directory. Do **not** force-push.
-4. After meaningful edits, run checks when possible:
+4. **Ship gate (mandatory before you stop):** the harness will re-open your turn if these fail. You must leave them green:
    - \`bun run typecheck\`
-   - \`bun run test:harness\` (or full \`bun run test\` if network tools are OK)
+   - \`bun run build\`
+   - smoke: \`bun dist/cli.js --version\` (or \`bun src/cli.ts --version\`)
+   Optionally also \`bun run test:harness\` when practical.
 5. Keep TypeScript 7 + Bun as the toolchain. Do not reintroduce \`tsx\` or Node-only scripts without cause.
 6. Do not put secrets into source. Do not expand scope into unrelated repos.
 7. If you change CLI commands or behavior, update help text / slash catalog when needed.
 8. End with a short changelog of what you upgraded, which session friction it addresses, and how to roll back (\`/self-review restore ${opts.backupId}\`).
+9. **Never claim done while typecheck/build/smoke are red.** Fix until green.
 
 ## Suggested review order
 1. **Session friction report above** — tool errors, status errors, user retries
 2. Agent loop / toolcalling / Windows shell / permissions
 3. Reasoning modes (stuck Ultra, effort picker), TUI paint
-4. Tests that prove the fix + typecheck green
+4. Run typecheck + build + smoke; fix any failures before finishing
 
 You have full tools. Execute — do not only describe a plan.
 `.trim();
@@ -448,10 +451,33 @@ export function buildSelfReviewUserPrompt(opts: {
     `Run a full **self-review and self-upgrade** of Libra using model ` +
     `\`${opts.provider}/${opts.model}\`.\n\n` +
     `A source backup was saved as \`${opts.backupId}\` before you start. ` +
-    `**Review recent session transcripts for friction and errors first**, then improve the codebase in-place, verify with typecheck/tests, and summarize upgrades.` +
+    `**Review recent session transcripts for friction and errors first**, then improve the codebase in-place. ` +
+    `Before you finish you MUST leave the install green: \`bun run typecheck\`, \`bun run build\`, and CLI \`--version\` smoke. ` +
+    `If those fail, keep fixing — the harness will not exit for relaunch until they pass (or fix budget is exhausted).` +
     friction +
     focus
   );
+}
+
+/** Follow-up turn when in-session verify failed — keep working, do not exit. */
+export function buildSelfReviewFixPrompt(opts: {
+  attempt: number;
+  maxAttempts: number;
+  failureMarkdown: string;
+}): string {
+  return [
+    `# Self-review verify FAILED (fix round ${opts.attempt}/${opts.maxAttempts})`,
+    ``,
+    `The install is **not** ready to relaunch. **Do not stop.** Fix the errors below, then re-run:`,
+    `- \`bun run typecheck\``,
+    `- \`bun run build\``,
+    `- smoke: \`bun dist/cli.js --version\` (or \`bun src/cli.ts --version\`)`,
+    ``,
+    `## Failure`,
+    opts.failureMarkdown,
+    ``,
+    `Apply the smallest correct fix. Prefer search_replace over rewrites. After edits, run the checks yourself with run_terminal_command.`,
+  ].join("\n");
 }
 
 /** One-line friction blurb for user prompt / status UI. */

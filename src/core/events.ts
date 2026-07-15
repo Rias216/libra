@@ -194,6 +194,9 @@ export function reduce(state: HarnessState, event: HarnessEvent): HarnessState {
         tokens: {
           input: state.tokens.input + event.input,
           output: state.tokens.output + event.output,
+          // Latest request size ≈ current context window fill
+          lastPrompt:
+            event.input > 0 ? event.input : state.tokens.lastPrompt,
         },
       };
 

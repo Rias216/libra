@@ -1,8 +1,7 @@
 /**
  * Header + status bar chrome.
  * Top-right: plain main / peer models (no rainbow badges).
- * Bottom-right: theme-colored glow for active reasoning mode
- * (effort levels + Ultra / Ultra + Fusion).
+ * Bottom: phase spinner + context usage bar + reasoning-mode glow.
  */
 
 import type { HarnessState } from "../core/types.js";
@@ -13,7 +12,8 @@ import type { Row } from "./components/parts.js";
 import { spinnerFrame } from "./components/parts.js";
 import { loadAgentSettings } from "../agent/config.js";
 import { getEffortForModel } from "../agent/reasoning.js";
-import { parseModelKey } from "../auth/models.js";
+import { getModelContextWindow, parseModelKey } from "../auth/models.js";
+import { DEFAULT_COMPACT_TOKEN_BUDGET } from "../agent/compaction.js";
 
 export function renderHeader(
   state: HarnessState,
@@ -122,21 +122,168 @@ function formatModelLabel(provider: string, model: string): string {
   return truncate(`${provider}/${model}`, 36);
 }
 
+/** Fallback context window when the model catalog has no figure. */
+export const DEFAULT_CONTEXT_WINDOW = Math.round(
+  DEFAULT_COMPACT_TOKEN_BUDGET / 0.8,
+);
+
+export function resolveContextUsage(state: HarnessState): {
+  used: number;
+  limit: number;
+  ratio: number;
+} {
+  const limitRaw = getModelContextWindow(
+    state.session.provider,
+    state.session.model,
+  );
+  const limit =
+    limitRaw != null && limitRaw > 1024 ? limitRaw : DEFAULT_CONTEXT_WINDOW;
+  // Prefer latest request prompt_tokens (true context fill); else session input
+  const used = Math.max(
+    0,
+    state.tokens.lastPrompt ??
+      (state.tokens.input > 0 ? state.tokens.input : 0),
+  );
+  const ratio = limit > 0 ? Math.min(1, used / limit) : 0;
+  return { used, limit, ratio };
+}
+
+/**
+ * Visual context fill bar + counts (OpenCode-style footer).
+ * `barWidth` is the number of block cells in the meter.
+ */
+export function formatContextBar(
+  used: number,
+  limit: number,
+  barWidth = 12,
+): { bar: string; label: string; ratio: number; percent: number } {
+  const lim = Math.max(1, limit);
+  const u = Math.max(0, used);
+  const ratio = Math.min(1, u / lim);
+  const filled = Math.max(0, Math.min(barWidth, Math.round(ratio * barWidth)));
+  const empty = barWidth - filled;
+  const bar = `${"█".repeat(filled)}${"░".repeat(empty)}`;
+  const percent = Math.round(ratio * 100);
+  const label = `${formatCompactCount(u)}/${formatCompactCount(lim)} ${percent}%`;
+  return { bar, label, ratio, percent };
+}
+
+/**
+ * Color for the filled portion of the context meter.
+ * Uses only theme semantic tokens so every palette stays coherent
+ * (accent → info → warn → error as fill grows).
+ */
+export function contextBarColor(ratio: number, theme: Theme): Rgb {
+  if (ratio >= 0.9) return theme.error;
+  if (ratio >= 0.75) return theme.warn;
+  if (ratio >= 0.5) return theme.info;
+  return theme.accent;
+}
+
+export function renderContextBarSegments(
+  used: number,
+  limit: number,
+  theme: Theme,
+  barWidth = 12,
+): Row["segments"] {
+  const { bar, label, ratio } = formatContextBar(used, limit, barWidth);
+  const fill = contextBarColor(ratio, theme);
+  // Split bar into filled/empty for two-tone paint
+  const filledN = Math.round(Math.min(1, used / Math.max(1, limit)) * barWidth);
+  const filled = bar.slice(0, filledN);
+  const empty = bar.slice(filledN);
+  // Empty track: fgFaint (always readable on bgElevated; border can equal
+  // elevated bg on some palettes and disappear).
+  return [
+    { text: "ctx ", style: { fg: theme.fgFaint } },
+    ...(filled
+      ? [{ text: filled, style: { fg: fill } }]
+      : []),
+    ...(empty
+      ? [{ text: empty, style: { fg: theme.fgFaint } }]
+      : []),
+    { text: ` ${label}`, style: { fg: theme.fgMuted } },
+  ];
+}
+
+export interface StatusExtra {
+  scroll?: string;
+  completeOpen?: boolean;
+  pickerOpen?: boolean;
+  /** Live generation rate (tokens / second) */
+  tokensPerSec?: number;
+  /** Realised paint frames / second while agent is busy */
+  framesPerSec?: number;
+  /** Override context bar width (cells). Default scales with terminal. */
+  contextBarWidth?: number;
+}
+
+/**
+ * Bottom-most footer: full-width context meter.
+ * `ctx ████████░░░░  61k/128k 48%          session 120k · 60t/s`
+ */
+export function renderContextFooter(
+  state: HarnessState,
+  theme: Theme,
+  width: number,
+  extra?: StatusExtra,
+): Row {
+  const ctx = resolveContextUsage(state);
+  // Prefer a wide meter on the dedicated footer line
+  const barW =
+    extra?.contextBarWidth ??
+    Math.min(28, Math.max(10, Math.floor(width * 0.28)));
+  const segs: Row["segments"] = [
+    ...renderContextBarSegments(ctx.used, ctx.limit, theme, barW),
+  ];
+
+  const sessionTotal = state.tokens.input + state.tokens.output;
+  const rateBits: string[] = [];
+  if (sessionTotal > 0) {
+    rateBits.push(`Σ ${formatCompactCount(sessionTotal)}`);
+  }
+  const tps =
+    extra?.tokensPerSec != null &&
+    Number.isFinite(extra.tokensPerSec) &&
+    extra.tokensPerSec > 0
+      ? Math.round(extra.tokensPerSec)
+      : 0;
+  const fps =
+    extra?.framesPerSec != null &&
+    Number.isFinite(extra.framesPerSec) &&
+    extra.framesPerSec > 0
+      ? Math.round(extra.framesPerSec)
+      : 0;
+  if (tps > 0) rateBits.push(`${tps}t/s`);
+  if (fps > 0) rateBits.push(`${fps}f`);
+
+  if (rateBits.length) {
+    segs.push({
+      text: `  ·  ${rateBits.join(" · ")}`,
+      style: { fg: theme.fgFaint },
+    });
+  }
+
+  const usedW = segs.reduce((n, s) => n + stringWidth(s.text), 0);
+  if (usedW < width) {
+    segs.push({ text: " ".repeat(width - usedW), style: {} });
+  }
+  // Elevate the whole footer strip so the meter reads as a dedicated bar
+  return {
+    segments: segs.map((s) => ({
+      text: s.text,
+      style: { ...s.style, bg: theme.bgElevated },
+    })),
+  };
+}
+
 export function renderStatus(
   state: HarnessState,
   theme: Theme,
   width: number,
   tick: number,
   focus: "prompt" | "scrollback",
-  extra?: {
-    scroll?: string;
-    completeOpen?: boolean;
-    pickerOpen?: boolean;
-    /** Live generation rate (tokens / second) */
-    tokensPerSec?: number;
-    /** Realised paint frames / second while agent is busy */
-    framesPerSec?: number;
-  },
+  extra?: StatusExtra,
 ): Row {
   const phase = state.phase;
   let phaseText: string;
@@ -151,16 +298,12 @@ export function renderStatus(
     phaseText = state.activityLabel ?? "error";
     phaseStyle = { fg: theme.error };
   } else {
+    // OpenCode-style braille loader (via setSpinnerGlyphs / BRAILLE_SPINNER)
     phaseText = `${spinnerFrame(tick)} ${state.activityLabel ?? phase}`;
     phaseStyle = { fg: theme.spinner };
   }
 
   const mode = reasoningModeDisplay(state);
-  const tokens = formatTokenStatus(
-    state.tokens.input + state.tokens.output,
-    extra?.tokensPerSec,
-    extra?.framesPerSec,
-  );
   const focusHint = focus === "prompt" ? "PROMPT" : "SCROLL";
   const scroll = extra?.scroll ? `  |  ${extra.scroll}` : "";
   const keys = extra?.pickerOpen
@@ -172,7 +315,7 @@ export function renderStatus(
         : "wheel scroll  tab prompt";
 
   const left = phaseText;
-  const mid = `  ${tokens}  |  ${focusHint}${scroll}`;
+  const mid = `  |  ${focusHint}${scroll}`;
   const segs: Row["segments"] = [
     { text: left, style: phaseStyle },
     { text: mid, style: { fg: theme.fgFaint } },
@@ -331,6 +474,7 @@ export function formatCompactCount(n: number): string {
 /**
  * Status-bar token label: `120k / 60t / 28f` (total · tokens/sec · paint fps).
  * When rate is 0 / unknown, just the compact total. FPS only when provided.
+ * Pass totalTokens=0 to emit rate/fps only (context bar owns the count).
  */
 export function formatTokenStatus(
   totalTokens: number,
@@ -413,9 +557,10 @@ function modeGlowPalette(
   // Quieter modes sit closer to faint; louder modes sit closer to base
   const dimMix = modeDimMix(kind);
   const dim = lerpRgb(theme.fgFaint, base, dimMix);
-  // Peak: lift base toward white; louder modes get a brighter tip
+  // Peak: lift base toward theme.fg (near-white on dark palettes, ink on
+  // light) so glow never hardcodes pure white against a day theme.
   const peakLift = modePeakLift(kind);
-  const peak = lerpRgb(base, { r: 255, g: 255, b: 255 }, peakLift);
+  const peak = lerpRgb(base, theme.fg, peakLift);
   return { dim, peak };
 }
 
@@ -471,7 +616,7 @@ function modeDimMix(kind: ReasoningModeKind): number {
   }
 }
 
-/** How much peak lifts toward white (0–1). */
+/** How much peak lifts toward theme.fg (0–1). */
 function modePeakLift(kind: ReasoningModeKind): number {
   switch (kind) {
     case "ultra-fusion":

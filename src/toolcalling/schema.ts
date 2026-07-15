@@ -53,7 +53,9 @@ export const OPENAI_TOOLS: OpenAITool[] = [
         "Usage:",
         "- target_file for a single path; target_files for a BATCH of paths in ONE call (preferred for 2+ files).",
         "- You can also issue multiple read_file calls in the SAME step in parallel.",
-        "- Optional offset/limit (1-based start line, max lines) apply to single-file reads only.",
+        "- Results are returned with line numbers: LINE_NUMBER→LINE_CONTENT (no padding).",
+        "- When editing: the LINE_NUMBER→ prefix is NOT file content — match only the text after →.",
+        "- Optional offset/limit apply to single-file reads only. offset is 1-based; negative offset starts from the end of the file (e.g. -20 = last 20 lines when used with limit).",
         "- Default limit is 2000 lines; if truncated, the result tells you the next offset.",
         "- Prefer this over shell cat/type/head. Cannot read binary files.",
         "- If the path is known, do not list_dir first.",
@@ -75,7 +77,8 @@ export const OPENAI_TOOLS: OpenAITool[] = [
           },
           offset: {
             type: "integer",
-            description: "1-based start line (single-file only)",
+            description:
+              "1-based start line, or negative to count from end of file (single-file only)",
           },
           limit: {
             type: "integer",
@@ -120,9 +123,10 @@ export const OPENAI_TOOLS: OpenAITool[] = [
         "- Prefer editing existing files over writing new ones.",
         "- Prefer this over shell sed/awk.",
         "- old_string must match the file exactly (including whitespace). If unsure, read_file first this turn.",
+        "- When copying from a numbered read_file result, do NOT include the LINE_NUMBER→ prefix — only the text after →. (The harness also strips pasted N→ prefixes defensively.)",
         "- If old_string matches multiple times, the tool FAILS unless replace_all=true — include more context to make it unique.",
         "- Use replace_all when renaming a symbol across the whole file.",
-        "- Fails if old_string is missing or ambiguous (multiple matches without replace_all).",
+        "- Fails if old_string is missing or ambiguous (multiple matches without replace_all). On failure, re-read with read_file before retrying.",
       ].join("\n"),
       parameters: {
         type: "object",
@@ -195,10 +199,11 @@ export const OPENAI_TOOLS: OpenAITool[] = [
         "Usage:",
         "- Use for builds, tests, git, package managers, and OS commands that require a real shell.",
         "- Prefer specialized tools for file ops: list_dir, read_file, write, search_replace, grep, glob.",
+        "- On Windows, unix utilities (grep, cat, find, head, tail, sed, awk) may be missing — use list_dir / read_file / grep / glob instead of shell for those.",
         "- NEVER use shell to talk to the user (no echo of explanations).",
         "- Avoid destructive commands unless the user asked.",
         "- Provide a short description (5–10 words) of what the command does.",
-        "- Set background=true for long-running servers; then manage with the process tool.",
+        "- Set background=true for long-running servers; then manage with the process tool (poll/log/wait). Do NOT busy-poll with sleep loops — use process(action=\"wait\"|\"poll\").",
         "- Independent shell commands may run in parallel in the same step when safe.",
       ].join("\n"),
       parameters: {

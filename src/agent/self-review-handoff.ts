@@ -124,26 +124,70 @@ export function readHandoffStatus(statusPath: string): SelfReviewStatus | null {
   }
 }
 
-export function readLastRelaunchNotice(): {
+export interface LastRelaunchNotice {
   ok?: boolean;
   restored?: boolean;
   notice?: string;
   backupId?: string;
   at?: string;
-} | null {
+  /** Once true, CLI must not re-surface the notice on later boots */
+  consumed?: boolean;
+  consumedAt?: string;
+  handoffId?: string;
+}
+
+export function lastRelaunchPath(): string {
+  return join(selfReviewHome(), "last-relaunch.json");
+}
+
+export function readLastRelaunchNotice(): LastRelaunchNotice | null {
   try {
-    const p = join(selfReviewHome(), "last-relaunch.json");
+    const p = lastRelaunchPath();
     if (!existsSync(p)) return null;
-    return JSON.parse(readFileSync(p, "utf8")) as {
-      ok?: boolean;
-      restored?: boolean;
-      notice?: string;
-      backupId?: string;
-      at?: string;
-    };
+    return JSON.parse(readFileSync(p, "utf8")) as LastRelaunchNotice;
   } catch {
     return null;
   }
+}
+
+/** Mark last-relaunch notice as already shown (idempotent). */
+export function markLastRelaunchConsumed(): void {
+  try {
+    const p = lastRelaunchPath();
+    if (!existsSync(p)) return;
+    const cur = JSON.parse(readFileSync(p, "utf8")) as LastRelaunchNotice;
+    if (cur.consumed) return;
+    cur.consumed = true;
+    cur.consumedAt = new Date().toISOString();
+    writeFileSync(p, JSON.stringify(cur, null, 2) + "\n", "utf8");
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * One-shot read for CLI boot banners.
+ * Returns the notice only if it has not been shown yet and is recent
+ * (default 2h). Marks the file consumed so later starts stay quiet.
+ */
+export function consumeLastRelaunchNotice(opts?: {
+  maxAgeMs?: number;
+}): LastRelaunchNotice | null {
+  const last = readLastRelaunchNotice();
+  if (!last?.notice?.trim()) return null;
+  if (last.consumed) return null;
+
+  const maxAge = opts?.maxAgeMs ?? 2 * 60 * 60 * 1000;
+  if (last.at) {
+    const t = Date.parse(last.at);
+    if (Number.isFinite(t) && Date.now() - t > maxAge) {
+      markLastRelaunchConsumed();
+      return null;
+    }
+  }
+
+  markLastRelaunchConsumed();
+  return last;
 }
 
 export function createHandoff(opts: {

@@ -55,10 +55,24 @@ export function messagesToWire(
     if (
       opts.skipTrailingEmptyAssistant &&
       m.role === "assistant" &&
-      m.parts.length === 0 &&
       mi === msgs.length - 1
     ) {
-      continue;
+      // Empty shell OR reasoning-only seed (Ultra+Fusion dual traces) —
+      // not yet a completed wire turn. Dual traces already ride in the
+      // system addon; do not re-send as a trailing assistant message.
+      if (m.parts.length === 0) continue;
+      const hasText = m.parts.some(
+        (p) => p.type === "text" && p.content?.trim(),
+      );
+      const hasWireTools = m.parts.some(
+        (p) =>
+          p.type === "tool" &&
+          p.callId &&
+          (p.status === "completed" ||
+            p.status === "error" ||
+            p.status === "cancelled"),
+      );
+      if (!hasText && !hasWireTools) continue;
     }
 
     if (m.role === "user") {

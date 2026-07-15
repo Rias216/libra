@@ -47,6 +47,16 @@ export interface FusionCandidate {
   usage?: ChatResult["usage"];
 }
 
+/** One UI thinking block for dual-trace display (main or peer). */
+export interface FusionDisplayPart {
+  /** Short label shown after "Thought ·" */
+  title: string;
+  content: string;
+  /** Which candidate produced this */
+  role: "main" | "peer";
+  modelKey: string;
+}
+
 export interface FusionPrepResult {
   /** Main model's first-pass reasoning (no tools) */
   mainReasoning: FusionCandidate;
@@ -61,6 +71,11 @@ export interface FusionPrepResult {
    * Shown on the same assistant turn as execution (no split layout).
    */
   displayReasoning: string;
+  /**
+   * Dual traces as separate Thought parts (Main + Peer) so both are
+   * visible and expandable independently in the TUI.
+   */
+  displayParts: FusionDisplayPart[];
   /** Total phase-1 wall time (parallel) */
   phase1Ms: number;
 }
@@ -125,6 +140,12 @@ export interface PrepareFusionOptions {
    * peer model key list (e.g. ["xai/grok-4"] or ["openrouter/test-peer"]).
    */
   secondaryKeys?: string[];
+  /**
+   * Live UI streaming for phase-1 dual traces (main + first peer).
+   * Callers seed empty reasoning parts then pass deltas here.
+   */
+  onMainReasoningDelta?: (delta: string) => void;
+  onPeerReasoningDelta?: (delta: string) => void;
 }
 
 /**
@@ -172,11 +193,28 @@ export async function prepareFusionForMain(
     peers: secondaryKeys,
   });
 
-  // Parallel: main + peer reason (no tools)
+  // Parallel: main + peer reason (no tools); stream dual traces to UI when wired
   const [mainReasoning, ...secondaries] = await Promise.all([
-    runOneReasoning(mainKey, userPrompt, fusion, "fusion.main", signal, opts.chatImpl),
-    ...secondaryKeys.map((key) =>
-      runOneReasoning(key, userPrompt, fusion, "fusion.peer", signal, opts.chatImpl),
+    runOneReasoning(
+      mainKey,
+      userPrompt,
+      fusion,
+      "fusion.main",
+      signal,
+      opts.chatImpl,
+      opts.onMainReasoningDelta,
+    ),
+    ...secondaryKeys.map((key, i) =>
+      runOneReasoning(
+        key,
+        userPrompt,
+        fusion,
+        "fusion.peer",
+        signal,
+        opts.chatImpl,
+        // Only the first peer streams to the dedicated Peer Thought part
+        i === 0 ? opts.onPeerReasoningDelta : undefined,
+      ),
     ),
   ]);
 
@@ -198,6 +236,11 @@ export async function prepareFusionForMain(
     );
   }
 
+  const displayParts = formatFusionReasoningParts(
+    mainReasoning,
+    secondaries,
+    mainKey,
+  );
   const displayReasoning = formatFusionReasoningDisplay(
     mainReasoning,
     secondaries,
@@ -219,6 +262,7 @@ export async function prepareFusionForMain(
     summary,
     addonLen: systemAddon.length,
     displayLen: displayReasoning.length,
+    parts: displayParts.length,
   });
 
   return {
@@ -227,36 +271,83 @@ export async function prepareFusionForMain(
     systemAddon,
     summary,
     displayReasoning,
+    displayParts,
     phase1Ms,
   };
 }
 
-/** Single thinking-block body (same style as normal model reasoning). */
+/** Soft cap for UI-only display of dual traces (wire seed keeps full text elsewhere). */
+const DISPLAY_BODY_MAX = 12_000;
+
+function softTruncateDisplay(body: string, max = DISPLAY_BODY_MAX): string {
+  if (body.length <= max) return body;
+  return `${body.slice(0, max)}\n…(display truncated; full trace used for execute)`;
+}
+
+function candidateBody(c: FusionCandidate | undefined, empty = "(empty)"): string {
+  if (!c) return "(no peer)";
+  if (c.error) return `(error: ${c.error})`;
+  return c.text?.trim() || empty;
+}
+
+function timingSuffix(c: FusionCandidate | undefined): string {
+  if (!c) return "";
+  const ttft =
+    c.ttftMs != null ? ` ttft=${c.ttftMs}ms` : "";
+  return ` (${c.ms}ms${ttft})`;
+}
+
+/** Dual Thought parts for the TUI — both expanded by default. */
+export function formatFusionReasoningParts(
+  mainReasoning: FusionCandidate,
+  secondaries: FusionCandidate[],
+  mainKey: string,
+): FusionDisplayPart[] {
+  const peer = secondaries[0];
+  const parts: FusionDisplayPart[] = [
+    {
+      role: "main",
+      modelKey: mainKey,
+      title: `Main · ${mainKey}${timingSuffix(mainReasoning)}`,
+      content: softTruncateDisplay(candidateBody(mainReasoning)),
+    },
+  ];
+  if (peer || secondaries.length === 0) {
+    const peerKey = peer?.modelKey ?? "peer";
+    parts.push({
+      role: "peer",
+      modelKey: peerKey,
+      title: `Peer · ${peerKey}${timingSuffix(peer)}`,
+      content: softTruncateDisplay(candidateBody(peer)),
+    });
+  }
+  // Extra peers (rare; hard-cap is 1) still surface if present
+  for (let i = 1; i < secondaries.length; i++) {
+    const c = secondaries[i]!;
+    parts.push({
+      role: "peer",
+      modelKey: c.modelKey,
+      title: `Peer #${i + 1} · ${c.modelKey}${timingSuffix(c)}`,
+      content: softTruncateDisplay(candidateBody(c)),
+    });
+  }
+  return parts;
+}
+
+/** Combined thinking-block body (legacy single-part seed). */
 export function formatFusionReasoningDisplay(
   mainReasoning: FusionCandidate,
   secondaries: FusionCandidate[],
   mainKey: string,
 ): string {
-  const mainBody = mainReasoning.error
-    ? `(error: ${mainReasoning.error})`
-    : mainReasoning.text?.trim() || "(empty)";
-  const peer = secondaries[0];
-  const peerBody = peer
-    ? peer.error
-      ? `(error: ${peer.error})`
-      : peer.text?.trim() || "(empty)"
-    : "(no peer)";
-  const peerKey = peer?.modelKey ?? "peer";
-
-  return [
-    `Ultra + Fusion`,
-    ``,
-    `Main · ${mainKey} (${mainReasoning.ms}ms${mainReasoning.ttftMs != null ? ` ttft=${mainReasoning.ttftMs}ms` : ""})`,
-    mainBody,
-    ``,
-    `Peer · ${peerKey} (${peer?.ms ?? "?"}ms${peer?.ttftMs != null ? ` ttft=${peer.ttftMs}ms` : ""})`,
-    peerBody,
-  ].join("\n");
+  const parts = formatFusionReasoningParts(
+    mainReasoning,
+    secondaries,
+    mainKey,
+  );
+  return ["Ultra + Fusion", "", ...parts.flatMap((p) => [p.title, p.content, ""])]
+    .join("\n")
+    .trimEnd();
 }
 
 export interface BuildCompareAddonOptions {
@@ -294,6 +385,19 @@ export function buildMainCompareAddon(
     })
     .join("; ");
 
+  // Partial peer/main failure: still produce execute path with survivor
+  const mainFailed = Boolean(mainReasoning.error);
+  const peersFailed = secondaries.length > 0 && secondaries.every((s) => s.error);
+  const anyPeerOk = secondaries.some((s) => !s.error && (s.text?.trim()?.length ?? 0) > 0);
+  const partialFailureNote =
+    mainFailed && anyPeerOk
+      ? "Main phase-1 failed — proceed using the surviving peer trace(s) as your plan seed."
+      : !mainFailed && secondaries.some((s) => s.error)
+        ? "One or more peers failed — proceed with the surviving main (and any ok peer) traces; do not block on the failed peer."
+        : peersFailed && !mainFailed
+          ? "All peers failed — proceed with the main first-pass trace alone."
+          : "";
+
   const header = `
 ## Fusion phase 2 — execute the USER request
 
@@ -306,13 +410,13 @@ ${
     ? "Full dual traces are in your prior thinking block (sections **Main** and **Peer**)."
     : "Full traces are included below."
 }
-
+${partialFailureNote ? `\n### Status reminder\n${partialFailureNote}\n` : ""}
 ### Job
-1. Compare first-pass + peer traces against the user request above
+1. Compare first-pass + peer traces against the user request above (planning only — dual traces are not execution)
 2. ${reviewHint}
 3. Discard any plan that invents a different product (e.g. building an "AI harness", agent framework, or unrelated scaffold) unless the user explicitly asked for that
 4. Execute the user's request with tools when needed — do not only restate plans
-5. Spawn subagents only for independent parallel work that serves the user request
+5. Use dual traces for **planning only**. Use spawn_agent for **independent parallel execution**, not for re-reasoning the same plan. Prefer spawn N → one wait_agent.
 
 ### Coding hygiene (only if the user request involves writing code)
 - Prefer medium-sized writes over one giant truncated file
@@ -399,6 +503,7 @@ async function runOneReasoning(
   label: string,
   signal?: AbortSignal,
   chatImpl?: FusionChatImpl,
+  onReasoningDelta?: (delta: string) => void,
 ): Promise<FusionCandidate> {
   const ref = parseModelKey(key);
   const started = Date.now();
@@ -439,6 +544,7 @@ async function runOneReasoning(
         label: attempt ? `${label}.retry` : label,
         signal,
         chatImpl,
+        onReasoningDelta: attempt === 0 ? onReasoningDelta : undefined,
       });
       const ms = Date.now() - started;
       dbg("fusion", `${label}.ok`, {
@@ -505,6 +611,7 @@ async function completeReasoningOnly(opts: {
   label: string;
   signal?: AbortSignal;
   chatImpl?: FusionChatImpl;
+  onReasoningDelta?: (delta: string) => void;
 }): Promise<ReasoningOnlyResult> {
   // No internal reasoning caps — depth comes only from the model's API
   // effort setting (buildReasoningApiFields / per-model effort).
@@ -513,6 +620,7 @@ async function completeReasoningOnly(opts: {
     { role: "system", content: opts.system },
     { role: "user", content: opts.user },
   ];
+  let streamedReasoning = false;
   const result = await chat(
     {
       provider: opts.provider,
@@ -535,12 +643,28 @@ async function completeReasoningOnly(opts: {
           model: opts.model,
         });
       },
+      onReasoning: (d) => {
+        if (d) {
+          streamedReasoning = true;
+          opts.onReasoningDelta?.(d);
+        }
+      },
+      onText: (d) => {
+        // Prefer reasoning channel for live UI; fall back to content when
+        // the model never emits reasoning deltas (plain plan-in-content).
+        if (d && !streamedReasoning) opts.onReasoningDelta?.(d);
+      },
     },
   );
 
   const content = result.content ?? "";
   const reasoning = result.reasoning ?? "";
   const text = mergeReasoningText(content, reasoning);
+  // If the plan lived only in content and we already streamed it via onText,
+  // fine. If we never streamed (e.g. non-stream chatImpl), push once.
+  if (opts.onReasoningDelta && !streamedReasoning && text.trim()) {
+    opts.onReasoningDelta(text);
+  }
 
   if (!text.trim()) {
     dbg("fusion", `${opts.label}.empty_plan`, {

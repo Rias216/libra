@@ -258,6 +258,119 @@ test("formatTokenStatus fps field (chrome)", async () => {
   assert.equal(formatTokenStatus(1200, 0, 28), "1.2k / 28f");
 });
 
+test("context bar fill + spinner glyphs (OpenCode-style)", async () => {
+  const {
+    formatContextBar,
+    contextBarColor,
+    DEFAULT_CONTEXT_WINDOW,
+  } = await import("../src/tui/chrome.js");
+  const {
+    BRAILLE_SPINNER,
+    spinnerFrame,
+    setSpinnerGlyphs,
+    getSpinnerGlyphs,
+  } = await import("../src/tui/components/parts.js");
+  const { resolveTheme } = await import("../src/tui/theme.js");
+
+  const half = formatContextBar(64_000, 128_000, 10);
+  assert.equal(half.percent, 50);
+  assert.equal(half.bar.length, 10);
+  assert.ok(half.bar.includes("█"));
+  assert.ok(half.bar.includes("░"));
+  assert.match(half.label, /64k\/128k/);
+
+  const full = formatContextBar(128_000, 128_000, 8);
+  assert.equal(full.percent, 100);
+  assert.equal(full.bar, "████████");
+
+  const empty = formatContextBar(0, 128_000, 8);
+  assert.equal(empty.percent, 0);
+  assert.equal(empty.bar, "░░░░░░░░");
+
+  const theme = resolveTheme("libra-night");
+  assert.deepEqual(contextBarColor(0.2, theme), theme.accent);
+  assert.deepEqual(contextBarColor(0.6, theme), theme.info);
+  assert.deepEqual(contextBarColor(0.8, theme), theme.warn);
+  assert.deepEqual(contextBarColor(0.95, theme), theme.error);
+
+  assert.ok(DEFAULT_CONTEXT_WINDOW >= 100_000);
+
+  // Default spinner is braille (not |/-\)
+  setSpinnerGlyphs(null);
+  assert.equal(getSpinnerGlyphs()[0], BRAILLE_SPINNER[0]);
+  assert.equal(spinnerFrame(0), "⠋");
+  assert.equal(spinnerFrame(1), "⠙");
+  assert.ok(!["|", "/", "-", "\\"].includes(spinnerFrame(0)));
+});
+
+test("every theme has coherent semantic colors (no night-default leaks)", async () => {
+  const { listThemes, resolveTheme } = await import("../src/tui/theme.js");
+  const {
+    contextBarColor,
+    renderContextBarSegments,
+  } = await import("../src/tui/chrome.js");
+
+  const night = resolveTheme("libra-night");
+  const rgbKey = (c: { r: number; g: number; b: number }) =>
+    `${c.r},${c.g},${c.b}`;
+
+  for (const theme of listThemes()) {
+    // Semantic slots must resolve to the theme's own palette anchors
+    assert.deepEqual(
+      theme.success,
+      theme.toolOk,
+      `${theme.name}: success should match toolOk`,
+    );
+    assert.deepEqual(
+      theme.warn,
+      theme.toolRunning,
+      `${theme.name}: warn should match toolRunning`,
+    );
+    assert.deepEqual(
+      theme.error,
+      theme.toolError,
+      `${theme.name}: error should match toolError`,
+    );
+    assert.deepEqual(
+      theme.info,
+      theme.accentUser,
+      `${theme.name}: info should match accentUser`,
+    );
+    assert.deepEqual(
+      theme.spinner,
+      theme.accent,
+      `${theme.name}: spinner should match accent`,
+    );
+
+    // Context bar fill uses only this theme's tokens at each band
+    assert.deepEqual(contextBarColor(0.1, theme), theme.accent);
+    assert.deepEqual(contextBarColor(0.55, theme), theme.info);
+    assert.deepEqual(contextBarColor(0.8, theme), theme.warn);
+    assert.deepEqual(contextBarColor(0.95, theme), theme.error);
+
+    // Empty track uses fgFaint (readable on bgElevated)
+    const segs = renderContextBarSegments(0, 128_000, theme, 8);
+    const emptySeg = segs.find((s) => s.text.includes("░"));
+    assert.ok(emptySeg, `${theme.name}: expected empty track`);
+    assert.deepEqual(
+      emptySeg!.style?.fg,
+      theme.fgFaint,
+      `${theme.name}: empty track should use fgFaint`,
+    );
+
+    // Non-night themes must not silently inherit night's accent for spinner
+    if (theme.name !== "libra-night") {
+      // At least one of accent / accentUser should differ from night
+      // (otherwise the palette is a clone and derivation is moot)
+      const differs =
+        rgbKey(theme.accent) !== rgbKey(night.accent) ||
+        rgbKey(theme.accentUser) !== rgbKey(night.accentUser) ||
+        rgbKey(theme.toolOk) !== rgbKey(night.toolOk);
+      assert.ok(differs, `${theme.name}: expected palette distinct from night`);
+    }
+  }
+});
+
 test("renderMarkdown cache hits on large finished messages", async () => {
   const {
     renderMarkdown,

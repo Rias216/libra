@@ -316,6 +316,36 @@ test("resolvePromptPackId slim override wins; pack force works", () => {
   );
 });
 
+test("every prompt pack is product-neutral (no brand identity)", async () => {
+  const { listPromptPackIds, getPromptPack, NO_PRODUCT_IDENTITY } =
+    await import("../src/agent/prompts/packs.js");
+  assert.match(NO_PRODUCT_IDENTITY, /Do not claim any product name/i);
+  for (const id of listPromptPackIds()) {
+    const pack = getPromptPack(id);
+    assert.match(
+      pack,
+      /Do not claim any product name/i,
+      `pack ${id} missing anti-branding line`,
+    );
+    assert.ok(
+      !/\bYou are \*\*Libra\*\*/i.test(pack),
+      `pack ${id} must not brand as Libra`,
+    );
+    assert.ok(
+      !/\bYou are (the )?Codex CLI\b/i.test(pack),
+      `pack ${id} must not brand as Codex CLI`,
+    );
+  }
+  const codex = buildSystemPrompt({
+    provider: "openai",
+    model: "gpt-5.3-codex",
+    skipProjectInstructions: true,
+  });
+  assert.match(codex, /Do not claim any product name/i);
+  assert.ok(!/Product: Libra/i.test(codex));
+  assert.match(codex, /Active model: gpt-5\.3-codex/i);
+});
+
 test("buildSystemPrompt non-empty + project inject/skip", () => {
   const dir = join(tmpdir(), `libra-prompt-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
@@ -332,6 +362,10 @@ test("buildSystemPrompt non-empty + project inject/skip", () => {
     assert.match(withProj, /Project instructions/);
     assert.match(withProj, /Always use tabs/);
     assert.match(withProj, /gpt-4o/);
+    // Product-neutral: no brand identity
+    assert.match(withProj, /Do not claim any product name/i);
+    assert.ok(!/\bYou are \*\*Libra\*\*/i.test(withProj));
+    assert.ok(!/Product: Libra/i.test(withProj));
 
     const skip = buildSystemPrompt({
       provider: "openai",
@@ -987,6 +1021,12 @@ test("fusion formatFusionReasoningDisplay + prepareFusionForMain with chatImpl",
   assert.ok(prep.mainReasoning.text.includes("MAIN_PLAN"));
   assert.equal(prep.secondaries.length, 1);
   assert.ok(prep.secondaries[0]!.text.includes("PEER_PLAN"));
+  // Dual parts for independent Thought · Main / Thought · Peer UI
+  assert.equal(prep.displayParts.length, 2);
+  assert.equal(prep.displayParts[0]!.role, "main");
+  assert.equal(prep.displayParts[1]!.role, "peer");
+  assert.match(prep.displayParts[0]!.content, /MAIN_PLAN/);
+  assert.match(prep.displayParts[1]!.content, /PEER_PLAN/);
   // Compact path must not re-embed full dual bodies into system
   assert.ok(
     !prep.systemAddon.includes("MAIN_PLAN"),
@@ -1021,6 +1061,36 @@ test("fusion formatFusionReasoningDisplay + prepareFusionForMain with chatImpl",
 });
 
 // ─── self-review backup / restore ───────────────────────────────────
+
+test("self-review verify format + ship-gate helpers", async () => {
+  const {
+    formatVerifyFailure,
+    SELF_REVIEW_MAX_FIX_ROUNDS,
+  } = await import("../src/agent/self-review-verify.js");
+  const { buildSelfReviewFixPrompt } = await import(
+    "../src/agent/self-review.js"
+  );
+  assert.ok(SELF_REVIEW_MAX_FIX_ROUNDS >= 1);
+  const fail = formatVerifyFailure({
+    ok: false,
+    step: "typecheck",
+    typecheck: {
+      ok: false,
+      status: 2,
+      stdout: "",
+      stderr: "error TS2304: Cannot find name 'x'",
+    },
+  });
+  assert.match(fail, /typecheck/);
+  assert.match(fail, /TS2304/);
+  const fix = buildSelfReviewFixPrompt({
+    attempt: 1,
+    maxAttempts: 3,
+    failureMarkdown: fail,
+  });
+  assert.match(fix, /VERIFY FAILED|verify FAILED/i);
+  assert.match(fix, /typecheck/);
+});
 
 test("self-review handoff write + resume path resolve", async () => {
   const {

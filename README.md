@@ -278,9 +278,36 @@ registry.schemas({ slim: true });
 
 | Provider API | Tools |
 | --- | --- |
-| OpenAI-compatible (OpenAI, xAI, OpenRouter, …) | native `tools` / `tool_calls` |
+| OpenAI-compatible (OpenAI, xAI, OpenRouter, OpenCode Zen/Go, DeepSeek, Groq, …) | native `tools` / `tool_calls` |
 | Anthropic | `tools` + `tool_use` / `tool_result` blocks |
 | Gemini | `functionDeclarations` + `functionCall` / `functionResponse` |
+
+### Providers (`/login`)
+
+| Id | Name | Env key | Notes |
+| --- | --- | --- | --- |
+| `xai` | xAI (Grok) | `XAI_API_KEY` | OAuth PKCE or console key |
+| `opencode` / `zen` | **OpenCode Zen** | `OPENCODE_API_KEY` | Curated gateway · [opencode.ai/auth](https://opencode.ai/auth) |
+| `opencode-go` / `go` | **OpenCode Go** | `OPENCODE_GO_API_KEY` (falls back to Zen key) | Low-cost open models |
+| `openai` / `codex` | OpenAI / Codex | `OPENAI_API_KEY` | |
+| `anthropic` | Anthropic Claude | `ANTHROPIC_API_KEY` | |
+| `gemini` | Google Gemini | `GEMINI_API_KEY` | |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY` | |
+| `deepseek` | DeepSeek | `DEEPSEEK_API_KEY` | |
+| `groq` | Groq | `GROQ_API_KEY` | |
+| `together` | Together AI | `TOGETHER_API_KEY` | |
+| `mistral` | Mistral | `MISTRAL_API_KEY` | |
+| `fireworks` | Fireworks | `FIREWORKS_API_KEY` | |
+| `cerebras` | Cerebras | `CEREBRAS_API_KEY` | |
+| `moonshot` | Moonshot (Kimi) | `MOONSHOT_API_KEY` | |
+| `deepinfra` | DeepInfra | `DEEPINFRA_API_KEY` | |
+| `custom` | Custom OpenAI-compatible | — | Set base URL at login |
+
+```text
+/login opencode          # paste key from opencode.ai/auth
+/login go                # OpenCode Go (same console key works)
+/model                   # pick opencode/… or opencode-go/…
+```
 
 Compat helpers (`src/toolcalling/compat.ts`): arg JSON repair, alias normalization, per-model caps (parallel, max tools), Anthropic/Gemini schema conversion.
 

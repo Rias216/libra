@@ -77,6 +77,7 @@ import { initDebug, dbg } from "./agent/debug.js";
 import {
   buildSelfReviewSystemAddon,
   buildSelfReviewUserPrompt,
+  buildSelfReviewFixPrompt,
   collectSelfReviewSessionContext,
   createSelfReviewBackup,
   frictionOneLiner,
@@ -85,13 +86,20 @@ import {
   restoreSelfReviewBackup,
 } from "./agent/self-review.js";
 import {
+  consumeLastRelaunchNotice,
   createHandoff,
   installRelaunchSupervisor,
+  markLastRelaunchConsumed,
   readLastRelaunchNotice,
   signalRelaunch,
   spawnRelaunchSupervisor,
   type SelfReviewHandoff,
 } from "./agent/self-review-handoff.js";
+import {
+  formatVerifyFailure,
+  SELF_REVIEW_MAX_FIX_ROUNDS,
+  verifyLibraInstall,
+} from "./agent/self-review-verify.js";
 import {
   createSessionAutosave,
   getSessionsDir,
@@ -269,13 +277,28 @@ After install:  bun run link   (from the libra repo)
   // Quiet start — no welcome wall of text
   ui.setState(store.state);
 
-  // Surface self-review relaunch / restore notice
-  const notice =
-    noticeArg?.trim() ||
-    readLastRelaunchNotice()?.notice ||
-    (resumeArg ? "Session resumed." : "");
-  if (notice.trim()) {
+  // Surface self-review relaunch notice once (never every subsequent boot).
+  // Prefer explicit --notice= from the supervisor; otherwise one-shot consume
+  // last-relaunch.json so a sticky failure banner cannot reappear forever.
+  let notice = noticeArg?.trim() || "";
+  let noticeLevel: "warn" | "success" | "info" = "info";
+  if (notice) {
+    // Supervisor passed the text — mark file consumed so plain `libra` stays quiet
+    markLastRelaunchConsumed();
     const last = readLastRelaunchNotice();
+    noticeLevel = last?.restored ? "warn" : "success";
+  } else {
+    const last = consumeLastRelaunchNotice();
+    if (last?.notice?.trim()) {
+      notice = last.notice.trim();
+      noticeLevel = last.restored ? "warn" : "success";
+    } else if (resumeArg) {
+      // Only a light resume hint when no self-review banner applies
+      notice = "Session resumed.";
+      noticeLevel = "info";
+    }
+  }
+  if (notice.trim()) {
     store.appendMessage({
       id: newId("m"),
       role: "system",
@@ -284,7 +307,7 @@ After install:  bun run link   (from the libra repo)
         {
           id: newId("p"),
           type: "status",
-          level: last?.restored ? "warn" : "success",
+          level: noticeLevel,
           message: notice.trim(),
         },
       ],
@@ -366,9 +389,12 @@ function handleCommand(
             content:
               "### Commands\n\n" +
               "- `/login [provider]` — OAuth (xAI SuperGrok PKCE) or API keys; multi-login OK\n" +
+              "  · OpenCode **Zen** (`opencode`/`zen`) & **Go** (`opencode-go`/`go`) — key from opencode.ai/auth\n" +
+              "  · Also: openai, anthropic, gemini, openrouter, deepseek, groq, together, mistral, fireworks, cerebras, moonshot, deepinfra, custom\n" +
               "- `/model` — pick any model from **all** connected providers (fetched live)\n" +
               "- `/reasoning` — official model effort modes + ultra / ultra-fusion\n" +
               "- `/self-review` — **backup Libra then self-upgrade** with your active model\n" +
+              "  · verifies typecheck+build+smoke **in this tab** before exit; keeps fixing if red\n" +
               "- `/self-review list` / `restore` — source snapshots under `~/.libra/self-review-backups`\n" +
               "- Sessions auto-save as `~/.libra/sessions/*.libe` (friction mined on self-review)\n" +
               "- `/subagent` — subagent config\n" +
@@ -378,8 +404,8 @@ function handleCommand(
               "- **Click** a Thought / tool header to expand or collapse\n\n" +
               "### Reasoning\n\n" +
               "Effort levels are **per model** (from the provider catalog). Esc goes **back** in nested pickers.\n\n" +
-              "- **ultra** — max effort + Codex multi-agent (spawn/wait, proactive)\n" +
-              "- **ultra-fusion** — peer reasons; main compares, then multi-agent execute\n\n" +
+              "- **ultra** — max effort + forced reasoning subagents (reason×2 + explorer) then multi-agent execute\n" +
+              "- **ultra-fusion** — peer reasons; main compares, then multi-agent v2 execute\n\n" +
               "### Self-review\n\n" +
               "Uses **your current model**. Always snapshots sources + `.libe` session first. " +
               "After the agent finishes, an **external supervisor** verifies the build, " +
@@ -1373,6 +1399,9 @@ async function activateUltraNative(
       ...a.subagents,
       enabled: true,
       autoSpawn: true,
+      maxConcurrent: Math.max(a.subagents.maxConcurrent ?? 6, 8),
+      maxDepth: Math.max(a.subagents.maxDepth ?? 1, 2),
+      peerMessaging: true,
       preferredModelKey: modelKey({ provider, model: modelId }),
     },
   });
@@ -1385,7 +1414,11 @@ async function activateUltraNative(
   toast(
     store,
     `${mode} · ${provider}/${modelId} · ${effortNote}` +
-      (mode === "ultra-fusion" ? " · peer reasons too" : ""),
+      (mode === "ultra"
+        ? " · forced reason×2 + explorer"
+        : mode === "ultra-fusion"
+          ? " · peer reasons too"
+          : ""),
   );
 }
 
@@ -1913,9 +1946,9 @@ async function confirmAndRunSelfReview(
 }
 
 /**
- * Snapshot sources, mine .libe friction, run AgentLoop on Libra, then hand
- * off to an **external** supervisor that verifies build and relaunches into
- * this session (auto-restores source backup if open/build fails).
+ * Snapshot sources, mine .libe friction, run AgentLoop on Libra, **verify
+ * typecheck/build/smoke in this tab** (fix loop if red), then hand off to
+ * an external supervisor only when green (or fix budget exhausted).
  */
 async function runSelfReview(
   store: HarnessStore,
@@ -1987,7 +2020,7 @@ async function runSelfReview(
     return;
   }
 
-  // External supervisor — OUTSIDE agent loop; survives broken installs
+  // External supervisor — OUTSIDE agent loop; safety net only after we exit
   let handoff: SelfReviewHandoff | null = null;
   let supervisorPid = 0;
   try {
@@ -2021,7 +2054,7 @@ async function runSelfReview(
 
   toast(
     store,
-    `backup ${backup.id} · sessions ${friction.sessionsScanned} · relaunch armed`,
+    `backup ${backup.id} · sessions ${friction.sessionsScanned} · verify-before-exit`,
   );
   store.appendMessage({
     id: newId("m"),
@@ -2036,8 +2069,8 @@ async function runSelfReview(
           `Self-review: source backup \`${backup.id}\` (${backup.manifest.fileCount} files). ` +
           `Mined ${friction.sessionsScanned} .libe session(s) — ${frictionLine}. ` +
           `Model: \`${provider}/${model}\`. ` +
-          `External supervisor pid=${supervisorPid} will verify, auto-restore if broken, ` +
-          `and relaunch into this session (\`${store.state.session.id}\`).`,
+          `This tab will **typecheck + build + smoke** before exit; on failure the agent keeps fixing ` +
+          `(up to ${SELF_REVIEW_MAX_FIX_ROUNDS} fix rounds). Supervisor pid=${supervisorPid} is the safety net.`,
       },
     ],
   });
@@ -2071,6 +2104,18 @@ async function runSelfReview(
     "\n\n" +
     systemAddon;
 
+  const turnOpts = {
+    provider,
+    model,
+    cwd: libraRoot,
+    tools: true as const,
+    systemPrompt: system,
+    autoApprove: true,
+    label: "self-review",
+    maxSteps: 48,
+    subagents: loadAgentSettings().subagents.enabled,
+  };
+
   dbg("self-review", "start", {
     backupId: backup.id,
     root: libraRoot,
@@ -2082,36 +2127,127 @@ async function runSelfReview(
   });
 
   let agentFailed: string | undefined;
+  let verifyOk = false;
+  let lastVerifyDetail = "";
+
   try {
-    // Force tools + auto-approve so the model can actually ship upgrades.
-    // cwd is the Libra install — not the user's unrelated project cwd.
-    await liveAgent.handle(userPrompt, {
-      provider,
-      model,
-      cwd: libraRoot,
-      tools: true,
-      systemPrompt: system,
-      autoApprove: true,
-      label: "self-review",
-      maxSteps: 48,
-      // Prefer multi-agent if the user already enabled it / ultra
-      subagents: loadAgentSettings().subagents.enabled,
-    });
-  } catch (err) {
-    agentFailed = err instanceof Error ? err.message : String(err);
-    notify(store, agentFailed, "error");
-    store.setPhase("idle");
+    // ── Pass 1: upgrade ───────────────────────────────────────────
+    try {
+      await liveAgent.handle(userPrompt, turnOpts);
+    } catch (err) {
+      agentFailed = err instanceof Error ? err.message : String(err);
+      notify(store, agentFailed, "error");
+      store.setPhase("idle");
+    }
+
+    // ── In-tab verify + fix loop (do NOT exit while red) ──────────
+    for (let fix = 0; fix <= SELF_REVIEW_MAX_FIX_ROUNDS; fix++) {
+      store.setPhase(
+        "tool",
+        fix === 0
+          ? "self-review: verifying typecheck + build + smoke…"
+          : `self-review: re-verifying after fix ${fix}/${SELF_REVIEW_MAX_FIX_ROUNDS}…`,
+      );
+      try {
+        ui.setState(store.state);
+        ui.requestPaint();
+      } catch {
+        /* */
+      }
+
+      const verified = verifyLibraInstall(libraRoot);
+      dbg("self-review", "verify", {
+        ok: verified.ok,
+        step: verified.step,
+        fix,
+        version: verified.version ?? null,
+      });
+
+      if (verified.ok) {
+        verifyOk = true;
+        lastVerifyDetail = verified.version || "ok";
+        store.appendMessage({
+          id: newId("m"),
+          role: "system",
+          createdAt: Date.now(),
+          parts: [
+            {
+              id: newId("p"),
+              type: "status",
+              level: "success",
+              message:
+                `Self-review verify **green** (${verified.version || "typecheck+build+smoke"}). ` +
+                `Exiting this tab for clean relaunch into the same session…`,
+            },
+          ],
+        });
+        break;
+      }
+
+      lastVerifyDetail = formatVerifyFailure(verified);
+      store.appendMessage({
+        id: newId("m"),
+        role: "system",
+        createdAt: Date.now(),
+        parts: [
+          {
+            id: newId("p"),
+            type: "status",
+            level: "warn",
+            message:
+              `Self-review verify **failed** at \`${verified.step}\` ` +
+              `(fix budget ${fix}/${SELF_REVIEW_MAX_FIX_ROUNDS}). ` +
+              (fix < SELF_REVIEW_MAX_FIX_ROUNDS
+                ? "Keeping this tab open — agent will keep fixing…"
+                : "Fix budget exhausted — supervisor safety net will run on exit."),
+          },
+        ],
+      });
+
+      if (fix >= SELF_REVIEW_MAX_FIX_ROUNDS) break;
+
+      // Keep working in this session with the failure log
+      const fixPrompt = buildSelfReviewFixPrompt({
+        attempt: fix + 1,
+        maxAttempts: SELF_REVIEW_MAX_FIX_ROUNDS,
+        failureMarkdown: lastVerifyDetail,
+      });
+      store.setPhase(
+        "streaming",
+        `self-review: fix round ${fix + 1}/${SELF_REVIEW_MAX_FIX_ROUNDS}…`,
+      );
+      try {
+        await liveAgent.handle(fixPrompt, {
+          ...turnOpts,
+          label: `self-review-fix-${fix + 1}`,
+          maxSteps: 32,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        agentFailed = agentFailed ? `${agentFailed}; ${msg}` : msg;
+        notify(store, msg, "error");
+        // still re-verify next loop
+      }
+      sessionAutosave?.flush();
+      saveSessionLibe(store.state, { libraVersion: getVersion() });
+    }
   } finally {
     // Always flush session so relaunch restores full transcript
     sessionAutosave?.flush();
     saveSessionLibe(store.state, { libraVersion: getVersion() });
 
+    const exitReason = verifyOk ? "agent_done" : "agent_failed";
+    const exitNote = !verifyOk
+      ? `in-tab verify still red after ${SELF_REVIEW_MAX_FIX_ROUNDS} fix rounds` +
+        (agentFailed ? `; agent: ${agentFailed}` : "") +
+        `\n\n${lastVerifyDetail}`
+      : agentFailed
+        ? `verify green but agent reported: ${agentFailed}`
+        : undefined;
+
     if (handoff) {
-      signalRelaunch(
-        handoff,
-        agentFailed ? "agent_failed" : "agent_done",
-        agentFailed,
-      );
+      // Only signal exit readiness now — supervisor was waiting on parent life
+      signalRelaunch(handoff, exitReason, exitNote);
     }
 
     store.appendMessage({
@@ -2122,14 +2258,13 @@ async function runSelfReview(
         {
           id: newId("p"),
           type: "status",
-          level: agentFailed ? "warn" : "success",
-          message: agentFailed
-            ? `Self-review agent error — supervisor will still verify build; auto-restore if needed. Exiting for relaunch…`
-            : `Self-review finished — exiting so supervisor can verify + relaunch into this session…`,
+          level: verifyOk ? "success" : "warn",
+          message: verifyOk
+            ? `Self-review ship gate passed — handing off to supervisor for relaunch…`
+            : `Self-review ship gate still red — exiting for supervisor (may auto-restore backup \`${backup.id}\`)…`,
         },
       ],
     });
-    // Paint the final status once
     try {
       ui.setState(store.state);
       ui.requestPaint();
@@ -2141,10 +2276,10 @@ async function runSelfReview(
     dbg("self-review", "end", {
       backupId: backup.id,
       agentFailed: agentFailed ?? null,
+      verifyOk,
       supervisorPid,
     });
 
-    // Hand TTY back; supervisor relaunches into the same .libe session
     await exitForSelfReviewRelaunch(ui);
   }
 }
@@ -2209,14 +2344,65 @@ async function handleUserSubmit(
       fusionPrepAbort = abortCtrl;
       try {
         const settings = loadAgentSettings();
-        // Collect dual reasoning off-screen; display as one normal thinking block
+        // Phase-1: create the turn early and stream Main + Peer thoughts live
+        store.appendUser(text);
+        const assistant = store.startAssistant();
+        const mid = assistant.id;
+        const mainPartId = newId("p");
+        const peerPartId = newId("p");
+        store.appendPart(mid, {
+          id: mainPartId,
+          type: "reasoning",
+          content: "",
+          streaming: true,
+          collapsed: false,
+          title: `Main · ${provider}/${model}`,
+        });
+        store.appendPart(mid, {
+          id: peerPartId,
+          type: "reasoning",
+          content: "",
+          streaming: true,
+          collapsed: false,
+          title: "Peer · …",
+        });
+
         const prep = await prepareFusionForMain(
           store,
           text,
           provider,
           model,
-          abortCtrl.signal,
+          {
+            signal: abortCtrl.signal,
+            onMainReasoningDelta: (d) => {
+              if (d) store.reasoningDelta(mid, mainPartId, d);
+            },
+            onPeerReasoningDelta: (d) => {
+              if (d) store.reasoningDelta(mid, peerPartId, d);
+            },
+          },
         );
+
+        // Finalize dual Thought parts with full text + accurate titles
+        const mainDisp = prep.displayParts.find((p) => p.role === "main");
+        const peerDisp = prep.displayParts.find((p) => p.role === "peer");
+        store.patchPart(mid, mainPartId, {
+          content: mainDisp?.content ?? prep.mainReasoning.text ?? "",
+          streaming: false,
+          collapsed: false,
+          title: mainDisp?.title ?? `Main · ${provider}/${model}`,
+        } as never);
+        store.patchPart(mid, peerPartId, {
+          content:
+            peerDisp?.content ??
+            prep.secondaries[0]?.text ??
+            prep.secondaries[0]?.error ??
+            "(no peer)",
+          streaming: false,
+          collapsed: false,
+          title: peerDisp?.title ?? "Peer",
+        } as never);
+
         toast(store, prep.summary);
         const system =
           buildSystemPrompt({
@@ -2233,8 +2419,11 @@ async function handleUserSubmit(
           cwd: process.cwd(),
           tools: true,
           systemPrompt: system,
-          // Same assistant turn as tools/text — not a split second panel
+          // Dual traces already on the assistant message (live-streamed)
+          existingAssistantId: mid,
+          // Wire seed for lightReasoning + history CoT (not re-appended as parts)
           seedReasoning: prep.displayReasoning,
+          lightReasoning: true,
         });
       } catch (err) {
         notify(

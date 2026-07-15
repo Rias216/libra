@@ -65,10 +65,42 @@ export interface Row {
   hit?: RowHit;
 }
 
-const SPINNER = ["|", "/", "-", "\\"];
+/**
+ * OpenCode-style braille loading spinner (default).
+ * Override via setSpinnerGlyphs() when a font profile supplies its own frames.
+ */
+export const BRAILLE_SPINNER = [
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+] as const;
+
+let SPINNER: readonly string[] = BRAILLE_SPINNER;
+
+/** Install spinner frames from the active glyph profile (or reset to braille). */
+export function setSpinnerGlyphs(frames?: readonly string[] | null): void {
+  if (frames && frames.length > 0) {
+    SPINNER = frames;
+  } else {
+    SPINNER = BRAILLE_SPINNER;
+  }
+}
 
 export function spinnerFrame(tick: number): string {
-  return SPINNER[tick % SPINNER.length]!;
+  const frames = SPINNER.length > 0 ? SPINNER : BRAILLE_SPINNER;
+  return frames[tick % frames.length]!;
+}
+
+/** Active spinner frames (for tests / diagnostics). */
+export function getSpinnerGlyphs(): readonly string[] {
+  return SPINNER;
 }
 
 export function renderPart(
@@ -245,7 +277,10 @@ function renderReasoning(
     : collapsed
       ? ">"
       : "v";
-  const label = part.streaming ? "Thinking" : "Thought";
+  const baseLabel = part.streaming ? "Thinking" : "Thought";
+  const label = part.title?.trim()
+    ? `${baseLabel} · ${part.title.trim()}`
+    : baseLabel;
   const sizeHint = formatSizeHint(part.content);
   const meta = part.streaming
     ? " streaming"

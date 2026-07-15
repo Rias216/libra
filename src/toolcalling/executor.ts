@@ -482,7 +482,8 @@ export class ToolExecutor {
 
     const lines = raw.split(/\r?\n/);
     const defaultLimit = this.opts.defaultReadLimit ?? DEFAULT_READ_LIMIT;
-    const start = Math.max(0, (offset ?? 1) - 1);
+    // Negative offset = from end of file (Grok resolve_read_start_line spirit)
+    const start = resolveReadStartIndex(offset, lines.length);
     const maxLines = limit ?? defaultLimit;
     const end = Math.min(lines.length, start + maxLines);
     const slice = lines.slice(start, end).map((l) =>
@@ -504,9 +505,7 @@ export class ToolExecutor {
       };
     }
 
-    const numbered = slice
-      .map((l, i) => `${String(start + i + 1).padStart(4)}|${l}`)
-      .join("\n");
+    const numbered = formatNumberedReadLines(slice, start + 1);
     return {
       ok: true,
       content: numbered,
@@ -544,12 +543,11 @@ export class ToolExecutor {
     if (!raw.includes(oldStr)) {
       // Soft hint: whitespace-only mismatch
       const soft = findSoftMatchHint(raw, oldStr);
+      const base = soft
+        ? `old_string not found. ${soft}`
+        : "old_string not found — read the file and copy the exact text (including whitespace).";
       throw Object.assign(
-        new Error(
-          soft
-            ? `old_string not found. ${soft}`
-            : "old_string not found — read the file and copy the exact text (including whitespace).",
-        ),
+        new Error(`${base}${EDIT_REREAD_HINT}`),
         { code: "not_found" },
       );
     }
@@ -559,7 +557,7 @@ export class ToolExecutor {
     if (count > 1 && !replaceAll) {
       throw Object.assign(
         new Error(
-          `old_string matched ${count} times; set replace_all=true or include more surrounding context to make it unique.`,
+          `old_string matched ${count} times; set replace_all=true or include more surrounding context to make it unique.${EDIT_REREAD_HINT}`,
         ),
         { code: "ambiguous" },
       );
@@ -874,6 +872,36 @@ export function coerceTodoItems(raw: unknown): unknown[] | null {
     if (Array.isArray(o.todos)) return o.todos;
   }
   return null;
+}
+
+/** Appended on NoMatches / ambiguous search_replace failures (Grok edit hint). */
+export const EDIT_REREAD_HINT =
+  " File may have changed — re-read with read_file before retrying.";
+
+/**
+ * Resolve 1-based or negative offset to 0-based start index.
+ * offset omitted / 0 / 1 → start of file; negative → from end (e.g. -1 = last line).
+ */
+export function resolveReadStartIndex(
+  offset: number | undefined,
+  totalLines: number,
+): number {
+  if (offset == null || offset === 0) return 0;
+  if (offset < 0) {
+    // -1 = last line only when limit=1; start index for last |offset| lines
+    return Math.max(0, totalLines + offset);
+  }
+  return Math.max(0, offset - 1);
+}
+
+/** Interactive read_file line format: `LINE_NUMBER→LINE_CONTENT` (no padding). */
+export function formatNumberedReadLines(
+  lines: string[],
+  startLine1Based: number,
+): string {
+  return lines
+    .map((l, i) => `${startLine1Based + i}→${l}`)
+    .join("\n");
 }
 
 function countOccurrences(haystack: string, needle: string): number {

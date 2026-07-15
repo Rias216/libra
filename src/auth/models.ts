@@ -4,7 +4,11 @@
  */
 
 import type { ProviderId } from "./types.js";
-import { getProvider, PROVIDERS } from "./types.js";
+import {
+  canonicalizeProviderId,
+  getProvider,
+  PROVIDERS,
+} from "./types.js";
 import { resolveToken, resolveTokenFresh } from "./api-key.js";
 import { getCredential } from "./store.js";
 import {
@@ -54,9 +58,9 @@ export function parseModelKey(key: string): ModelRef | null {
   if (!raw) return null;
   const i = raw.indexOf("/");
   if (i <= 0) return null;
-  const provider = raw.slice(0, i) as ProviderId;
+  const provider = canonicalizeProviderId(raw.slice(0, i));
   const model = raw.slice(i + 1).trim();
-  if (!getProvider(provider) || !model) return null;
+  if (!provider || !getProvider(provider) || !model) return null;
   // Reject accidental cycle-encoding from pickers
   if (model.includes("::")) return null;
   return { provider, model };
@@ -220,7 +224,11 @@ async function fetchOpenAIStyle(
     Authorization: `Bearer ${token}`,
     Accept: "application/json",
   };
-  if (provider === "openrouter") {
+  if (
+    provider === "openrouter" ||
+    provider === "opencode" ||
+    provider === "opencode-go"
+  ) {
     headers["HTTP-Referer"] = "https://github.com/libra-tui";
     headers["X-Title"] = "Libra";
   }
@@ -291,13 +299,31 @@ async function fetchOpenAIStyle(
     }
   }
 
-  // xAI fallback catalog if live list fails (still allows selecting known IDs)
+  // Fallback catalogs when live list fails (still allows selecting known IDs)
   if (provider === "xai") {
     return XAI_FALLBACK_MODELS.map((id) => ({
       id,
       name: id,
       provider: "xai" as const,
       description: "xAI (fallback catalog — API list unavailable)",
+      reasoning: looksReasoning(id),
+    }));
+  }
+  if (provider === "opencode") {
+    return OPENCODE_ZEN_FALLBACK.map((id) => ({
+      id,
+      name: id,
+      provider: "opencode" as const,
+      description: "OpenCode Zen (fallback catalog)",
+      reasoning: looksReasoning(id),
+    }));
+  }
+  if (provider === "opencode-go") {
+    return OPENCODE_GO_FALLBACK.map((id) => ({
+      id,
+      name: id,
+      provider: "opencode-go" as const,
+      description: "OpenCode Go (fallback catalog)",
       reasoning: looksReasoning(id),
     }));
   }
@@ -315,6 +341,42 @@ const XAI_FALLBACK_MODELS = [
   "grok-3-mini",
   "grok-2-1212",
   "grok-2-vision-1212",
+];
+
+/** Subset of curated Zen models when /models is unavailable */
+const OPENCODE_ZEN_FALLBACK = [
+  "gpt-5.5",
+  "gpt-5.4",
+  "claude-sonnet-4-6",
+  "claude-opus-4-6",
+  "claude-haiku-4-5",
+  "gemini-3-flash",
+  "gemini-3.1-pro",
+  "kimi-k2.7-code",
+  "kimi-k2.6",
+  "glm-5.2",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash",
+  "minimax-m2.7",
+  "grok-4.5",
+  "big-pickle",
+];
+
+/** OpenCode Go open-model catalog subset */
+const OPENCODE_GO_FALLBACK = [
+  "kimi-k2.7-code",
+  "kimi-k2.6",
+  "glm-5.2",
+  "glm-5.1",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash",
+  "mimo-v2.5",
+  "mimo-v2.5-pro",
+  "minimax-m3",
+  "minimax-m2.7",
+  "qwen3.7-max",
+  "qwen3.7-plus",
+  "qwen3.6-plus",
 ];
 
 async function fetchGemini(

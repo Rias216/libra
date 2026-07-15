@@ -64,7 +64,9 @@ import {
   buildMultiAgentSystemAddon,
   isMultiAgentTool,
 } from "./subagent/tools.js";
+import { forceUltraReasoningExtension } from "./ultra-reason.js";
 import { getModelContextWindow } from "../auth/models.js";
+import { newId } from "../core/types.js";
 
 /** OpenCode-style step cap before max-steps nudge. */
 export const MAX_STEPS = 24;
@@ -97,6 +99,11 @@ export interface TurnOptions {
    * Effort is always applied via buildReasoningApiFields / per-model settings.
    */
   lightReasoning?: boolean;
+  /**
+   * Explicit reasoning effort for this turn (child spawn / role override).
+   * Passed as ChatRequest.reasoning_effort so it wins over native defaults.
+   */
+  reasoningEffort?: string;
   toolChoice?: "auto" | "none" | "required";
   label?: string;
   permissions?: PermissionRules;
@@ -116,6 +123,14 @@ export interface TurnOptions {
   promptProfile?: "full" | "slim";
   /** Short tool descriptions to save prompt tokens. */
   slimTools?: boolean;
+  /** Extra tool schemas (e.g. peer multi-agent tools for children). */
+  extraTools?: OpenAITool[];
+  /** Treat name as custom (peer multi-agent) for headless children. */
+  isCustomTool?: (name: string) => boolean;
+  /** Dispatch custom tools (peer multi-agent) for headless children. */
+  customDispatch?: (
+    call: DispatchCall,
+  ) => Promise<{ ok: boolean; output: string; durationMs?: number }>;
 }
 
 export interface TurnResult {
@@ -173,6 +188,12 @@ export interface TurnCoreHooks {
    * the live assistant message id.
    */
   onSessionRollover?: (compacted: CompactedSession) => void;
+  /**
+   * After a tool wave (and before the next sample): inject completion
+   * notices for finished subagents. Return text to append as a user note,
+   * or empty/undefined to skip.
+   */
+  drainSubagentNotices?: () => string | undefined;
   /** Span namespace */
   spanNs?: string;
 }
@@ -186,6 +207,8 @@ export interface TurnCoreInput {
   runtime: ToolCallRuntime;
   maxSteps: number;
   lightReasoning: boolean;
+  /** Explicit effort override → ChatRequest.reasoning_effort */
+  reasoningEffort?: string;
   toolChoice?: "auto" | "none" | "required";
   toolsEnabledInitially: boolean;
   abortSignal?: AbortSignal;
@@ -210,6 +233,7 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
     runtime,
     maxSteps,
     lightReasoning,
+    reasoningEffort,
     toolChoice,
     toolsEnabledInitially,
     abortSignal,
@@ -328,6 +352,9 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
       const toolsEnabled =
         toolsEnabledInitially && Boolean(toolSchemas?.length) && !isLast;
 
+      // Before sample: surface subagent completions that finished since last notice
+      maybeInjectSubagentNotices(messages, hooks.drainSubagentNotices);
+
       // Same max-steps nudge for parent AND child
       const sampleMessages = isLast
         ? [
@@ -336,9 +363,11 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
           ]
         : messages;
 
-      // Reasoning effort is set only at the API layer (buildReasoningApiFields /
-      // user per-model effort). Never force "low" or disable native reasoning.
-      const effort = resolveEffortForModel(provider, model).effort;
+      // Native effort from per-model settings; explicit turn override wins
+      // via ChatRequest.reasoning_effort (see llm/client).
+      const effort =
+        reasoningEffort?.trim() ||
+        resolveEffortForModel(provider, model).effort;
 
       // Always "streaming" while the model is generating — never jump to
       // "tool" mid-thought. Tool phase starts only when tools actually run.
@@ -380,6 +409,10 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
                 temperature: lightReasoning ? 0.2 : 0.4,
                 stream: true,
                 applyNativeReasoning: true,
+                // Explicit child/spawn effort override (native still applied first)
+                ...(reasoningEffort?.trim()
+                  ? { reasoning_effort: reasoningEffort.trim() }
+                  : {}),
                 // No max_tokens — unlimited generation; effort only via API fields
                 signal: abortSignal,
                 label: `${label}.s${step}`,
@@ -529,6 +562,9 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
           fail: outputs.filter((o) => !o.ok).length,
         });
 
+        // After tool wave: notify parent of any subagents that finished
+        maybeInjectSubagentNotices(messages, hooks.drainSubagentNotices);
+
         finalText = result.content?.trim() || finalText;
         continue;
       }
@@ -666,13 +702,16 @@ export async function runStoreTurn(
             .slice(0, 2000) ?? "",
         signal: opts.abortSignal,
         preferredModelKey: settings.subagents.preferredModelKey,
+        // Tests inject chatImpl for parent + forced Ultra reasoners
+        chatImpl: opts.chatImpl,
       })
     : null;
+  const turnId = subRuntime?.beginTurn();
 
+  const isUltra = settings.reasoning.custom === "ultra";
+  const isUltraFusion = settings.reasoning.custom === "ultra-fusion";
   const proactive =
-    settings.subagents.autoSpawn ||
-    settings.reasoning.custom === "ultra" ||
-    settings.reasoning.custom === "ultra-fusion";
+    settings.subagents.autoSpawn || isUltra || isUltraFusion;
 
   let system =
     opts.systemPrompt ??
@@ -692,7 +731,77 @@ export async function runStoreTurn(
         maxThreads: settings.subagents.maxConcurrent,
         maxDepth: settings.subagents.maxDepth,
         proactive,
+        peerMessaging: settings.subagents.peerMessaging !== false,
       });
+  }
+
+  /**
+   * Ultra (not fusion): harness-forces parallel reason/explorer subagents
+   * before the main sample loop so reasoning is extended by construction.
+   * Fusion already dual-reasons in phase-1; skip double-prep there.
+   * Main keeps full native effort (do not flip lightReasoning from this seed).
+   */
+  if (
+    isUltra &&
+    subRuntime?.canSpawn &&
+    opts.tools !== false &&
+    !opts.seedReasoning?.trim()
+  ) {
+    const userPrompt =
+      [...ctx.store.state.messages]
+        .reverse()
+        .find((m) => m.role === "user")
+        ?.parts.filter((p) => p.type === "text")
+        .map((p) => (p.type === "text" ? p.content : ""))
+        .join("\n")
+        .trim() ?? "";
+
+    if (userPrompt) {
+      try {
+        const ext = await forceUltraReasoningExtension(
+          subRuntime,
+          userPrompt,
+          {
+            signal: opts.abortSignal,
+            onPhase: (lab) => ctx.store.setPhase("thinking", lab),
+          },
+        );
+        // Mark notices consumed so mid-turn drain does not re-paste them
+        void subRuntime.drainCompletionNotices();
+
+        if (ext.systemAddon.trim()) {
+          system += "\n\n" + ext.systemAddon;
+        }
+        // Thought blocks in the TUI (one per forced angle)
+        for (const part of ext.parts) {
+          if (!part.content.trim()) continue;
+          ctx.store.appendPart(ctx.messageId, {
+            id: newId("p"),
+            type: "reasoning",
+            content: part.content,
+            streaming: false,
+            collapsed: false,
+            title: part.title,
+          });
+        }
+        if (ext.okCount > 0) {
+          ctx.store.setPhase(
+            "thinking",
+            `ultra · ${ext.okCount} reasoning subagent${ext.okCount === 1 ? "" : "s"} ready · ${Math.round(ext.ms)}ms`,
+          );
+        }
+      } catch (err) {
+        if (
+          err instanceof DOMException &&
+          err.name === "AbortError"
+        ) {
+          throw err;
+        }
+        dbg("agent", "ultra.force_reason.error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   const messages: ChatMessage[] = [
@@ -730,6 +839,7 @@ export async function runStoreTurn(
       runtime,
       maxSteps,
       lightReasoning: light,
+      reasoningEffort: opts.reasoningEffort,
       toolChoice: opts.toolChoice,
       toolsEnabledInitially: opts.tools !== false,
       abortSignal: opts.abortSignal,
@@ -742,6 +852,9 @@ export async function runStoreTurn(
         compactBudget: modelBudget,
         onPhase: (phase, lab) => ctx.store.setPhase(phase, lab),
         onUsage: (p, c) => ctx.store.addTokens(p, c),
+        drainSubagentNotices: subRuntime
+          ? () => subRuntime.drainCompletionNotices()
+          : undefined,
         /**
          * Full auto-compact: wipe the old transcript and seed a **new**
          * session with the compacted context, then re-bind the live
@@ -827,7 +940,9 @@ export async function runStoreTurn(
       },
     });
   } finally {
-    subRuntime?.cancelAll();
+    // Cancel only agents tagged to this parent turn
+    if (turnId) subRuntime?.cancelTurn(turnId);
+    else subRuntime?.cancelTurn();
   }
 }
 
@@ -864,20 +979,26 @@ export async function runHeadlessTurn(
   }
   const chat = opts.chatImpl ?? chatComplete;
   const light = Boolean(opts.lightReasoning);
+  const baseSchemas =
+    opts.tools !== false
+      ? runner.registry.schemas({ slim: opts.slimTools === true })
+      : undefined;
+  const toolSchemas =
+    baseSchemas && opts.extraTools?.length
+      ? mergeToolSchemas(baseSchemas, opts.extraTools)
+      : baseSchemas;
 
   try {
     return await runTurnCore({
       provider: opts.provider,
       model: opts.model,
       messages,
-      toolSchemas:
-        opts.tools !== false
-          ? runner.registry.schemas({ slim: opts.slimTools === true })
-          : undefined,
+      toolSchemas,
       runner,
       runtime,
       maxSteps,
       lightReasoning: light,
+      reasoningEffort: opts.reasoningEffort,
       toolChoice: opts.toolChoice,
       toolsEnabledInitially: opts.tools !== false,
       abortSignal: opts.abortSignal,
@@ -892,6 +1013,8 @@ export async function runHeadlessTurn(
           COMPACT_TOKEN_BUDGET_CHILD,
         ),
         compactKeepRecent: 12,
+        isCustomTool: opts.isCustomTool,
+        customDispatch: opts.customDispatch,
         // Headless has no UI session — wire messages are already replaced
         // in maybeCompact; no onSessionRollover needed.
       },
@@ -923,6 +1046,20 @@ function mergeToolSchemas(
     }
   }
   return out;
+}
+
+/** Append deduped subagent completion notices as a system-reminder user turn. */
+function maybeInjectSubagentNotices(
+  messages: ChatMessage[],
+  drain?: () => string | undefined,
+): void {
+  if (!drain) return;
+  const text = drain()?.trim();
+  if (!text) return;
+  messages.push({
+    role: "user",
+    content: `<system-reminder>\nSubagent(s) finished since last notice:\n\n${text}\n</system-reminder>`,
+  });
 }
 
 /** Title for a session after auto-compaction rollover. */

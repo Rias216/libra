@@ -884,6 +884,60 @@ export function extractReasoningFromMessage(msg: {
   return "";
 }
 
+/**
+ * OpenCode Zen/Go: strip non-wire fields from assistant history.
+ * Keep reasoning_content only (DeepSeek/OR-compatible); drop the parallel
+ * `reasoning` string which some Console upstreams reject mid tool-loop.
+ */
+export function sanitizeOpenCodeMessages(
+  messages: ChatMessage[],
+): Array<Record<string, unknown>> {
+  return messages.map((m) => {
+    const out: Record<string, unknown> = {
+      role: m.role,
+      content: m.content,
+    };
+    if (m.name) out.name = m.name;
+    if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+    if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
+    // Prefer reasoning_content; never send empty
+    const r = (m.reasoning_content ?? m.reasoning ?? "").trim();
+    if (r) out.reasoning_content = r;
+    return out;
+  });
+}
+
+/** Human-friendly HTTP errors for Zen credits / upstream flakiness. */
+export function formatProviderHttpError(
+  status: number,
+  body: string,
+  provider: ProviderId,
+  model: string,
+): string {
+  const slice = body.slice(0, 400);
+  if (
+    (provider === "opencode" || provider === "opencode-go") &&
+    /CreditsError|Insufficient balance/i.test(body)
+  ) {
+    return (
+      `OpenCode Zen: insufficient balance for ${model}. ` +
+      `Top up at https://opencode.ai/auth (or pick a free model like deepseek-v4-flash-free / big-pickle). ` +
+      `HTTP ${status}: ${slice}`
+    );
+  }
+  if (
+    (provider === "opencode" || provider === "opencode-go") &&
+    /Upstream request failed/i.test(body)
+  ) {
+    return (
+      `OpenCode Zen upstream failed for ${model} (often free-tier flakiness). ` +
+      `Retry, switch model, or check https://opencode.ai status. ` +
+      `HTTP ${status}: ${slice}`
+    );
+  }
+  return `HTTP ${status}: ${slice}`;
+}
+
 export async function chatComplete(
   req: ChatRequest,
   handlers?: StreamHandlers,
@@ -948,14 +1002,23 @@ async function chatOpenAI(
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
   };
-  if (provider === "openrouter") {
+  if (
+    provider === "openrouter" ||
+    provider === "opencode" ||
+    provider === "opencode-go"
+  ) {
     headers["HTTP-Referer"] = "https://github.com/libra-tui";
     headers["X-Title"] = "Libra";
   }
 
+  const isOpenCode = provider === "opencode" || provider === "opencode-go";
   const body: Record<string, unknown> = {
     model: req.model,
-    messages: req.messages,
+    // Zen/Go: only send wire-safe message fields (avoids dual reasoning
+    // string fields confusing OR-backed free models).
+    messages: isOpenCode
+      ? sanitizeOpenCodeMessages(req.messages)
+      : req.messages,
     temperature: req.temperature ?? 0.2,
     stream: req.stream !== false,
   };
@@ -981,8 +1044,10 @@ async function chatOpenAI(
   }
   // Explicit override wins (still sent as native API fields, not prompt)
   if (req.reasoning_effort && req.reasoning_effort !== "default") {
-    if (provider === "openrouter") {
+    if (provider === "openrouter" || isOpenCode) {
+      // Single nested shape — do not also set reasoning_effort
       body.reasoning = { effort: req.reasoning_effort };
+      delete body.reasoning_effort;
     } else if (provider === "xai") {
       body.reasoning_effort = req.reasoning_effort;
       body.reasoning = { effort: req.reasoning_effort };
@@ -991,7 +1056,8 @@ async function chatOpenAI(
     }
   }
 
-  // stream_options for usage on OpenAI/OpenRouter when streaming
+  // stream_options for usage on OpenAI/OpenRouter when streaming.
+  // OpenCode Zen free models proxy through OR and accept it; keep enabled.
   if (body.stream) {
     body.stream_options = { include_usage: true };
   }
@@ -1044,7 +1110,34 @@ async function chatOpenAI(
       body: t.slice(0, 400),
       model: modelTag(provider, req.model),
     });
-    throw new Error(`HTTP ${res.status}: ${t.slice(0, 400)}`);
+
+    // OpenCode Zen: one retry with a minimal body when Console returns
+    // upstream 400 (field shape / free-tier flakiness).
+    if (
+      isOpenCode &&
+      res.status === 400 &&
+      /Upstream request failed|invalid_request/i.test(t) &&
+      !req.label?.includes(".zenretry")
+    ) {
+      dbg("llm", "zen.simplify_retry", {
+        model: modelTag(provider, req.model),
+        label: req.label,
+      });
+      return chatOpenAI(
+        base,
+        token,
+        provider,
+        {
+          ...req,
+          reasoning_effort: undefined,
+          applyNativeReasoning: false,
+          label: `${req.label ?? "chat"}.zenretry`,
+        },
+        handlers,
+      );
+    }
+
+    throw new Error(formatProviderHttpError(res.status, t, provider, req.model));
   }
 
   if (body.stream) {

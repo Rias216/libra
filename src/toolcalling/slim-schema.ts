@@ -9,17 +9,17 @@ import { OPENAI_TOOLS } from "./schema.js";
 const SLIM_DESC: Record<string, string> = {
   list_dir: "List files in a directory (prefer over shell ls/dir).",
   read_file:
-    "Read file(s). Use target_file or target_files (batch). Prefer over cat/type.",
+    "Read file(s) as LINE_NUMBER→content. target_file or target_files. Negative offset = from end. Prefer over cat/type.",
   write: "Write full file contents (creates parents).",
   search_replace:
-    "Exact string edit. old_string must be unique unless replace_all.",
+    "Exact string edit. Do not paste LINE_NUMBER→ prefixes. old_string must be unique unless replace_all; re-read on failure.",
   grep: "Search file contents by regex/pattern.",
   glob: "Find files by glob pattern.",
   run_terminal_command:
-    "Run a shell command (builds/tests/git only — not for reading files).",
+    "Run a shell command (builds/tests/git). Prefer specialized tools for file ops. On Windows avoid missing unix utils; background=true + process tool, no sleep-poll.",
   web_search: "Search the web.",
   todo_write: "Update the session todo list.",
-  process: "Manage background processes (poll/log/wait/kill).",
+  process: "Manage background processes (poll/log/wait/kill — do not sleep-poll).",
 };
 
 /** Return schemas with short descriptions; parameters unchanged. */

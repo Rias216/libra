@@ -148,7 +148,8 @@ export function glyphsFor(profile: FontProfile): GlyphSet {
         user: ">",
         thumb: "#",
         track: "|",
-        spinner: ["|", "/", "-", "\\"],
+        // OpenCode-style braille loader even on the ascii chrome profile
+        spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
       };
   }
 }

@@ -50,6 +50,7 @@ import {
 } from "./prompt.js";
 import {
   reasoningModeDisplay,
+  renderContextFooter,
   renderDivider,
   renderHeader,
   renderStatus,
@@ -72,6 +73,7 @@ import {
   type PickerSpec,
   type PickerState,
 } from "./picker.js";
+import { setSpinnerGlyphs } from "./components/parts.js";
 import {
   fontChangeSequence,
   glyphsFor,
@@ -249,6 +251,7 @@ export class TuiRenderer {
     this.theme = resolveTheme(opts.theme ?? "libra-night");
     this.font = resolveFont(opts.font ?? "default");
     this.glyphs = glyphsFor(this.font);
+    setSpinnerGlyphs(this.glyphs.spinner);
     this.colorLevel = detectColorLevel();
     const { cols, rows } = this.size();
     this.buf = new FrameBuffer(cols, rows, this.colorLevel, this.theme.bg);
@@ -487,6 +490,7 @@ export class TuiRenderer {
   setFont(name: string, opts?: { preview?: boolean }): void {
     this.font = resolveFont(name);
     this.glyphs = glyphsFor(this.font);
+    setSpinnerGlyphs(this.glyphs.spinner);
     if (this.font.family && this.running) {
       this.stdout.write(fontChangeSequence(this.font.family));
     }
@@ -1550,7 +1554,8 @@ export class TuiRenderer {
 
     const headerRows = renderHeader(state, this.theme, contentWidth, compact);
     const headerH = headerRows.length + (compact ? 0 : 1);
-    const statusH = 1;
+    // status line + dedicated context usage bar at the very bottom
+    const statusH = 2;
     const dividerH = 1;
 
     const ghost =
@@ -1724,16 +1729,32 @@ export class TuiRenderer {
       state.phase !== "idle" &&
       state.phase !== "error" &&
       this.paintFps > 0;
+    const statusExtra = {
+      scroll: sp,
+      completeOpen: this.completeOpen && !this.picker && !this.modal,
+      pickerOpen: Boolean(this.picker || this.modal),
+      tokensPerSec,
+      framesPerSec: showFps ? this.paintFps : undefined,
+    };
+    // Status (spinner / phase / mode) just above the context bar
+    this.paintRow(
+      padX,
+      rows - 2,
+      renderStatus(
+        statusState,
+        this.theme,
+        contentWidth,
+        this.tick,
+        this.focus,
+        statusExtra,
+      ),
+      contentWidth,
+    );
+    // Bottom-most row: context usage meter (OpenCode-style fill bar)
     this.paintRow(
       padX,
       rows - 1,
-      renderStatus(statusState, this.theme, contentWidth, this.tick, this.focus, {
-        scroll: sp,
-        completeOpen: this.completeOpen && !this.picker && !this.modal,
-        pickerOpen: Boolean(this.picker || this.modal),
-        tokensPerSec,
-        framesPerSec: showFps ? this.paintFps : undefined,
-      }),
+      renderContextFooter(statusState, this.theme, contentWidth, statusExtra),
       contentWidth,
     );
 

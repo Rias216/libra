@@ -46,10 +46,43 @@ export interface Theme {
   selection: Rgb;
 }
 
+/**
+ * Build a theme. Explicit fields win; any omitted semantic slots are
+ * derived from the theme's own palette (toolOk → success, etc.) so
+ * partial definitions never leak libra-night violet/cyan into other
+ * palettes (context bar, status, glow, diffs).
+ */
 function t(
-  partial: Omit<Theme, keyof typeof defaults> & Partial<Theme> & { name: string; displayName: string },
+  partial: Partial<Theme> & { name: string; displayName: string },
 ): Theme {
-  return { ...defaults, ...partial };
+  const base = { ...defaults, ...partial };
+  const own = <K extends keyof Theme>(k: K): boolean =>
+    Object.prototype.hasOwnProperty.call(partial, k);
+
+  // Palette-native anchors (prefer explicit partial, else post-merge base)
+  const toolOk = own("toolOk") ? base.toolOk : own("tool") ? base.tool : base.toolOk;
+  const toolError = own("toolError") ? base.toolError : base.toolError;
+  const toolRunning = own("toolRunning") ? base.toolRunning : base.toolRunning;
+  const accent = base.accent;
+  const accentUser = base.accentUser;
+  const fgMuted = base.fgMuted;
+
+  return {
+    ...base,
+    toolOk,
+    toolError,
+    toolRunning,
+    accentSystem: own("accentSystem") ? base.accentSystem : fgMuted,
+    thinking: own("thinking") ? base.thinking : accent,
+    success: own("success") ? base.success : toolOk,
+    warn: own("warn") ? base.warn : toolRunning,
+    error: own("error") ? base.error : toolError,
+    info: own("info") ? base.info : accentUser,
+    spinner: own("spinner") ? base.spinner : accent,
+    diffAdd: own("diffAdd") ? base.diffAdd : toolOk,
+    diffDel: own("diffDel") ? base.diffDel : toolError,
+    diffMeta: own("diffMeta") ? base.diffMeta : fgMuted,
+  };
 }
 
 const defaults = {
@@ -161,14 +194,14 @@ const catppuccin = t({
   fgMuted: { r: 166, g: 173, b: 200 },
   fgFaint: { r: 108, g: 112, b: 134 },
   border: { r: 69, g: 71, b: 90 },
-  accent: { r: 203, g: 166, b: 247 },
-  accentUser: { r: 137, g: 180, b: 250 },
+  accent: { r: 203, g: 166, b: 247 }, // mauve
+  accentUser: { r: 137, g: 180, b: 250 }, // blue
   accentAssistant: { r: 203, g: 166, b: 247 },
-  tool: { r: 148, g: 226, b: 213 },
-  toolRunning: { r: 249, g: 226, b: 175 },
-  toolOk: { r: 166, g: 227, b: 161 },
-  toolError: { r: 243, g: 139, b: 168 },
-  thinking: { r: 180, g: 190, b: 254 },
+  tool: { r: 148, g: 226, b: 213 }, // teal
+  toolRunning: { r: 249, g: 226, b: 175 }, // yellow
+  toolOk: { r: 166, g: 227, b: 161 }, // green
+  toolError: { r: 243, g: 139, b: 168 }, // red
+  thinking: { r: 180, g: 190, b: 254 }, // lavender
   selection: { r: 69, g: 71, b: 90 },
 });
 
@@ -184,13 +217,13 @@ const rosePine = t({
   fgMuted: { r: 144, g: 140, b: 170 },
   fgFaint: { r: 110, g: 106, b: 134 },
   border: { r: 38, g: 35, b: 53 },
-  accent: { r: 196, g: 167, b: 231 },
-  accentUser: { r: 156, g: 207, b: 216 },
-  accentAssistant: { r: 246, g: 193, b: 119 },
+  accent: { r: 196, g: 167, b: 231 }, // iris
+  accentUser: { r: 156, g: 207, b: 216 }, // foam
+  accentAssistant: { r: 246, g: 193, b: 119 }, // gold
   tool: { r: 156, g: 207, b: 216 },
   toolRunning: { r: 246, g: 193, b: 119 },
-  toolOk: { r: 158, g: 206, b: 147 },
-  toolError: { r: 235, g: 111, b: 146 },
+  toolOk: { r: 158, g: 206, b: 147 }, // pine
+  toolError: { r: 235, g: 111, b: 146 }, // love
   thinking: { r: 196, g: 167, b: 231 },
   selection: { r: 38, g: 35, b: 53 },
 });
@@ -207,14 +240,14 @@ const nord = t({
   fgMuted: { r: 216, g: 222, b: 233 },
   fgFaint: { r: 129, g: 161, b: 193 },
   border: { r: 76, g: 86, b: 106 },
-  accent: { r: 136, g: 192, b: 208 },
-  accentUser: { r: 129, g: 161, b: 193 },
-  accentAssistant: { r: 143, g: 188, b: 187 },
-  tool: { r: 163, g: 190, b: 140 },
-  toolRunning: { r: 235, g: 203, b: 139 },
+  accent: { r: 136, g: 192, b: 208 }, // nord8
+  accentUser: { r: 129, g: 161, b: 193 }, // nord9
+  accentAssistant: { r: 143, g: 188, b: 187 }, // nord7
+  tool: { r: 163, g: 190, b: 140 }, // nord14
+  toolRunning: { r: 235, g: 203, b: 139 }, // nord13
   toolOk: { r: 163, g: 190, b: 140 },
-  toolError: { r: 191, g: 97, b: 106 },
-  thinking: { r: 180, g: 142, b: 173 },
+  toolError: { r: 191, g: 97, b: 106 }, // nord11
+  thinking: { r: 180, g: 142, b: 173 }, // nord15
   selection: { r: 67, g: 76, b: 94 },
 });
 
@@ -230,13 +263,13 @@ const dracula = t({
   fgMuted: { r: 189, g: 147, b: 249 },
   fgFaint: { r: 98, g: 114, b: 164 },
   border: { r: 68, g: 71, b: 90 },
-  accent: { r: 189, g: 147, b: 249 },
-  accentUser: { r: 139, g: 233, b: 253 },
-  accentAssistant: { r: 255, g: 121, b: 198 },
-  tool: { r: 80, g: 250, b: 123 },
-  toolRunning: { r: 241, g: 250, b: 140 },
+  accent: { r: 189, g: 147, b: 249 }, // purple
+  accentUser: { r: 139, g: 233, b: 253 }, // cyan
+  accentAssistant: { r: 255, g: 121, b: 198 }, // pink
+  tool: { r: 80, g: 250, b: 123 }, // green
+  toolRunning: { r: 241, g: 250, b: 140 }, // yellow
   toolOk: { r: 80, g: 250, b: 123 },
-  toolError: { r: 255, g: 85, b: 85 },
+  toolError: { r: 255, g: 85, b: 85 }, // red
   thinking: { r: 189, g: 147, b: 249 },
   selection: { r: 68, g: 71, b: 90 },
 });
@@ -253,13 +286,13 @@ const gruvbox = t({
   fgMuted: { r: 168, g: 153, b: 132 },
   fgFaint: { r: 146, g: 131, b: 116 },
   border: { r: 80, g: 73, b: 69 },
-  accent: { r: 254, g: 128, b: 25 },
-  accentUser: { r: 131, g: 165, b: 152 },
-  accentAssistant: { r: 211, g: 134, b: 155 },
-  tool: { r: 184, g: 187, b: 38 },
-  toolRunning: { r: 250, g: 189, b: 47 },
+  accent: { r: 254, g: 128, b: 25 }, // orange
+  accentUser: { r: 131, g: 165, b: 152 }, // aqua
+  accentAssistant: { r: 211, g: 134, b: 155 }, // purple
+  tool: { r: 184, g: 187, b: 38 }, // green
+  toolRunning: { r: 250, g: 189, b: 47 }, // yellow
   toolOk: { r: 184, g: 187, b: 38 },
-  toolError: { r: 251, g: 73, b: 52 },
+  toolError: { r: 251, g: 73, b: 52 }, // red
   thinking: { r: 211, g: 134, b: 155 },
   selection: { r: 80, g: 73, b: 69 },
 });
@@ -275,15 +308,16 @@ const solarized = t({
   fg: { r: 131, g: 148, b: 150 },
   fgMuted: { r: 147, g: 161, b: 161 },
   fgFaint: { r: 88, g: 110, b: 117 },
-  border: { r: 7, g: 54, b: 66 },
-  accent: { r: 38, g: 139, b: 210 },
-  accentUser: { r: 42, g: 161, b: 152 },
-  accentAssistant: { r: 108, g: 113, b: 196 },
-  tool: { r: 133, g: 153, b: 0 },
-  toolRunning: { r: 181, g: 137, b: 0 },
+  // base01 — distinct from bgElevated so borders/tracks stay visible
+  border: { r: 88, g: 110, b: 117 },
+  accent: { r: 38, g: 139, b: 210 }, // blue
+  accentUser: { r: 42, g: 161, b: 152 }, // cyan
+  accentAssistant: { r: 108, g: 113, b: 196 }, // violet
+  tool: { r: 133, g: 153, b: 0 }, // green
+  toolRunning: { r: 181, g: 137, b: 0 }, // yellow
   toolOk: { r: 133, g: 153, b: 0 },
-  toolError: { r: 220, g: 50, b: 47 },
-  thinking: { r: 211, g: 54, b: 130 },
+  toolError: { r: 220, g: 50, b: 47 }, // red
+  thinking: { r: 211, g: 54, b: 130 }, // magenta
   selection: { r: 7, g: 54, b: 66 },
 });
 
@@ -299,11 +333,11 @@ const monokai = t({
   fgMuted: { r: 117, g: 113, b: 94 },
   fgFaint: { r: 117, g: 113, b: 94 },
   border: { r: 73, g: 72, b: 62 },
-  accent: { r: 174, g: 129, b: 255 },
-  accentUser: { r: 102, g: 217, b: 239 },
-  accentAssistant: { r: 249, g: 38, b: 114 },
-  tool: { r: 166, g: 226, b: 46 },
-  toolRunning: { r: 230, g: 219, b: 116 },
+  accent: { r: 174, g: 129, b: 255 }, // purple
+  accentUser: { r: 102, g: 217, b: 239 }, // cyan
+  accentAssistant: { r: 249, g: 38, b: 114 }, // pink
+  tool: { r: 166, g: 226, b: 46 }, // green
+  toolRunning: { r: 230, g: 219, b: 116 }, // yellow
   toolOk: { r: 166, g: 226, b: 46 },
   toolError: { r: 249, g: 38, b: 114 },
   thinking: { r: 174, g: 129, b: 255 },
@@ -326,6 +360,10 @@ const oscura = t({
   accentUser: { r: 120, g: 200, b: 255 },
   accentAssistant: { r: 200, g: 140, b: 255 },
   tool: { r: 100, g: 230, b: 200 },
+  toolRunning: { r: 230, g: 180, b: 100 },
+  toolOk: { r: 120, g: 220, b: 150 },
+  toolError: { r: 240, g: 100, b: 130 },
+  thinking: { r: 180, g: 120, b: 255 },
   selection: { r: 40, g: 30, b: 70 },
 });
 
@@ -341,11 +379,11 @@ const oneDark = t({
   fgMuted: { r: 92, g: 99, b: 112 },
   fgFaint: { r: 92, g: 99, b: 112 },
   border: { r: 57, g: 63, b: 73 },
-  accent: { r: 198, g: 120, b: 221 },
-  accentUser: { r: 97, g: 175, b: 239 },
-  accentAssistant: { r: 224, g: 108, b: 117 },
-  tool: { r: 152, g: 195, b: 121 },
-  toolRunning: { r: 229, g: 192, b: 123 },
+  accent: { r: 198, g: 120, b: 221 }, // purple
+  accentUser: { r: 97, g: 175, b: 239 }, // blue
+  accentAssistant: { r: 224, g: 108, b: 117 }, // red
+  tool: { r: 152, g: 195, b: 121 }, // green
+  toolRunning: { r: 229, g: 192, b: 123 }, // yellow
   toolOk: { r: 152, g: 195, b: 121 },
   toolError: { r: 224, g: 108, b: 117 },
   thinking: { r: 198, g: 120, b: 221 },

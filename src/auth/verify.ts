@@ -73,6 +73,28 @@ export function validateKeyFormat(
     case "anthropic":
       if (k.startsWith("sk-ant-") || k.length >= 20) return { ok: true };
       return { ok: false, error: "expected sk-ant-... Anthropic key" };
+    case "opencode":
+    case "opencode-go":
+      // Console keys from opencode.ai/auth — no fixed prefix
+      if (k.length >= 16) return { ok: true };
+      return {
+        ok: false,
+        error: "expected OpenCode API key from opencode.ai/auth",
+      };
+    case "deepseek":
+      if (k.startsWith("sk-") || k.length >= 20) return { ok: true };
+      return { ok: false, error: "expected DeepSeek sk-... key" };
+    case "groq":
+      if (k.startsWith("gsk_") || k.length >= 20) return { ok: true };
+      return { ok: false, error: "expected Groq gsk_... key" };
+    case "together":
+    case "mistral":
+    case "fireworks":
+    case "cerebras":
+    case "moonshot":
+    case "deepinfra":
+      if (k.length >= 16) return { ok: true };
+      return { ok: false, error: `expected ${provider} API key` };
     case "custom":
       return { ok: true };
     default:
@@ -199,6 +221,16 @@ export async function verifyAuthModelsOffline(): Promise<VerifyResult[]> {
     codex: { good: "sk-abcdefghijklmnopqrstuvwxyz", bad: "x" },
     openrouter: { good: "sk-or-v1-abcdefghijklmnopqrstuv", bad: "or" },
     anthropic: { good: "sk-ant-api03-abcdefghijklmnopqrstuv", bad: "ant" },
+    opencode: { good: "oc_live_abcdefghijklmnopqrstuv", bad: "short" },
+    "opencode-go": { good: "oc_go_abcdefghijklmnopqrstuvwxyz", bad: "x" },
+    deepseek: { good: "sk-abcdefghijklmnopqrstuvwxyz01", bad: "ds" },
+    groq: { good: "gsk_abcdefghijklmnopqrstuvwxyz", bad: "gq" },
+    together: { good: "together-key-abcdefghijklmnop", bad: "tg" },
+    mistral: { good: "mistral-key-abcdefghijklmnop", bad: "ms" },
+    fireworks: { good: "fw_abcdefghijklmnopqrstuvwxyz", bad: "fw" },
+    cerebras: { good: "csk-abcdefghijklmnopqrstuvwxyz", bad: "cb" },
+    moonshot: { good: "sk-moonshot-abcdefghijklmnop", bad: "mk" },
+    deepinfra: { good: "deepinfra-key-abcdefghijklmn", bad: "di" },
     custom: { good: "any-long-enough-key-value", bad: "" },
   };
 

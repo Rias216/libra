@@ -57,6 +57,7 @@ export interface SubagentConfig {
   /**
    * Spawn nesting depth. Root=0; maxDepth=1 means root can spawn
    * children but children cannot spawn (Codex default).
+   * Ultra raises this to 2 so workers can spawn explorers.
    */
   maxDepth: number;
   /** Per-child wall-clock timeout in seconds (Codex job_max_runtime) */
@@ -66,6 +67,11 @@ export interface SubagentConfig {
    * spawn without an explicit user request.
    */
   autoSpawn: boolean;
+  /**
+   * Codex multi-agent v2: children get list_agents / message_agent / wait_agent
+   * so peers can coordinate (parent always has full spawn surface).
+   */
+  peerMessaging?: boolean;
   preferredModelKey?: string;
   roles: SubagentRole[];
 }
@@ -115,10 +121,21 @@ export interface AgentSettings {
 
 export const DEFAULT_SUBAGENT_ROLES: SubagentRole[] = [
   {
+    id: "reason",
+    name: "Reason",
+    description:
+      "Deep multi-angle reasoning (read-only). Extends parent thinking with plans, critiques, and risks.",
+    instructions:
+      "You are a deep-reasoning specialist. Do NOT implement. Think step-by-step from first principles about the assigned question. Cover goals, constraints, alternatives, risks, edge cases, and a concrete recommended plan. Prefer evidence from the codebase when tools allow. Return a structured reasoning brief (Findings | Plan | Risks | Open questions) — no code dumps.",
+    sandbox: "read-only",
+    reasoningEffort: "max",
+    enabled: true,
+  },
+  {
     id: "explore",
     name: "Explore",
     description:
-      "Read-only codebase explorer (Codex explorer). Gather evidence before changes.",
+      "Read-only codebase explorer. Gather evidence before changes.",
     instructions:
       "You are a read-only explore agent. Search the codebase, summarize findings with path:line refs, do not edit files.",
     sandbox: "read-only",
@@ -128,7 +145,7 @@ export const DEFAULT_SUBAGENT_ROLES: SubagentRole[] = [
     id: "implement",
     name: "Implement",
     description:
-      "Execution-focused worker (Codex worker). Small diffs + optional tests.",
+      "Execution-focused implementer. Small diffs + optional tests.",
     instructions:
       "You implement focused code changes. Prefer small diffs, run tests when possible. Summarize what changed for the parent.",
     sandbox: "workspace-write",
@@ -191,6 +208,7 @@ export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
     maxDepth: 1, // Codex agents.max_depth default
     jobMaxRuntimeSeconds: 600,
     autoSpawn: false,
+    peerMessaging: true, // children can talk when depth allows peer tools
     roles: DEFAULT_SUBAGENT_ROLES.map((r) => ({ ...r })),
   },
 };
@@ -290,6 +308,11 @@ export function saveAgentSettings(partial: {
   if (next.reasoning.custom === "ultra" || next.reasoning.custom === "ultra-fusion") {
     next.subagents.enabled = true;
     next.subagents.autoSpawn = true;
+    next.subagents.peerMessaging = true;
+    // Codex multi-agent v2: parent + one nested spawn level (worker → explorer)
+    next.subagents.maxDepth = Math.max(next.subagents.maxDepth ?? 1, 2);
+    // Room for forced Ultra reasoners (3) + parent-spawned workers
+    next.subagents.maxConcurrent = Math.max(next.subagents.maxConcurrent ?? 6, 8);
     // Prefer highest native effort; "max" is clamped per-model at request time
     if (
       next.reasoning.effort === "default" ||
@@ -299,6 +322,25 @@ export function saveAgentSettings(partial: {
       next.reasoning.effort === "minimal"
     ) {
       next.reasoning.effort = "max";
+    }
+    // Ensure reasoning-extension roles stay enabled under Ultra
+    next.subagents.roles = next.subagents.roles.map((r) => {
+      const id = r.id.trim().toLowerCase();
+      if (id === "reason" || id === "explore" || id === "explorer") {
+        return { ...r, enabled: true };
+      }
+      return r;
+    });
+    // If user config never listed reason, inject the default role
+    if (
+      !next.subagents.roles.some(
+        (r) => r.id.trim().toLowerCase() === "reason",
+      )
+    ) {
+      const reason = DEFAULT_SUBAGENT_ROLES.find((r) => r.id === "reason");
+      if (reason) {
+        next.subagents.roles = [{ ...reason }, ...next.subagents.roles];
+      }
     }
   }
   // Fusion: peer reasoners only in phase 1; hard-cap one additional agent
@@ -349,13 +391,13 @@ export const CUSTOM_REASONING_OPTIONS: {
     value: "ultra",
     label: "Ultra",
     description:
-      "Max effort + Codex-style multi-agent (spawn/wait) with proactive delegation",
+      "Max effort + forced reasoning subagents (reason×2 + explorer) then multi-agent execute",
   },
   {
     value: "ultra-fusion",
     label: "Ultra + Fusion",
     description:
-      "Peer reasons first; main compares, then executes with multi-agent tools",
+      "Peer reasons first; main compares, then multi-agent v2 execute (peer chat)",
   },
 ];
 

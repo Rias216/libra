@@ -1,17 +1,28 @@
 /**
  * Headless child agent loop — shared runHeadlessTurn (Codex/OpenCode shape).
  * Isolated context, no parent store pollution.
- * Children never receive multi-agent tools (max_depth / no recursion).
+ * Optional peer multi-agent tools (list/message/wait) for Codex v2.
  */
 
 import type { ProviderId } from "../../auth/types.js";
 import type { ChatMessage } from "../../llm/client.js";
 import type { PermissionRules } from "../../toolcalling/permissions.js";
 import type { ToolsetId } from "../../toolcalling/registry.js";
-import { runHeadlessTurn } from "../turn.js";
+import type { OpenAITool } from "../../toolcalling/schema.js";
+import { runHeadlessTurn, type TurnOptions } from "../turn.js";
 import type { ChildRunResult } from "./types.js";
 
 const MAX_CHILD_ROUNDS = 8;
+
+export interface ChildPeerHooks {
+  /** Extra multi-agent peer tools (list/message/wait) */
+  tools: OpenAITool[];
+  isCustomTool: (name: string) => boolean;
+  customDispatch: (
+    name: string,
+    args: Record<string, unknown>,
+  ) => Promise<{ ok: boolean; output: string }>;
+}
 
 export interface ChildLoopOptions {
   provider: ProviderId;
@@ -26,6 +37,12 @@ export interface ChildLoopOptions {
   label?: string;
   maxRounds?: number;
   lightReasoning?: boolean;
+  /** Applied to child chat as reasoning_effort (spawn/role override) */
+  reasoningEffort?: string;
+  /** Injected chat for tests */
+  chatImpl?: TurnOptions["chatImpl"];
+  /** Codex v2 peer messaging hooks */
+  peer?: ChildPeerHooks;
 }
 
 export async function runChildLoop(
@@ -52,8 +69,21 @@ export async function runChildLoop(
     label: opts.label ?? "subagent",
     maxSteps: opts.maxRounds ?? MAX_CHILD_ROUNDS,
     lightReasoning: opts.lightReasoning,
+    reasoningEffort: opts.reasoningEffort,
+    chatImpl: opts.chatImpl,
     headless: true,
     headlessMessages: messages,
+    extraTools: opts.peer?.tools,
+    isCustomTool: opts.peer?.isCustomTool,
+    customDispatch: opts.peer
+      ? async (call) => {
+          const r = await opts.peer!.customDispatch(call.name, call.args);
+          return {
+            ok: r.ok,
+            output: r.output,
+          };
+        }
+      : undefined,
   });
 
   return {
