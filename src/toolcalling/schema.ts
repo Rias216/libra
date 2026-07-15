@@ -269,14 +269,44 @@ export const OPENAI_TOOLS: OpenAITool[] = [
   {
     type: "function",
     function: {
-      name: "web_fetch",
+      name: "web_search",
       description: [
-        "Fetch a URL and return text content (may be truncated).",
+        "Search the public web and return ranked results (title, URL, snippet).",
         "",
         "Usage:",
-        "- Fully-formed URL required; http is upgraded to https when possible.",
-        "- Use for docs and web content the user needs analyzed.",
+        "- Prefer this before guessing URLs. Then web_fetch the best links.",
+        "- Good for docs, APIs, news, facts, package pages.",
         "- Read-only; does not modify the workspace.",
+        "- Pass a focused query (keywords + intent), not a full essay.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description:
+              "Search query string (alias names pattern/q/search also accepted at runtime)",
+          },
+          max_results: {
+            type: "integer",
+            description: "Max results to return (default 8, max 12)",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_fetch",
+      description: [
+        "Fetch a URL and return readable text content (HTML stripped; may be truncated).",
+        "",
+        "Usage:",
+        "- Fully-formed URL required; bare domains and http are upgraded to https.",
+        "- Use after web_search when you need full page text.",
+        "- Read-only; does not modify the workspace. Binary/PDF not supported.",
       ].join("\n"),
       parameters: {
         type: "object",
@@ -296,7 +326,8 @@ export const OPENAI_TOOLS: OpenAITool[] = [
         "",
         "Usage:",
         "- Use for complex tasks with 3+ steps.",
-        "- Pass items:[{id,content,status}] to replace the list.",
+        "- Pass items:[{id,content,status}] (or todos) to replace the list.",
+        "- id is optional (auto-assigned). status: pending|in_progress|completed|cancelled.",
         "- Set merge=true to update items by id without wiping others.",
       ].join("\n"),
       parameters: {
@@ -314,7 +345,19 @@ export const OPENAI_TOOLS: OpenAITool[] = [
                   enum: ["pending", "in_progress", "completed", "cancelled"],
                 },
               },
-              required: ["id", "content", "status"],
+              required: ["content"],
+            },
+          },
+          todos: {
+            type: "array",
+            description: "Alias for items (same shape)",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                content: { type: "string" },
+                status: { type: "string" },
+              },
             },
           },
           merge: {
@@ -322,7 +365,8 @@ export const OPENAI_TOOLS: OpenAITool[] = [
             description: "Merge by id instead of replacing the whole list",
           },
         },
-        required: ["items"],
+        // Prefer items; todos accepted at runtime if items omitted
+        required: [],
       },
     },
   },

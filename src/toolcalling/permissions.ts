@@ -80,6 +80,7 @@ export const DEFAULT_PERMISSIONS: PermissionRules = {
   grep: "allow",
   glob: "allow",
   web_fetch: "allow",
+  web_search: "allow",
   calc: "allow",
   todo_write: "allow",
   process: "allow",

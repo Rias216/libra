@@ -18,6 +18,9 @@
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
+    "test": "tsx test/harness.test.ts && tsx test/web-tools.test.ts",
+    "test:web": "tsx test/web-tools.test.ts",
+    "test:harness": "tsx test/harness.test.ts",
     "demo": "tsx src/cli.ts",
     "link": "npm run build && npm link",
     "unlink": "npm unlink -g libra"

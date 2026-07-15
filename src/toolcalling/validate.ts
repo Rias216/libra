@@ -161,13 +161,45 @@ function extraInvariants(
   }
 
   if (name === "web_fetch") {
-    const url = String(args.url ?? "");
-    if (url && !/^https?:\/\//i.test(url)) {
+    const url = String(args.url ?? "").trim();
+    if (!url) {
       issues.push({
         path: "url",
-        message: "url must start with http:// or https://",
-        hint: "Provide a fully-formed URL.",
+        message: "url is required",
+        hint: "Provide a fully-formed https URL or bare domain.",
       });
+    } else if (
+      !/^https?:\/\//i.test(url) &&
+      !/^[\w.-]+\.[a-z]{2,}([/:].*)?$/i.test(url)
+    ) {
+      issues.push({
+        path: "url",
+        message: "url must be http(s) or a bare domain",
+        hint: "Example: https://example.com/docs or example.com",
+      });
+    }
+  }
+
+  if (name === "web_search") {
+    const q = String(
+      args.query ??
+        args.q ??
+        args.search ??
+        args.pattern ??
+        args.keywords ??
+        args.keyword ??
+        "",
+    ).trim();
+    if (!q) {
+      issues.push({
+        path: "query",
+        message: "query is required",
+        hint: 'Example: {"query":"Node.js fetch API documentation"}',
+      });
+    } else if (args.pattern != null && args.query == null) {
+      // Coerce common mis-name so execution can proceed after soft normalize
+      args.query = q;
+      delete args.pattern;
     }
   }
 

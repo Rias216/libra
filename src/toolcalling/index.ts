@@ -18,3 +18,5 @@ export * from "./discipline.js";
 export * from "./latency.js";
 export * from "./slim-schema.js";
 export * from "./compat.js";
+export * from "./shell-win.js";
+export * from "./web.js";

@@ -15,6 +15,7 @@ import {
   attachInTurnReasoning,
   buildAssistantToolRoundMessage,
   chatComplete,
+  ensureToolCallPairing,
   hasBrokenToolCallArgs,
   isLengthFinish,
   lengthContinuationNudge,
@@ -315,6 +316,10 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
 
       // Before each sample — soft digest; full rollover if still over budget
       maybeCompact(`step_${step}`);
+
+      // Codex: every tool_call_id must have exactly one tool result on the wire
+      // before the next sample (synthetic "aborted" for gaps; drop orphans).
+      ensureToolCallPairing(messages);
 
       const isLast = step >= maxSteps;
       // Tools off only on last step OR when tools disabled for the whole turn

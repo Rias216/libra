@@ -16,6 +16,7 @@ import {
   selectPromptPackId,
   type PromptPackId,
 } from "./prompts/packs.js";
+import { shellEnvHint } from "../toolcalling/shell-win.js";
 
 export type PromptProfile = "full" | "slim";
 
@@ -95,6 +96,7 @@ function buildEnvBlock(
     `  Working directory: ${cwd}`,
     `  Is directory a git repo: ${isGit ? "yes" : "no"}`,
     `  Platform: ${process.platform}`,
+    shellEnvHint(),
     `  Today's date: ${new Date().toDateString()}`,
     `</env>`,
   ]

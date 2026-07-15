@@ -225,7 +225,13 @@ function ensureToolId(id: string | undefined, index: number): string {
   return `call_${Date.now().toString(36)}_${index}_${toolIdSeq}`;
 }
 
-/** Normalize provider tool_calls (fill missing ids, repair args, resolve aliases). */
+/**
+ * Normalize provider tool_calls for the agent loop: fill missing ids + resolve
+ * name aliases. **Does not repair arguments** — truncated / invalid JSON must
+ * stay invalid so `hasBrokenToolCallArgs` can refuse execution and re-prompt.
+ * Argument repair belongs at dispatch time (`parseToolArgs` / runner), only
+ * after the broken-args gate has passed.
+ */
 export function normalizeToolCalls(
   raw: Array<Partial<ToolCall> & { function?: { name?: string; arguments?: string } }> | undefined,
 ): ToolCall[] {
@@ -235,16 +241,73 @@ export function normalizeToolCalls(
       const rawName = tc.function?.name ?? "";
       if (!rawName) return null;
       const name = resolveToolName(rawName);
+      // Preserve raw arguments (including empty / truncated). Do not coerce
+      // empty → "{}" here — empty is incomplete and must trip broken-args.
+      const args =
+        tc.function?.arguments != null ? String(tc.function.arguments) : "";
       return {
         id: ensureToolId(tc.id, i),
         type: "function" as const,
         function: {
           name,
-          arguments: repairToolArgumentsJson(tc.function?.arguments),
+          arguments: args,
         },
       };
     })
     .filter((x): x is ToolCall => x != null);
+}
+
+/**
+ * Codex history normalize spirit: every assistant tool_call_id gets exactly
+ * one following tool-role message; orphan tool rows are dropped.
+ * Mutates and returns the same array for in-place use on the live wire.
+ */
+export function ensureToolCallPairing(messages: ChatMessage[]): ChatMessage[] {
+  if (!messages.length) return messages;
+
+  const paired = new Set<string>();
+  for (const m of messages) {
+    if (m.role === "tool" && m.tool_call_id) paired.add(m.tool_call_id);
+  }
+
+  const out: ChatMessage[] = [];
+  for (const m of messages) {
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      out.push(m);
+      for (const tc of m.tool_calls) {
+        if (!tc.id) continue;
+        if (paired.has(tc.id)) continue;
+        // Missing result (abort mid-turn, compacted cut, crash) — synthetic
+        // aborted so the next sample does not 400 on unpaired tool_calls.
+        out.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: "aborted",
+        });
+        paired.add(tc.id);
+      }
+      continue;
+    }
+    if (m.role === "tool") {
+      // Drop orphans (tool result with no matching call in transcript)
+      if (!m.tool_call_id) continue;
+      // Keep only if some assistant tool_calls referenced this id
+      const hasCall = messages.some(
+        (x) =>
+          x.role === "assistant" &&
+          x.tool_calls?.some((tc) => tc.id === m.tool_call_id),
+      );
+      if (!hasCall) continue;
+      out.push(m);
+      continue;
+    }
+    out.push(m);
+  }
+
+  // Replace contents of the original array (callers hold a reference)
+  messages.length = 0;
+  messages.push(...out);
+  return messages;
 }
 
 /**

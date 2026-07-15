@@ -8,6 +8,16 @@ import { OPENAI_TOOLS } from "./schema.js";
 import { CATALOG_TOOLS } from "./catalog.js";
 import { slimToolSchemas } from "./slim-schema.js";
 
+/** All known OpenAI tool schemas (agent + catalog). */
+const ALL_SCHEMAS: OpenAITool[] = (() => {
+  const by = new Map<string, OpenAITool>();
+  for (const t of OPENAI_TOOLS) by.set(t.function.name, t);
+  for (const t of CATALOG_TOOLS) {
+    if (!by.has(t.function.name)) by.set(t.function.name, t);
+  }
+  return [...by.values()];
+})();
+
 /** Logical groups — enable/disable like Hermes toolsets. */
 export type ToolsetId =
   | "fs"
@@ -132,7 +142,8 @@ const ENTRIES: RegistryEntry[] = [
   },
   {
     name: "calc",
-    toolset: "catalog",
+    // Exposed by default with meta tools (not only Fusion catalog evals)
+    toolset: "meta",
     risk: "meta",
     description: "Evaluate math expression",
   },
@@ -150,14 +161,17 @@ for (const e of ENTRIES) {
   for (const a of e.aliases ?? []) BY_NAME.set(a, e);
 }
 
-// Attach schemas
-for (const t of OPENAI_TOOLS) {
+// Attach schemas only on the primary entry name so catalog aliases
+// (write_file → write) do not overwrite the Libra-canonical schema.
+for (const t of ALL_SCHEMAS) {
   const e = BY_NAME.get(t.function.name);
-  if (e) e.schema = t;
-}
-for (const t of CATALOG_TOOLS) {
-  const e = BY_NAME.get(t.function.name);
-  if (e && !e.schema) e.schema = t;
+  if (!e) continue;
+  if (e.name === t.function.name) {
+    e.schema = t;
+  } else if (!e.schema) {
+    // Alias-only catalog schema: keep as fallback if primary missing
+    e.schema = t;
+  }
 }
 
 export const ALL_TOOLSETS: ToolsetId[] = [
@@ -170,7 +184,7 @@ export const ALL_TOOLSETS: ToolsetId[] = [
   "catalog",
 ];
 
-/** Default interactive agent toolsets (no catalog finish/calc unless asked). */
+/** Default interactive agent toolsets (no catalog finish unless asked). */
 export const DEFAULT_AGENT_TOOLSETS: ToolsetId[] = [
   "fs",
   "search",
@@ -246,17 +260,34 @@ export class ToolRegistry {
   schemas(opts?: { slim?: boolean }): OpenAITool[] {
     const out: OpenAITool[] = [];
     const seen = new Set<string>();
-    for (const t of OPENAI_TOOLS) {
-      if (!this.isEnabled(t.function.name)) continue;
+    const mark = (name: string) => {
+      seen.add(name);
+      const e = BY_NAME.get(name);
+      if (e) {
+        seen.add(e.name);
+        for (const a of e.aliases ?? []) seen.add(a);
+      }
+    };
+    // Prefer primary entry schemas (canonical names: write, not write_file)
+    for (const e of ENTRIES) {
+      if (!this.isEnabled(e.name) || !e.schema) continue;
+      if (seen.has(e.name)) continue;
+      out.push(e.schema);
+      mark(e.name);
+    }
+    for (const t of ALL_SCHEMAS) {
+      if (seen.has(t.function.name) || !this.isEnabled(t.function.name)) {
+        continue;
+      }
       out.push(t);
-      seen.add(t.function.name);
+      mark(t.function.name);
     }
     for (const t of this.extraSchemas) {
       if (seen.has(t.function.name) || !this.isEnabled(t.function.name)) {
         continue;
       }
       out.push(t);
-      seen.add(t.function.name);
+      mark(t.function.name);
     }
     return opts?.slim ? slimToolSchemas(out) : out;
   }

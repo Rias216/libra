@@ -57,6 +57,12 @@ export interface AgentLoopOptions {
    * Multi-agent (Codex v1). Default: follow settings.subagents.enabled.
    */
   subagents?: boolean;
+  /** Override parent max sampling steps (default MAX_STEPS). */
+  maxSteps?: number;
+  /** full | slim system prompt pack. */
+  promptProfile?: "full" | "slim";
+  /** Short tool descriptions to save tokens. */
+  slimTools?: boolean;
   /**
    * Test injection: replace chatComplete.
    */
@@ -127,6 +133,9 @@ export class AgentLoop {
         autoApprove: opts.autoApprove,
         toolsets: opts.toolsets,
         subagents: opts.subagents,
+        maxSteps: opts.maxSteps,
+        promptProfile: opts.promptProfile,
+        slimTools: opts.slimTools,
         chatImpl: opts.chatImpl,
       };
 

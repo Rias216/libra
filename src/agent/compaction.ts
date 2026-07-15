@@ -53,6 +53,38 @@ export function shouldAutoCompact(
 }
 
 /**
+ * Snap a "keep last N" cut so we never bisect an assistant tool_calls
+ * message and its following tool-role results (Codex pairing invariant).
+ * Returns the index of the first message in the "recent / keep intact" region.
+ */
+export function alignKeepRecentStart(
+  messages: ChatMessage[],
+  keepRecent: number,
+  bodyStart = 0,
+): number {
+  const keep = Math.max(1, keepRecent);
+  let cut = Math.max(bodyStart, messages.length - keep);
+  // Walk back across any tool-role rows so the cut never starts mid-results.
+  while (cut > bodyStart && messages[cut]?.role === "tool") {
+    cut--;
+  }
+  // If we landed on the assistant that owns those tools, cut is correct
+  // (assistant + following tools stay together in recent).
+  // If the previous message is still a tool (shouldn't after loop), keep walking.
+  while (cut > bodyStart && messages[cut - 1]?.role === "tool") {
+    cut--;
+  }
+  if (
+    cut > bodyStart &&
+    messages[cut]?.role === "tool" &&
+    messages[cut - 1]?.role === "assistant"
+  ) {
+    cut--;
+  }
+  return cut;
+}
+
+/**
  * In-place soft compact of a live messages array (system first).
  * Digests old tool results / long assistant text without breaking
  * tool_call pairing. Returns true if anything changed.
@@ -71,7 +103,7 @@ export function softCompactMessages(
   // Keep system (index 0 if present) + last `keep` messages fully
   const hasSystem = messages[0]?.role === "system";
   const start = hasSystem ? 1 : 0;
-  const cutEnd = Math.max(start, messages.length - keep);
+  const cutEnd = alignKeepRecentStart(messages, keep, start);
   let changed = false;
 
   for (let i = start; i < cutEnd; i++) {
@@ -177,8 +209,12 @@ export function buildCompactedSession(
     Math.max(4, keepN),
     Math.max(1, body.length),
   );
-  const recent = body.slice(-keepRecent);
-  const older = body.slice(0, Math.max(0, body.length - keepRecent));
+  // Pairing-safe cut: never start `recent` mid tool-result block
+  const full = hasSystem ? copy : body;
+  const bodyStart = hasSystem ? 1 : 0;
+  const cut = alignKeepRecentStart(full, keepRecent, bodyStart);
+  const recent = full.slice(cut);
+  const older = full.slice(bodyStart, cut);
 
   let wire: ChatMessage[];
   if (

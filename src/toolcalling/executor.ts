@@ -27,7 +27,17 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { normalizeToolArgs } from "./normalize.js";
 import { processAction, startBackground } from "./process.js";
+import {
+  prepareShellCommand,
+  resolveShellHost,
+} from "./shell-win.js";
 import { formatShellOutputForModel } from "./truncate.js";
+import {
+  formatWebFetchForModel,
+  formatWebSearchForModel,
+  webFetchUrl,
+  webSearch,
+} from "./web.js";
 
 const MAX_RESULT = 24_000;
 /** OpenCode default — avoid blowing context */
@@ -235,7 +245,29 @@ export class ToolExecutor {
       case "finish":
         return `finished: ${String(data.answer ?? "").slice(0, 200)}`;
       case "web_fetch":
-        return `HTTP ${data.status}\n${data.content ?? ""}`;
+        return formatWebFetchForModel({
+          ok: data.ok !== false,
+          status: Number(data.status ?? 0),
+          url: String(data.url ?? ""),
+          finalUrl:
+            data.finalUrl != null ? String(data.finalUrl) : undefined,
+          contentType:
+            data.contentType != null ? String(data.contentType) : undefined,
+          title: data.title != null ? String(data.title) : undefined,
+          content: String(data.content ?? ""),
+          truncated: Boolean(data.truncated),
+          error: data.error != null ? String(data.error) : undefined,
+        });
+      case "web_search":
+        return formatWebSearchForModel({
+          ok: data.ok !== false,
+          query: String(data.query ?? ""),
+          results: (Array.isArray(data.results)
+            ? data.results
+            : []) as never,
+          provider: String(data.provider ?? ""),
+          error: data.error != null ? String(data.error) : undefined,
+        });
       default:
         return JSON.stringify(data);
     }
@@ -304,6 +336,19 @@ export class ToolExecutor {
         });
       case "web_fetch":
         return this.webFetch(str(args.url));
+      case "web_search":
+        return this.webSearch(
+          str(
+            args.query ??
+              args.q ??
+              args.search ??
+              // Models often confuse web_search with grep and pass `pattern`
+              args.pattern ??
+              args.keywords ??
+              args.keyword,
+          ),
+          num(args.max_results ?? args.maxResults, 8) ?? 8,
+        );
       case "calc":
         return this.calc(str(args.expression));
       case "todo_write":
@@ -599,23 +644,25 @@ export class ToolExecutor {
       }
     }
 
-    const shellOpt = resolveShellOption();
+    const { host, shellOption: shellOpt } = resolveShellHost();
+    // Rewrite bash-isms / npm.ps1 pitfalls before spawn (Windows coding agents).
+    const prepared = prepareShellCommand(command, host);
 
     if (background) {
-      const session = startBackground(command, this.cwd, shellOpt);
+      const session = startBackground(prepared, this.cwd, shellOpt);
       return Promise.resolve({
         ok: true,
         background: true,
         session_id: session.id,
         pid: session.pid,
-        description: description ?? command.slice(0, 80),
+        description: description ?? prepared.slice(0, 80),
         hint: 'Use process(action="poll"|"log"|"wait"|"kill", session_id=...) to manage.',
       });
     }
 
     return new Promise((resolveP) => {
       const t0 = Date.now();
-      const child = spawn(command, {
+      const child = spawn(prepared, {
         cwd: this.cwd,
         shell: shellOpt,
         windowsHide: true,
@@ -719,27 +766,47 @@ export class ToolExecutor {
   }
 
   private async webFetch(url: string): Promise<Record<string, unknown>> {
-    if (!/^https?:\/\//i.test(url)) throw new Error("url must be http(s)");
-    // Prefer AbortSignal.any when available (Node 20.3+); else timeout only
-    let signal: AbortSignal;
-    const timeout = AbortSignal.timeout(20_000);
-    if (this.opts.signal && typeof AbortSignal.any === "function") {
-      signal = AbortSignal.any([this.opts.signal, timeout]);
-    } else if (this.opts.signal?.aborted) {
-      throw Object.assign(new Error("cancelled"), { code: "cancelled" });
-    } else {
-      signal = timeout;
-    }
-    const res = await fetch(url, {
-      signal,
-      headers: { "User-Agent": "libra-harness/0.1" },
-      redirect: "follow",
+    const r = await webFetchUrl(url, {
+      signal: this.opts.signal,
+      maxChars: MAX_RESULT,
     });
-    const text = await res.text();
+    if (!r.ok && !r.content) {
+      throw Object.assign(new Error(r.error ?? "web_fetch failed"), {
+        code: r.status === 0 ? "network" : "http_error",
+      });
+    }
     return {
-      ok: res.ok,
-      status: res.status,
-      content: truncate(text.replace(/<[^>]+>/g, " "), MAX_RESULT),
+      ok: r.ok,
+      status: r.status,
+      url: r.url,
+      finalUrl: r.finalUrl,
+      contentType: r.contentType,
+      title: r.title,
+      content: r.content,
+      truncated: r.truncated,
+      error: r.error,
+    };
+  }
+
+  private async webSearch(
+    query: string,
+    maxResults: number,
+  ): Promise<Record<string, unknown>> {
+    const r = await webSearch(query, {
+      maxResults: Math.min(12, Math.max(1, maxResults || 8)),
+      signal: this.opts.signal,
+    });
+    if (!r.ok && r.results.length === 0) {
+      throw Object.assign(new Error(r.error ?? "web_search failed"), {
+        code: "network",
+      });
+    }
+    return {
+      ok: r.ok,
+      query: r.query,
+      provider: r.provider,
+      results: r.results,
+      count: r.results.length,
     };
   }
 
@@ -755,16 +822,23 @@ export class ToolExecutor {
     if (items == null && merge) {
       return { ok: true, items: this.todos };
     }
-    if (!Array.isArray(items)) {
-      throw new Error("items must be an array");
+    const list = coerceTodoItems(items);
+    if (!list) {
+      throw new Error(
+        'todo_write requires items (or todos) as an array of {id?, content, status}. ' +
+          'Example: items:[{id:"1",content:"Implement",status:"in_progress"}]',
+      );
     }
-    const mapped = items.map((it) => {
+    const mapped = list.map((it, i) => {
       const o = it as Record<string, unknown>;
-      return {
-        id: String(o.id ?? ""),
-        content: String(o.content ?? ""),
-        status: String(o.status ?? "pending"),
-      };
+      const content = String(
+        o.content ?? o.title ?? o.task ?? o.text ?? "",
+      );
+      const status = String(
+        o.status ?? o.state ?? "pending",
+      );
+      const id = String(o.id ?? o.key ?? `t${i + 1}`);
+      return { id, content, status };
     });
     if (merge) {
       const byId = new Map(this.todos.map((t) => [t.id, t]));
@@ -779,6 +853,27 @@ export class ToolExecutor {
     }
     return { ok: true, items: this.todos };
   }
+}
+
+/** Accept array, JSON string, or { items: [...] } shapes models emit. */
+export function coerceTodoItems(raw: unknown): unknown[] | null {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) return null;
+    try {
+      return coerceTodoItems(JSON.parse(s));
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    if (Array.isArray(o.items)) return o.items;
+    if (Array.isArray(o.todos)) return o.todos;
+  }
+  return null;
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -891,7 +986,12 @@ function formatShellOutput(data: Record<string, unknown>): string {
     data.ok === false && data.error && !body.includes(String(data.error))
       ? String(data.error)
       : "";
-  const output = [errExtra, body || "(no output)"].filter(Boolean).join("\n");
+  let output = [errExtra, body || "(no output)"].filter(Boolean).join("\n");
+  // Recovery hints for common agent shell failures (Windows + package managers)
+  if (data.ok === false) {
+    const hint = shellFailureHint(output);
+    if (hint) output = `${output}\n\n[libra:shell-hint] ${hint}`;
+  }
   // Codex-style framing for the model
   return formatShellOutputForModel({
     exitCode,
@@ -901,13 +1001,48 @@ function formatShellOutput(data: Record<string, unknown>): string {
   });
 }
 
-function resolveShellOption(): string | true | boolean {
-  const override = process.env.LIBRA_SHELL?.trim();
-  if (override) return override;
-  if (process.platform === "win32") {
-    return "powershell.exe";
+/** Actionable recovery lines appended to failed shell results. */
+export function shellFailureHint(combinedOutput: string): string | null {
+  const o = combinedOutput;
+  if (/not a valid statement separator|token '&&'/i.test(o)) {
+    return (
+      "This host rejects bash-style &&. Prefer a single command, or rely on " +
+      "the harness cmd.exe default which supports &&. Do not spend steps probing shells."
+    );
   }
-  return true;
+  if (/npm\.ps1|running scripts is disabled|ExecutionPolicy/i.test(o)) {
+    return (
+      "npm.ps1 is blocked by ExecutionPolicy. Use npm.cmd / npx.cmd (harness rewrites " +
+      "these automatically on Windows). Retry once with the package manager only."
+    );
+  }
+  if (/'tail' is not recognized|'head' is not recognized/i.test(o)) {
+    return (
+      "head/tail are not available on Windows cmd. Do not pipe through them — " +
+      "the harness strips these pipes when possible. Re-run the left-hand command alone."
+    );
+  }
+  if (/ENOENT|not recognized as an internal or external command/i.test(o)) {
+    return (
+      "Command not found. Check spelling; for package scripts use npm.cmd run <script> " +
+      "after npm.cmd install."
+    );
+  }
+  if (/Cannot find module|ERR_MODULE_NOT_FOUND/i.test(o)) {
+    return (
+      "Missing dependency or wrong entry. Run npm.cmd install, check package.json " +
+      "type/module, and prefer node --import tsx for TS tests."
+    );
+  }
+  if (/\bEADDRINUSE\b|address already in use/i.test(o)) {
+    return "Port in use. Bind to port 0 in tests and close the server in after() hooks.";
+  }
+  return null;
+}
+
+/** @deprecated use resolveShellHost().shellOption — kept for any external callers. */
+function resolveShellOption(): string | true | boolean {
+  return resolveShellHost().shellOption;
 }
 
 function classifyError(msg: string): string {

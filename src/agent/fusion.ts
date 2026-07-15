@@ -20,9 +20,18 @@ import { rankModelsByNativeReasoning } from "./reasoning.js";
 import {
   chatComplete,
   mergeReasoningText,
+  type ChatMessage,
+  type ChatRequest,
   type ChatResult,
+  type StreamHandlers,
 } from "../llm/client.js";
 import { dbg, span } from "./debug.js";
+
+/** Injected chat for fusion phase-1 tests (mirrors turn/loop chatImpl). */
+export type FusionChatImpl = (
+  req: ChatRequest,
+  handlers?: StreamHandlers,
+) => Promise<ChatResult>;
 
 export interface FusionCandidate {
   modelKey: string;
@@ -97,6 +106,20 @@ export async function resolveSecondaryReasoners(
   return [];
 }
 
+export interface PrepareFusionOptions {
+  signal?: AbortSignal;
+  /**
+   * Injected chat for tests — both main and peer reasoners use this when set.
+   * Production leaves undefined → chatComplete.
+   */
+  chatImpl?: FusionChatImpl;
+  /**
+   * Skip resolveSecondaryReasoners / catalog fetch. When set, used as the
+   * peer model key list (e.g. ["xai/grok-4"] or ["openrouter/test-peer"]).
+   */
+  secondaryKeys?: string[];
+}
+
 /**
  * Phase 1: main + peer reason in parallel (no tools, no store UI dump).
  * Returns systemAddon for execute + a single reasoning block body that
@@ -107,15 +130,23 @@ export async function prepareFusionForMain(
   userPrompt: string,
   mainProvider: ProviderId,
   mainModel: string,
-  signal?: AbortSignal,
+  signalOrOpts?: AbortSignal | PrepareFusionOptions,
 ): Promise<FusionPrepResult> {
+  const opts: PrepareFusionOptions =
+    signalOrOpts instanceof AbortSignal || signalOrOpts == null
+      ? { signal: signalOrOpts ?? undefined }
+      : signalOrOpts;
+  const signal = opts.signal;
+
   if (signal?.aborted) {
     throw new DOMException("Aborted", "AbortError");
   }
   const settings = loadAgentSettings();
   const fusion = settings.reasoning.fusion;
   const mainKey = modelKey({ provider: mainProvider, model: mainModel });
-  const secondaryKeys = await resolveSecondaryReasoners(fusion, mainKey);
+  const secondaryKeys =
+    opts.secondaryKeys ??
+    (await resolveSecondaryReasoners(fusion, mainKey));
 
   if (secondaryKeys.length === 0) {
     throw new Error(
@@ -136,9 +167,9 @@ export async function prepareFusionForMain(
 
   // Parallel: main + peer reason (no tools)
   const [mainReasoning, ...secondaries] = await Promise.all([
-    runOneReasoning(mainKey, userPrompt, fusion, "fusion.main", signal),
+    runOneReasoning(mainKey, userPrompt, fusion, "fusion.main", signal, opts.chatImpl),
     ...secondaryKeys.map((key) =>
-      runOneReasoning(key, userPrompt, fusion, "fusion.peer", signal),
+      runOneReasoning(key, userPrompt, fusion, "fusion.peer", signal, opts.chatImpl),
     ),
   ]);
 
@@ -312,6 +343,7 @@ async function runOneReasoning(
   fusion: FusionConfig,
   label: string,
   signal?: AbortSignal,
+  chatImpl?: FusionChatImpl,
 ): Promise<FusionCandidate> {
   const ref = parseModelKey(key);
   const started = Date.now();
@@ -351,6 +383,7 @@ async function runOneReasoning(
         user: userPrompt,
         label: attempt ? `${label}.retry` : label,
         signal,
+        chatImpl,
       });
       const ms = Date.now() - started;
       dbg("fusion", `${label}.ok`, {
@@ -416,17 +449,20 @@ async function completeReasoningOnly(opts: {
   user: string;
   label: string;
   signal?: AbortSignal;
+  chatImpl?: FusionChatImpl;
 }): Promise<ReasoningOnlyResult> {
   // No internal reasoning caps — depth comes only from the model's API
   // effort setting (buildReasoningApiFields / per-model effort).
-  const result = await chatComplete(
+  const chat = opts.chatImpl ?? chatComplete;
+  const messages: ChatMessage[] = [
+    { role: "system", content: opts.system },
+    { role: "user", content: opts.user },
+  ];
+  const result = await chat(
     {
       provider: opts.provider,
       model: opts.model,
-      messages: [
-        { role: "system", content: opts.system },
-        { role: "user", content: opts.user },
-      ],
+      messages,
       tools: undefined,
       tool_choice: "none",
       temperature: 0.2,
