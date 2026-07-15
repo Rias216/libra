@@ -75,6 +75,24 @@ import { prepareFusionForMain } from "./agent/fusion.js";
 import { buildSystemPrompt } from "./agent/loop.js";
 import { initDebug, dbg } from "./agent/debug.js";
 
+/**
+ * Guards handleUserSubmit against re-entrancy. AgentLoop.busy only kicks
+ * in once live.handle() is actually called — but the ultra-fusion path
+ * spends real time (two model calls, possibly with rate-limit retries)
+ * *before* live.handle() is reached. Without this flag, pressing Enter
+ * again during that window starts a second, fully concurrent fusion
+ * prep + execute, wasting API calls and racing writes to the store.
+ */
+let submissionInFlight = false;
+
+/**
+ * AbortController for whatever Ultra + Fusion phase-1 prep is currently
+ * in flight (if any). Phase 1 runs outside AgentLoop, so AgentLoop.cancel()
+ * alone can't stop it — the existing cancel affordances (quit, /clear,
+ * /new) need a way to reach it too.
+ */
+let fusionPrepAbort: AbortController | null = null;
+
 async function main(): Promise<void> {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
     const { createRequire } = await import("node:module");
@@ -152,6 +170,7 @@ After install:  npm run link   (from the libra repo)
     onQuit: () => {
       mockAgent.cancel();
       liveAgent.cancel();
+      fusionPrepAbort?.abort();
     },
     // OpenCode-style: click reasoning / tool headers to expand or collapse
     onTogglePart: (messageId, partId) => {
@@ -497,6 +516,7 @@ function handleCommand(
     case "new":
       agent.cancel();
       liveAgent?.cancel();
+      fusionPrepAbort?.abort();
       store.reset({
         title: "demo session",
         model: store.state.session.model,
@@ -1411,83 +1431,101 @@ async function handleUserSubmit(
   mock: MockAgent,
   live: AgentLoop,
 ): Promise<void> {
-  const provider = store.state.session.provider as ProviderId;
-  const model = store.state.session.model;
-  const hasAuth =
-    Boolean(getProvider(provider) && resolveToken(provider)) &&
-    model &&
-    model !== "unset" &&
-    model !== "libra-mock" &&
-    model !== "libra-demo";
+  if (submissionInFlight) {
+    notify(
+      store,
+      "still working on the previous message — hold on…",
+      "warn",
+    );
+    return;
+  }
+  submissionInFlight = true;
+  try {
+    const provider = store.state.session.provider as ProviderId;
+    const model = store.state.session.model;
+    const hasAuth =
+      Boolean(getProvider(provider) && resolveToken(provider)) &&
+      model &&
+      model !== "unset" &&
+      model !== "libra-mock" &&
+      model !== "libra-demo";
 
-  const mode = loadAgentSettings().reasoning.custom;
+    const mode = loadAgentSettings().reasoning.custom;
 
-  // Ultra + Fusion: secondaries reason only → main reviews & executes with tools
-  if (mode === "ultra-fusion") {
-    if (!hasAuth) {
-      notify(
-        store,
-        "ultra-fusion needs a logged-in main model (/login + /model)",
-        "warn",
-      );
+    // Ultra + Fusion: secondaries reason only → main reviews & executes with tools
+    if (mode === "ultra-fusion") {
+      if (!hasAuth) {
+        notify(
+          store,
+          "ultra-fusion needs a logged-in main model (/login + /model)",
+          "warn",
+        );
+        return;
+      }
+      const abortCtrl = new AbortController();
+      fusionPrepAbort = abortCtrl;
+      try {
+        const settings = loadAgentSettings();
+        // Collect dual reasoning off-screen; display as one normal thinking block
+        const prep = await prepareFusionForMain(
+          store,
+          text,
+          provider,
+          model,
+          abortCtrl.signal,
+        );
+        toast(store, prep.summary);
+        const system =
+          buildSystemPrompt({
+            extra: settings.reasoning.customInstructions,
+            model,
+            provider,
+            cwd: process.cwd(),
+          }) +
+          "\n\n" +
+          prep.systemAddon;
+        await live.handle(text, {
+          provider,
+          model,
+          cwd: process.cwd(),
+          tools: true,
+          systemPrompt: system,
+          // Same assistant turn as tools/text — not a split second panel
+          seedReasoning: prep.displayReasoning,
+        });
+      } catch (err) {
+        notify(
+          store,
+          err instanceof Error ? err.message : String(err),
+          "error",
+        );
+        store.setPhase("idle");
+      } finally {
+        if (fusionPrepAbort === abortCtrl) fusionPrepAbort = null;
+      }
       return;
     }
-    try {
-      const settings = loadAgentSettings();
-      // Collect dual reasoning off-screen; display as one normal thinking block
-      const prep = await prepareFusionForMain(
-        store,
-        text,
-        provider,
-        model,
-      );
-      toast(store, prep.summary);
-      const system =
-        buildSystemPrompt({
-          extra: settings.reasoning.customInstructions,
-          model,
-          provider,
-          cwd: process.cwd(),
-        }) +
-        "\n\n" +
-        prep.systemAddon;
+
+    if (hasAuth) {
       await live.handle(text, {
         provider,
         model,
         cwd: process.cwd(),
         tools: true,
-        systemPrompt: system,
-        // Same assistant turn as tools/text — not a split second panel
-        seedReasoning: prep.displayReasoning,
       });
-    } catch (err) {
-      notify(
-        store,
-        err instanceof Error ? err.message : String(err),
-        "error",
-      );
-      store.setPhase("idle");
+      return;
     }
-    return;
-  }
 
-  if (hasAuth) {
-    await live.handle(text, {
-      provider,
-      model,
-      cwd: process.cwd(),
-      tools: true,
-    });
-    return;
+    // Fallback demo loop so the TUI still responds without keys
+    notify(
+      store,
+      "No live model selected — using demo agent. /login openrouter then /model",
+      "info",
+    );
+    await mock.handle(text);
+  } finally {
+    submissionInFlight = false;
   }
-
-  // Fallback demo loop so the TUI still responds without keys
-  notify(
-    store,
-    "No live model selected — using demo agent. /login openrouter then /model",
-    "info",
-  );
-  await mock.handle(text);
 }
 
 // ── subagents ─────────────────────────────────────────

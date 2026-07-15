@@ -142,6 +142,13 @@ export interface TurnCoreHooks {
   ) => void;
   onPhase?: (phase: "streaming" | "tool" | "idle", label: string) => void;
   onUsage?: (prompt: number, completion: number) => void;
+  /**
+   * Fired right before withRetry re-issues a sample after a transient
+   * failure (network drop, 5xx, rate limit). Must discard any text/
+   * reasoning already streamed to the UI for the failed attempt so the
+   * retry doesn't append its output onto stale partial content.
+   */
+  onSampleReset?: () => void;
   /** Before tools run — mark UI pending/running. */
   onToolsStart?: (calls: DispatchCall[]) => void;
   /** After each tool finishes. */
@@ -380,6 +387,10 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
                 delayMs,
                 error: err instanceof Error ? err.message : String(err),
               });
+              // Same sampleHandlers/processor is reused for the next
+              // attempt — wipe its buffered/streamed state first so the
+              // retry doesn't append onto a partial, now-abandoned reply.
+              hooks.onSampleReset?.();
             },
           },
         );
@@ -754,6 +765,9 @@ export async function runStoreTurn(
         },
         onSampleEnd: (_step, result) => {
           processor?.finish(result);
+        },
+        onSampleReset: () => {
+          processor?.resetForRetry();
         },
         onToolsStart: (calls) => {
           for (let i = 0; i < calls.length; i++) {

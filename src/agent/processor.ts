@@ -42,6 +42,16 @@ export interface SampleProcessor {
     args: Record<string, unknown>,
     callId: string,
   ): string;
+  /**
+   * Discard everything buffered/streamed from a failed attempt before
+   * withRetry fires the next one. Without this, a transient mid-stream
+   * error (dropped connection, 5xx) leaves partial text/reasoning already
+   * pushed to the store, and the successful retry's deltas get appended
+   * onto that stale content instead of replacing it — corrupting the
+   * visible assistant message. Tool cards are never touched here: they
+   * are only materialized in `finish()`, well after retries are done.
+   */
+  resetForRetry(): void;
   readonly textPartId: string;
   readonly reasoningPartId: string;
 }
@@ -179,6 +189,38 @@ export function createSampleProcessor(
     textPartId,
     reasoningPartId,
     toolPartId: (index) => toolPartIds.get(index),
+    resetForRetry() {
+      // Drop unflushed buffers and cancel their batch timers — nothing
+      // from the failed attempt should leak into the retried stream.
+      if (textTimer) {
+        clearTimeout(textTimer);
+        textTimer = null;
+      }
+      if (reasonTimer) {
+        clearTimeout(reasonTimer);
+        reasonTimer = null;
+      }
+      textBuf = "";
+      reasonBuf = "";
+      // Wipe any content already pushed to the store for this attempt.
+      // Keep the same part ids / "started" bookkeeping so the next
+      // flushText/flushReason call correctly appends (via textDelta)
+      // onto a clean slate rather than creating a duplicate part.
+      if (textStarted) {
+        store.patchPart(messageId, textPartId, { content: "" } as never);
+      }
+      if (reasoningStarted) {
+        store.patchPart(messageId, reasoningPartId, {
+          content: "",
+        } as never);
+      }
+      // Tool cards are only ever materialized in finish()/ensureToolPart,
+      // which happen after a sample fully succeeds — so there should be
+      // nothing to undo here. Clear defensively in case a future change
+      // moves tool-call visibility earlier.
+      pendingTools.clear();
+      toolsFlushed = false;
+    },
     ensureToolPart(index, name, args, callId) {
       // Tools are running — surface any still-buffered cards first
       flushPendingTools();

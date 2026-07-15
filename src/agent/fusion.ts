@@ -15,11 +15,7 @@ import {
   parseModelKey,
   modelKey,
 } from "../auth/models.js";
-import {
-  FUSION_MAX_SECONDARIES,
-  loadAgentSettings,
-  type FusionConfig,
-} from "./config.js";
+import { loadAgentSettings, type FusionConfig } from "./config.js";
 import { rankModelsByNativeReasoning } from "./reasoning.js";
 import {
   chatComplete,
@@ -111,7 +107,11 @@ export async function prepareFusionForMain(
   userPrompt: string,
   mainProvider: ProviderId,
   mainModel: string,
+  signal?: AbortSignal,
 ): Promise<FusionPrepResult> {
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
   const settings = loadAgentSettings();
   const fusion = settings.reasoning.fusion;
   const mainKey = modelKey({ provider: mainProvider, model: mainModel });
@@ -136,9 +136,9 @@ export async function prepareFusionForMain(
 
   // Parallel: main + peer reason (no tools)
   const [mainReasoning, ...secondaries] = await Promise.all([
-    runOneReasoning(mainKey, userPrompt, fusion, "fusion.main"),
+    runOneReasoning(mainKey, userPrompt, fusion, "fusion.main", signal),
     ...secondaryKeys.map((key) =>
-      runOneReasoning(key, userPrompt, fusion, "fusion.peer"),
+      runOneReasoning(key, userPrompt, fusion, "fusion.peer", signal),
     ),
   ]);
 
@@ -287,11 +287,31 @@ function isRateLimitError(err: unknown): boolean {
   return /\b429\b|rate.?limit|temporarily rate-limited/i.test(msg);
 }
 
+/** Rate-limit retry wait that bails immediately if the turn is cancelled. */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function runOneReasoning(
   key: string,
   userPrompt: string,
   fusion: FusionConfig,
   label: string,
+  signal?: AbortSignal,
 ): Promise<FusionCandidate> {
   const ref = parseModelKey(key);
   const started = Date.now();
@@ -315,10 +335,14 @@ async function runOneReasoning(
 
   let lastError = "";
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (signal?.aborted) {
+      lastError = "aborted";
+      break;
+    }
     try {
       if (attempt > 0) {
         dbg("fusion", `${label}.retry`, { attempt, waitMs: FUSION_RETRY_MS });
-        await new Promise((r) => setTimeout(r, FUSION_RETRY_MS));
+        await sleepUnlessAborted(FUSION_RETRY_MS, signal);
       }
       const text = await completeReasoningOnly({
         provider: ref.provider,
@@ -326,6 +350,7 @@ async function runOneReasoning(
         system,
         user: userPrompt,
         label: attempt ? `${label}.retry` : label,
+        signal,
       });
       const ms = Date.now() - started;
       dbg("fusion", `${label}.ok`, {
@@ -390,6 +415,7 @@ async function completeReasoningOnly(opts: {
   system: string;
   user: string;
   label: string;
+  signal?: AbortSignal;
 }): Promise<ReasoningOnlyResult> {
   // No internal reasoning caps — depth comes only from the model's API
   // effort setting (buildReasoningApiFields / per-model effort).
@@ -407,6 +433,7 @@ async function completeReasoningOnly(opts: {
       // No max_tokens — unlimited; reasoning depth via API effort only
       stream: true,
       applyNativeReasoning: true,
+      signal: opts.signal,
       label: opts.label,
     },
     {
