@@ -91,6 +91,7 @@ import {
 } from "./modal-input.js";
 import { copyText } from "./clipboard.js";
 import type { Row } from "./components/parts.js";
+import { CoalescedScheduler } from "../core/coalesce.js";
 
 export interface RendererOptions {
   theme?: string;
@@ -115,15 +116,27 @@ export class TuiRenderer {
   private focus: "prompt" | "scrollback" = "prompt";
   private scrollOffset = 0;
   private following = true;
+  /**
+   * Derived from wall-clock elapsed time, not incremented per-tick — see
+   * `armAnimation()`. This mirrors codex-cli's motion primitives, which key
+   * spinner/glow phase off `Instant.elapsed()` rather than a frame counter,
+   * so animation speed stays correct even if paints are delayed or skipped.
+   */
   private tick = 0;
+  private startedAtMs = 0;
   private running = false;
   private needsFull = true;
-  private timer: NodeJS.Timeout | null = null;
-  /** Coalesce high-frequency store paints (stream deltas) to ~30fps */
-  private paintRaf: NodeJS.Timeout | null = null;
-  private paintQueued = false;
-  private lastPaintMs = 0;
-  private static readonly PAINT_MIN_MS = 32;
+  /**
+   * Coalesced, rate-limited paint scheduler — TS port of codex-cli's
+   * `FrameRequester`/`FrameScheduler` actor (see core/coalesce.ts). Replaces
+   * the old bespoke `paintRaf`/`PAINT_MIN_MS` throttle *and* the always-on
+   * 50ms `setInterval` animation poll: callers just call `requestPaint()`
+   * as often as they like, and animation frames self-reschedule only while
+   * something is actually animating (see `armAnimation()`).
+   */
+  private frames: CoalescedScheduler;
+  private static readonly PAINT_MAX_HZ = 30;
+  private static readonly SPINNER_INTERVAL_MS = 50;
   private opts: RendererOptions;
   private stdin: NodeJS.ReadStream;
   private stdout: NodeJS.WriteStream;
@@ -197,6 +210,10 @@ export class TuiRenderer {
     this.colorLevel = detectColorLevel();
     const { cols, rows } = this.size();
     this.buf = new FrameBuffer(cols, rows, this.colorLevel, this.theme.bg);
+    this.frames = new CoalescedScheduler({
+      maxHz: TuiRenderer.PAINT_MAX_HZ,
+      onFire: () => this.paint(),
+    });
     this.paths = new PathIndex(opts.cwd ?? process.cwd());
     this.history = new PromptHistory();
     for (const h of this.history.recent(100).reverse()) {
@@ -267,21 +284,13 @@ export class TuiRenderer {
   }
 
   /**
-   * Schedule a paint soon (coalesced). Use for store/stream events.
-   * Input handlers should call paint() for immediate feedback.
+   * Schedule a paint soon (coalesced, rate-limited to PAINT_MAX_HZ).
+   * Use for store/stream events. Input handlers should call paint()
+   * directly for immediate feedback.
    */
   requestPaint(): void {
     if (!this.running) return;
-    this.paintQueued = true;
-    if (this.paintRaf != null) return;
-    const elapsed = Date.now() - this.lastPaintMs;
-    const wait = Math.max(0, TuiRenderer.PAINT_MIN_MS - elapsed);
-    this.paintRaf = setTimeout(() => {
-      this.paintRaf = null;
-      if (!this.paintQueued) return;
-      this.paintQueued = false;
-      this.paint();
-    }, wait);
+    this.frames.scheduleFrame();
   }
 
   getPromptText(): string {
@@ -474,32 +483,53 @@ export class TuiRenderer {
     };
     process.stdout.on("resize", this.onResize);
 
-    this.timer = setInterval(() => {
-      this.tick++;
-      if (!this.state) return;
-      // Spinner / glow / streaming caret — coalesced so we never double-paint
-      // with store events in the same frame budget
-      if (
-        this.state.phase !== "idle" ||
-        this.hasStreaming() ||
-        this.hasReasoningModeGlow() ||
-        this.copyFlash
-      ) {
-        this.requestPaint();
-      }
-    }, 50);
+    this.startedAtMs = Date.now();
+    this.armAnimation();
 
     this.refreshComplete();
     this.paint();
   }
 
+  /**
+   * Whether the spinner / reasoning-mode glow / streaming caret needs to
+   * keep animating right now. Same condition the old setInterval polled
+   * unconditionally every 50ms; now only evaluated when something might
+   * actually be animating.
+   */
+  private isAnimating(): boolean {
+    if (!this.state) return false;
+    return (
+      this.state.phase !== "idle" ||
+      this.hasStreaming() ||
+      this.hasReasoningModeGlow() ||
+      Boolean(this.copyFlash)
+    );
+  }
+
+  /**
+   * Self-rescheduling animation frame — TS port of codex-cli's per-widget
+   * `frame_requester.schedule_frame_in(interval)` pattern (see
+   * status_surfaces.rs / status_indicator_widget.rs upstream), used instead
+   * of an always-on poll timer. Called once from `start()` and again from
+   * the tail of every `paint()`: as long as `isAnimating()` stays true it
+   * keeps re-arming itself roughly every SPINNER_INTERVAL_MS; the instant
+   * nothing needs to animate, the chain simply stops and the process goes
+   * back to zero redraw-related wakeups until the next event.
+   */
+  private armAnimation(): void {
+    if (!this.running) return;
+    this.tick = Math.floor(
+      (Date.now() - this.startedAtMs) / TuiRenderer.SPINNER_INTERVAL_MS,
+    );
+    if (this.isAnimating()) {
+      this.frames.scheduleIn(TuiRenderer.SPINNER_INTERVAL_MS);
+    }
+  }
+
   stop(): void {
     if (!this.running) return;
     this.running = false;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-    if (this.paintRaf) clearTimeout(this.paintRaf);
-    this.paintRaf = null;
+    this.frames.stop();
 
     if (this.onData) this.stdin.off("data", this.onData);
     if (this.onResize) process.stdout.off("resize", this.onResize);
@@ -1282,8 +1312,6 @@ export class TuiRenderer {
     if (!this.running) return;
     const state = this.state;
     if (!state) return;
-    this.lastPaintMs = Date.now();
-    this.paintQueued = false;
 
     const { cols, rows } = this.size();
     if (cols !== this.buf.width || rows !== this.buf.height) {
@@ -1493,6 +1521,11 @@ export class TuiRenderer {
 
     this.needsFull = false;
     this.stdout.write(payload);
+
+    // Keep the spinner/glow/streaming caret animating if needed; this is
+    // the only thing that keeps redraws happening with no other events —
+    // it stops on its own the instant isAnimating() goes false.
+    this.armAnimation();
   }
 
   private paintRow(

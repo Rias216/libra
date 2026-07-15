@@ -116,6 +116,43 @@ export type AgentPhase =
   | "waiting"
   | "error";
 
+export type AgentThreadStatusLite =
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "closed";
+
+/**
+ * Bounded, best-effort snapshot of one subagent thread for TUI display —
+ * modeled on codex-cli's `AgentStatusThreadPreview` / `/agent` v2 status
+ * feed (codex-rs/tui/src/app/agent_status_feed.rs) and the footer
+ * `active_agent_label` (codex-rs/tui/src/bottom_pane/footer.rs).
+ *
+ * Unlike the main-thread TPS in TuiRenderer (which samples a ~2s sliding
+ * window of char deltas), `tokensPerSec` here is a running average over
+ * the thread's lifetime: subagent hooks only fire once per model round
+ * (`onUsage` in agent/turn.ts), not per streamed token, so a sliding
+ * window would be mostly empty between rounds. This mirrors codex-cli's
+ * own choice not to show a live per-token rate anywhere in its TUI —
+ * only elapsed time and token *counts* — because round-granularity is
+ * the real resolution available for background agent threads.
+ */
+export interface AgentThreadSummary {
+  id: string;
+  nickname: string;
+  /** Role id (agent_type): explorer, worker, review, … */
+  role: string;
+  status: AgentThreadStatusLite;
+  tokens: { input: number; output: number };
+  /** Running-average tokens/sec since the thread started (0 when idle/cold). */
+  tokensPerSec: number;
+  /** Short label for the thread's most recent activity, e.g. "streaming · step 2". */
+  lastActivity?: string;
+  startedAt: number;
+  endedAt?: number;
+}
+
 export interface HarnessState {
   session: SessionMeta;
   messages: Message[];
@@ -131,6 +168,12 @@ export interface HarnessState {
   /** Whether reasoning/thinking blocks are visible */
   showThinking: boolean;
   compact: boolean;
+  /**
+   * Bounded live view of subagent threads (most recent N, open threads
+   * first — see SubagentRuntime.emitSnapshot). Empty when multi-agent is
+   * off or no subagent has spawned yet this session.
+   */
+  agents: AgentThreadSummary[];
 }
 
 export function createEmptyState(partial?: Partial<SessionMeta>): HarnessState {
@@ -151,6 +194,7 @@ export function createEmptyState(partial?: Partial<SessionMeta>): HarnessState {
     showToolDetails: true,
     showThinking: true,
     compact: false,
+    agents: [],
   };
 }
 

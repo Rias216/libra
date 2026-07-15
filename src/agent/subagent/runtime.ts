@@ -10,6 +10,8 @@ import { parseModelKey } from "../../auth/models.js";
 import type { SubagentConfig } from "../config.js";
 import { dbg, span } from "../debug.js";
 import type { ChatMessage } from "../../llm/client.js";
+import type { AgentThreadSummary } from "../../core/types.js";
+import { CoalescedScheduler } from "../../core/coalesce.js";
 import { runChildLoop } from "./child-loop.js";
 import {
   listSpawnableRoles,
