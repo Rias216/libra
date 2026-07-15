@@ -9,6 +9,7 @@
 
 import type { HarnessState, Message, Part } from "../core/types.js";
 import type { Theme } from "./theme.js";
+import { formatCompactCount } from "./chrome.js";
 import {
   renderPart,
   renderRoleHeader,
@@ -225,7 +226,7 @@ function appendMessage(
   if (msg.role === "user" || msg.role === "assistant") {
     const meta =
       msg.usage != null
-        ? `${msg.usage.input + msg.usage.output} tok`
+        ? formatCompactCount(msg.usage.input + msg.usage.output)
         : undefined;
     rows.push(renderRoleHeader(msg.role, theme, meta));
   }

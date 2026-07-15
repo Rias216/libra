@@ -21,7 +21,11 @@ export function isRetryableError(err: unknown): boolean {
   if (/abort/i.test(msg) && /signal/i.test(msg)) return false;
   // HTTP status codes in error messages
   if (/\b(429|500|502|503|504)\b/.test(msg)) return true;
-  if (/rate.?limit|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(msg)) {
+  if (
+    /rate.?limit|timeout|ECONNRESET|ETIMEDOUT|fetch failed|network|overloaded/i.test(
+      msg,
+    )
+  ) {
     return true;
   }
   if (/HTTP 5\d\d/.test(msg)) return true;

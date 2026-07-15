@@ -250,31 +250,25 @@ async function fetchOpenAIStyle(
         continue;
       }
       const json = (await res.json()) as {
-        data?: Array<{
-          id?: string;
-          object?: string;
-          owned_by?: string;
-          name?: string;
-        }>;
-        models?: Array<{ id?: string; name?: string }>;
+        data?: Array<Record<string, unknown> & { id?: string; name?: string }>;
+        models?: Array<Record<string, unknown> & { id?: string; name?: string }>;
       };
       // Support { data: [...] } and { models: [...] }
       const rawList = json.data ?? json.models ?? [];
       const mapped: RemoteModel[] = [];
       for (const m of rawList) {
         const id = m.id ?? m.name;
-        if (!id) continue;
+        if (!id || typeof id !== "string") continue;
         // Skip non-chat noise when obvious
         if (/embed|whisper|tts|moderation|dall-e|image|audio/i.test(id)) {
           continue;
         }
         const owned =
-          "owned_by" in m && typeof (m as { owned_by?: string }).owned_by === "string"
-            ? (m as { owned_by: string }).owned_by
-            : undefined;
+          typeof m.owned_by === "string" ? m.owned_by : undefined;
+        const context = extractContextLength(m);
         mapped.push({
           id,
-          name: m.name ?? id,
+          name: (typeof m.name === "string" ? m.name : id),
           provider,
           description:
             owned != null
@@ -283,6 +277,7 @@ async function fetchOpenAIStyle(
                 ? "xAI Grok"
                 : undefined,
           reasoning: looksReasoning(id),
+          context,
           raw: m,
         });
       }
@@ -336,12 +331,15 @@ async function fetchGemini(
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} listing Gemini models`);
   const json = (await res.json()) as {
-    models?: Array<{
-      name?: string;
-      displayName?: string;
-      description?: string;
-      supportedGenerationMethods?: string[];
-    }>;
+    models?: Array<
+      Record<string, unknown> & {
+        name?: string;
+        displayName?: string;
+        description?: string;
+        supportedGenerationMethods?: string[];
+        inputTokenLimit?: number;
+      }
+    >;
   };
   return (json.models ?? [])
     .filter((m) =>
@@ -350,12 +348,16 @@ async function fetchGemini(
     .map((m) => {
       // name like "models/gemini-2.5-pro"
       const id = (m.name ?? "").replace(/^models\//, "");
+      const context =
+        extractContextLength(m) ??
+        (typeof m.inputTokenLimit === "number" ? m.inputTokenLimit : undefined);
       return {
         id,
         name: m.displayName ?? id,
         provider,
         description: m.description?.slice(0, 80),
         reasoning: looksReasoning(id),
+        context,
         raw: m,
       };
     })
@@ -381,7 +383,9 @@ async function fetchAnthropic(
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} listing Anthropic models`);
   const json = (await res.json()) as {
-    data?: Array<{ id?: string; display_name?: string }>;
+    data?: Array<
+      Record<string, unknown> & { id?: string; display_name?: string }
+    >;
   };
   return (json.data ?? [])
     .filter((m) => m.id)
@@ -390,6 +394,7 @@ async function fetchAnthropic(
       name: m.display_name ?? m.id!,
       provider,
       reasoning: looksReasoning(m.id!),
+      context: extractContextLength(m),
       raw: m,
     }));
 }
@@ -407,6 +412,108 @@ export function findModel(id: string): RemoteModel | undefined {
     const hit = v.models.find((m) => m.id === id);
     if (hit) return hit;
   }
+  return undefined;
+}
+
+/**
+ * Look up a model in the live catalog cache (provider + id).
+ */
+export function findModelForProvider(
+  provider: ProviderId | string,
+  modelId: string,
+): RemoteModel | undefined {
+  const list = cache.get(provider)?.models;
+  if (!list) return findModel(modelId);
+  return list.find((m) => m.id === modelId) ?? findModel(modelId);
+}
+
+/**
+ * Base context window (input tokens) for a model from the fetched catalog.
+ * Returns null when the catalog has no figure for this model.
+ */
+export function getModelContextWindow(
+  provider: ProviderId | string,
+  modelId: string,
+): number | null {
+  const m = findModelForProvider(provider, modelId);
+  if (m?.context != null && m.context > 0) return m.context;
+  // Last resort: scan raw payload if context was never promoted
+  if (m?.raw && typeof m.raw === "object") {
+    const n = extractContextLength(m.raw as Record<string, unknown>);
+    if (n != null) return n;
+  }
+  return null;
+}
+
+/**
+ * Pull context window from common provider model-list shapes:
+ * OpenRouter / OpenAI-compat / xAI / Gemini / Anthropic.
+ */
+export function extractContextLength(
+  raw: Record<string, unknown> | null | undefined,
+): number | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+
+  const tryNum = (v: unknown): number | undefined => {
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+      return Math.floor(v);
+    }
+    if (typeof v === "string" && /^\d+$/.test(v.trim())) {
+      const n = Number(v.trim());
+      return n > 0 ? n : undefined;
+    }
+    return undefined;
+  };
+
+  const direct =
+    tryNum(raw.context_length) ??
+    tryNum(raw.contextLength) ??
+    tryNum(raw.context) ??
+    tryNum(raw.max_context_length) ??
+    tryNum(raw.max_input_tokens) ??
+    tryNum(raw.maxInputTokens) ??
+    tryNum(raw.input_token_limit) ??
+    tryNum(raw.inputTokenLimit) ?? // Gemini
+    tryNum(raw.context_window) ??
+    tryNum(raw.contextWindow);
+  if (direct != null) return direct;
+
+  const arch = raw.architecture;
+  if (arch && typeof arch === "object") {
+    const a = arch as Record<string, unknown>;
+    const n =
+      tryNum(a.context_length) ??
+      tryNum(a.contextLength) ??
+      tryNum(a.context_window);
+    if (n != null) return n;
+  }
+
+  const top = raw.top_provider ?? raw.topProvider;
+  if (top && typeof top === "object") {
+    const t = top as Record<string, unknown>;
+    const n =
+      tryNum(t.context_length) ??
+      tryNum(t.contextLength) ??
+      tryNum(t.max_completion_tokens);
+    // max_completion_tokens is not context — skip that
+    if (tryNum(t.context_length) != null || tryNum(t.contextLength) != null) {
+      return tryNum(t.context_length) ?? tryNum(t.contextLength);
+    }
+    void n;
+  }
+
+  // Nested limits objects (some gateways)
+  const limits = raw.limits ?? raw.token_limits ?? raw.tokenLimits;
+  if (limits && typeof limits === "object") {
+    const l = limits as Record<string, unknown>;
+    const n =
+      tryNum(l.context) ??
+      tryNum(l.max_prompt_tokens) ??
+      tryNum(l.max_input_tokens) ??
+      tryNum(l.input);
+    if (n != null) return n;
+  }
+
   return undefined;
 }
 

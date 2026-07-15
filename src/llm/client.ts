@@ -910,6 +910,43 @@ async function chatOpenAI(
   };
 }
 
+/**
+ * Max time to wait for the *next* chunk once a stream is open. Reset on
+ * every chunk received (including keep-alives), so this only fires when
+ * the connection genuinely stalls — not for a single slow turn.
+ *
+ * This exists because `fetch`'s own timeout only covers the time to get
+ * response headers; once the body starts streaming there is otherwise no
+ * limit at all, so a stalled provider/proxy connection would hang forever
+ * (or until some external gateway drops it, often after 60-120s) with the
+ * UI appearing completely frozen the whole time.
+ */
+const STREAM_IDLE_TIMEOUT_MS = 30_000;
+
+/** Race a single reader.read() against an idle timeout, cancelling the
+ * reader (and thus the underlying connection) if it fires. */
+function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleMs: number,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      reader.cancel("idle timeout").catch(() => {});
+      reject(new Error(`stream idle timeout: no data for ${idleMs}ms`));
+    }, idleMs);
+    reader.read().then(
+      (r) => {
+        clearTimeout(t);
+        resolve(r);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
 async function consumeOpenAIStream(
   res: Response,
   handlers?: StreamHandlers,
@@ -957,7 +994,36 @@ async function consumeOpenAIStream(
   };
 
   while (true) {
-    const { done, value } = await reader.read();
+    let readResult: ReadableStreamReadResult<Uint8Array>;
+    try {
+      readResult = await readWithIdleTimeout(reader, STREAM_IDLE_TIMEOUT_MS);
+    } catch (err) {
+      // Stream stalled or the connection dropped mid-response.
+      //
+      // If nothing has been emitted yet, this is indistinguishable from a
+      // normal connection failure — rethrow so the caller's withRetry can
+      // safely re-issue the identical request (no partial UI state exists
+      // to conflict with a fresh attempt).
+      if (ttftMs == null) throw err;
+      // Otherwise the user is already looking at partial output. Do NOT
+      // throw here: the caller would retry with the *same* prompt and the
+      // *same* streaming handlers, which silently glues a second, unrelated
+      // completion onto the tail of the first (visible as "stops mid-
+      // sentence, then jumps to something else a minute later"). Instead,
+      // treat this exactly like a provider length-cutoff: return what we
+      // have with finish_reason "length" so the normal auto-continue path
+      // in agent/turn.ts asks the model to pick up where it left off, in a
+      // new step with its own message part.
+      dbg("llm", "stream.interrupted", {
+        reason: err instanceof Error ? err.message : String(err),
+        chunks: chunkCount,
+        contentLen: content.length,
+        reasoningLen: reasoning.length,
+      });
+      finish = "length";
+      break;
+    }
+    const { done, value } = readResult;
     if (done) break;
     buf += dec.decode(value, { stream: true });
     const lines = buf.split("\n");
@@ -1216,6 +1282,14 @@ function toGeminiContents(messages: ChatMessage[]): Array<{ role: string; parts:
   return contents;
 }
 
+function mapGeminiFinishReason(fr: string | null | undefined): string {
+  if (!fr) return "stop";
+  const f = fr.toUpperCase();
+  if (f === "MAX_TOKENS") return "length";
+  if (f === "STOP") return "stop";
+  return f.toLowerCase();
+}
+
 async function chatGemini(
   base: string,
   token: string,
@@ -1223,7 +1297,7 @@ async function chatGemini(
   handlers?: StreamHandlers,
 ): Promise<ChatResult> {
   const id = req.model.replace(/^models\//, "");
-  const url = `${base}/models/${id}:generateContent?key=${encodeURIComponent(token)}`;
+  const url = `${base}/models/${id}:streamGenerateContent?alt=sse&key=${encodeURIComponent(token)}`;
   const system = req.messages.find((m) => m.role === "system")?.content ?? "";
   const contents = toGeminiContents(req.messages);
   const native = buildReasoningApiFields(req.provider, req.model);
@@ -1252,69 +1326,182 @@ async function chatGemini(
     body.toolConfig = { functionCallingConfig: { mode } };
   }
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: req.signal ?? AbortSignal.timeout(120_000),
-  });
+  const controller = new AbortController();
+  const connectTimeout = setTimeout(() => controller.abort(), 180_000);
+  const onAbort = () => controller.abort();
+  req.signal?.addEventListener("abort", onAbort, { once: true });
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(connectTimeout);
+    req.signal?.removeEventListener("abort", onAbort);
+  }
   if (!res.ok) {
     throw new Error(
       `Gemini HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`,
     );
   }
-  const json = (await res.json()) as {
-    candidates?: Array<{
-      content?: {
-        parts?: Array<{
-          text?: string;
-          functionCall?: { name?: string; args?: Record<string, unknown> };
-        }>;
-      };
-      finishReason?: string;
-    }>;
-    usageMetadata?: {
-      promptTokenCount?: number;
-      candidatesTokenCount?: number;
-      totalTokenCount?: number;
-    };
+  const result = await consumeGeminiStream(res, handlers, t0);
+  result.durationMs = Date.now() - t0;
+  return result;
+}
+
+/** Gemini `alt=sse` stream. Same idle-timeout + graceful mid-stream
+ * degradation strategy as consumeOpenAIStream / consumeAnthropicStream. */
+async function consumeGeminiStream(
+  res: Response,
+  handlers?: StreamHandlers,
+  t0: number = Date.now(),
+): Promise<ChatResult> {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("no response body");
+  const dec = new TextDecoder();
+  let buf = "";
+  let content = "";
+  let reasoning = "";
+  const toolCalls: ToolCall[] = [];
+  let finish = "stop";
+  let promptTokens: number | undefined;
+  let completionTokens: number | undefined;
+  let totalTokens: number | undefined;
+  let ttftMs: number | undefined;
+  let firstKind: "text" | "reasoning" | "tool" | undefined;
+  let chunkCount = 0;
+
+  const markFirst = (kind: "text" | "reasoning" | "tool") => {
+    if (ttftMs != null) return;
+    ttftMs = Date.now() - t0;
+    firstKind = kind;
+    handlers?.onFirstToken?.(kind, ttftMs);
+    dbg("llm", "ttft", { ttftMs, kind, provider: "gemini" });
   };
-  const parts = json.candidates?.[0]?.content?.parts ?? [];
-  let text = "";
-  const tool_calls: ToolCall[] = [];
-  for (const p of parts) {
-    if (p.text) text += p.text;
-    if (p.functionCall?.name) {
-      tool_calls.push({
-        id: ensureToolId(undefined, tool_calls.length),
-        type: "function",
-        function: {
-          name: resolveToolName(p.functionCall.name),
-          arguments: JSON.stringify(p.functionCall.args ?? {}),
-        },
+
+  const handleChunk = (data: string) => {
+    let json: {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{
+            text?: string;
+            thought?: boolean;
+            functionCall?: { name?: string; args?: Record<string, unknown> };
+          }>;
+        };
+        finishReason?: string;
+      }>;
+      usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        totalTokenCount?: number;
+      };
+    };
+    try {
+      json = JSON.parse(data);
+    } catch {
+      dbgTrace("llm", "gemini.sse.parse_error", { data: data.slice(0, 200) });
+      return;
+    }
+    chunkCount++;
+    dbgTrace("llm", "gemini.sse.chunk", { n: chunkCount, data: data.slice(0, 300) });
+
+    const cand = json.candidates?.[0];
+    if (cand?.finishReason) finish = mapGeminiFinishReason(cand.finishReason);
+    for (const p of cand?.content?.parts ?? []) {
+      if (p.text) {
+        if (p.thought) {
+          markFirst("reasoning");
+          reasoning += p.text;
+          handlers?.onReasoning?.(p.text);
+        } else {
+          markFirst("text");
+          content += p.text;
+          handlers?.onText?.(p.text);
+        }
+      }
+      if (p.functionCall?.name) {
+        const idx = toolCalls.length;
+        const tc: ToolCall = {
+          id: ensureToolId(undefined, idx),
+          type: "function",
+          function: {
+            name: resolveToolName(p.functionCall.name),
+            arguments: JSON.stringify(p.functionCall.args ?? {}),
+          },
+        };
+        toolCalls.push(tc);
+        markFirst("tool");
+        handlers?.onToolCallDelta?.(idx, { ...tc });
+      }
+    }
+    if (json.usageMetadata) {
+      promptTokens = json.usageMetadata.promptTokenCount ?? promptTokens;
+      completionTokens = json.usageMetadata.candidatesTokenCount ?? completionTokens;
+      totalTokens = json.usageMetadata.totalTokenCount ?? totalTokens;
+    }
+  };
+
+  while (true) {
+    let readResult: ReadableStreamReadResult<Uint8Array>;
+    try {
+      readResult = await readWithIdleTimeout(reader, STREAM_IDLE_TIMEOUT_MS);
+    } catch (err) {
+      if (ttftMs == null) throw err;
+      dbg("llm", "stream.interrupted", {
+        provider: "gemini",
+        reason: err instanceof Error ? err.message : String(err),
+        chunks: chunkCount,
+        contentLen: content.length,
+        reasoningLen: reasoning.length,
       });
+      finish = "length";
+      break;
+    }
+    const { done, value } = readResult;
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const sLine = line.trim();
+      if (!sLine.startsWith("data:")) continue;
+      handleChunk(sLine.slice(5).trim());
     }
   }
-  if (text) handlers?.onText?.(text);
-  for (const tc of tool_calls) {
-    handlers?.onToolCallDelta?.(0, tc);
-  }
-  const usage = json.usageMetadata
-    ? {
-        prompt_tokens: json.usageMetadata.promptTokenCount,
-        completion_tokens: json.usageMetadata.candidatesTokenCount,
-        total_tokens: json.usageMetadata.totalTokenCount,
-      }
-    : undefined;
-  return {
-    content: text,
-    tool_calls: normalizeToolCalls(tool_calls),
-    finish_reason: tool_calls.length
-      ? "tool_calls"
-      : (json.candidates?.[0]?.finishReason?.toLowerCase() ?? "stop"),
-    usage,
+
+  const normalized = toolCalls.filter((t) => t.function.name);
+  dbg("llm", "stream.done", {
+    provider: "gemini",
+    finish,
+    ttftMs,
+    firstKind,
+    chunks: chunkCount,
+    contentLen: content.length,
+    reasoningLen: reasoning.length,
+    tools: normalized.map((t) => ({ id: t.id, name: t.function.name })),
     durationMs: Date.now() - t0,
-    ttftMs: Date.now() - t0,
+  });
+
+  return {
+    content,
+    reasoning: reasoning || undefined,
+    tool_calls: normalizeToolCalls(normalized),
+    finish_reason: normalized.length ? "tool_calls" : finish,
+    usage:
+      promptTokens != null || completionTokens != null
+        ? {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: totalTokens,
+          }
+        : undefined,
+    ttftMs,
+    durationMs: Date.now() - t0,
   };
 }
 
@@ -1425,62 +1612,275 @@ async function chatAnthropic(
     }
   }
 
-  const res = await fetch(`${base}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "x-api-key": token,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-    signal: req.signal ?? AbortSignal.timeout(180_000),
-  });
+  body.stream = true;
+
+  const controller = new AbortController();
+  const connectTimeout = setTimeout(() => controller.abort(), 180_000);
+  const onAbort = () => controller.abort();
+  req.signal?.addEventListener("abort", onAbort, { once: true });
+
+  let res: Response;
+  try {
+    res = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "x-api-key": token,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(connectTimeout);
+    req.signal?.removeEventListener("abort", onAbort);
+  }
   if (!res.ok) {
     throw new Error(
       `Anthropic HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`,
     );
   }
-  const json = (await res.json()) as {
-    content?: Array<{
-      type?: string;
-      text?: string;
-      id?: string;
-      name?: string;
-      input?: Record<string, unknown>;
-    }>;
-    stop_reason?: string;
-    usage?: { input_tokens?: number; output_tokens?: number };
+  const result = await consumeAnthropicStream(res, handlers, t0);
+  result.durationMs = Date.now() - t0;
+  return result;
+}
+
+function mapAnthropicStopReason(sr: string | null | undefined): string {
+  switch (sr) {
+    case "end_turn":
+    case "stop_sequence":
+    case "pause_turn":
+    case "refusal":
+      return "stop";
+    case "max_tokens":
+      return "length";
+    case "tool_use":
+      return "tool_calls";
+    default:
+      return sr || "stop";
+  }
+}
+
+/**
+ * Anthropic Messages API SSE stream. Same idle-timeout + graceful mid-stream
+ * degradation strategy as consumeOpenAIStream (see readWithIdleTimeout):
+ * a stall before any output means it's safe to let the caller retry the
+ * identical request; a stall after output has started is folded into a
+ * finish_reason "length" partial result so the caller's existing
+ * auto-continue path picks it up in a fresh step instead of gluing a second,
+ * unrelated completion onto the first.
+ */
+async function consumeAnthropicStream(
+  res: Response,
+  handlers?: StreamHandlers,
+  t0: number = Date.now(),
+): Promise<ChatResult> {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("no response body");
+  const dec = new TextDecoder();
+  let buf = "";
+  let content = "";
+  let reasoning = "";
+  const toolCalls: ToolCall[] = [];
+  const blockKind = new Map<number, "text" | "thinking" | "tool_use">();
+  const blockToolIndex = new Map<number, number>();
+  let finish = "stop";
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+  let ttftMs: number | undefined;
+  let firstKind: "text" | "reasoning" | "tool" | undefined;
+  let chunkCount = 0;
+  let currentEvent = "";
+  let streamError: Error | undefined;
+
+  const markFirst = (kind: "text" | "reasoning" | "tool") => {
+    if (ttftMs != null) return;
+    ttftMs = Date.now() - t0;
+    firstKind = kind;
+    handlers?.onFirstToken?.(kind, ttftMs);
+    dbg("llm", "ttft", { ttftMs, kind, provider: "anthropic" });
   };
-  let text = "";
-  const tool_calls: ToolCall[] = [];
-  for (const c of json.content ?? []) {
-    if (c.type === "text" && c.text) text += c.text;
-    if (c.type === "tool_use" && c.name) {
-      tool_calls.push({
-        id: c.id || ensureToolId(undefined, tool_calls.length),
-        type: "function",
-        function: {
-          name: resolveToolName(c.name),
-          arguments: JSON.stringify(c.input ?? {}),
-        },
+
+  const handleEvent = (event: string, data: string) => {
+    let json: {
+      type?: string;
+      index?: number;
+      message?: { usage?: { input_tokens?: number } };
+      content_block?: {
+        type?: string;
+        id?: string;
+        name?: string;
+      };
+      delta?: {
+        type?: string;
+        text?: string;
+        thinking?: string;
+        partial_json?: string;
+        stop_reason?: string;
+      };
+      usage?: { output_tokens?: number };
+      error?: { type?: string; message?: string };
+    };
+    try {
+      json = JSON.parse(data);
+    } catch {
+      dbgTrace("llm", "anthropic.sse.parse_error", { data: data.slice(0, 200) });
+      return;
+    }
+    chunkCount++;
+    dbgTrace("llm", "anthropic.sse.chunk", { n: chunkCount, event, data: data.slice(0, 300) });
+
+    switch (event) {
+      case "message_start":
+        if (json.message?.usage?.input_tokens != null) {
+          inputTokens = json.message.usage.input_tokens;
+        }
+        break;
+      case "content_block_start": {
+        const idx = json.index ?? 0;
+        const cb = json.content_block ?? {};
+        if (cb.type === "tool_use") {
+          blockKind.set(idx, "tool_use");
+          const tcIdx = toolCalls.length;
+          blockToolIndex.set(idx, tcIdx);
+          toolCalls.push({
+            id: cb.id || ensureToolId(cb.id, tcIdx),
+            type: "function",
+            function: { name: resolveToolName(cb.name ?? ""), arguments: "" },
+          });
+          markFirst("tool");
+          handlers?.onToolCallDelta?.(tcIdx, { ...toolCalls[tcIdx]! });
+        } else if (cb.type === "thinking") {
+          blockKind.set(idx, "thinking");
+        } else {
+          blockKind.set(idx, "text");
+        }
+        break;
+      }
+      case "content_block_delta": {
+        const idx = json.index ?? 0;
+        const delta = json.delta ?? {};
+        if (delta.type === "text_delta" && delta.text) {
+          markFirst("text");
+          content += delta.text;
+          handlers?.onText?.(delta.text);
+        } else if (delta.type === "thinking_delta" && delta.thinking) {
+          markFirst("reasoning");
+          reasoning += delta.thinking;
+          handlers?.onReasoning?.(delta.thinking);
+        } else if (delta.type === "input_json_delta" && delta.partial_json != null) {
+          const tcIdx = blockToolIndex.get(idx);
+          if (tcIdx != null) {
+            const tc = toolCalls[tcIdx]!;
+            tc.function.arguments += delta.partial_json;
+            handlers?.onToolCallDelta?.(tcIdx, { ...tc });
+          }
+        }
+        break;
+      }
+      case "message_delta":
+        if (json.delta?.stop_reason) finish = mapAnthropicStopReason(json.delta.stop_reason);
+        if (json.usage?.output_tokens != null) outputTokens = json.usage.output_tokens;
+        break;
+      case "error": {
+        const e = json.error ?? {};
+        streamError = new Error(
+          `Anthropic stream error${e.type ? ` (${e.type})` : ""}: ${e.message ?? "unknown"}`,
+        );
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  while (true) {
+    let readResult: ReadableStreamReadResult<Uint8Array>;
+    try {
+      readResult = await readWithIdleTimeout(reader, STREAM_IDLE_TIMEOUT_MS);
+    } catch (err) {
+      if (ttftMs == null) throw err;
+      dbg("llm", "stream.interrupted", {
+        provider: "anthropic",
+        reason: err instanceof Error ? err.message : String(err),
+        chunks: chunkCount,
+        contentLen: content.length,
+        reasoningLen: reasoning.length,
       });
+      finish = "length";
+      break;
+    }
+    const { done, value } = readResult;
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const sLine = line.trim();
+      if (!sLine) {
+        currentEvent = "";
+        continue;
+      }
+      if (sLine.startsWith("event:")) {
+        currentEvent = sLine.slice(6).trim();
+        continue;
+      }
+      if (sLine.startsWith("data:")) {
+        handleEvent(currentEvent, sLine.slice(5).trim());
+      }
+    }
+    if (streamError) {
+      // Same graceful-degradation rule as a network stall: only throw away
+      // the whole attempt if nothing has been shown to the user yet.
+      if (ttftMs == null) throw streamError;
+      dbg("llm", "stream.interrupted", {
+        provider: "anthropic",
+        reason: streamError.message,
+        chunks: chunkCount,
+        contentLen: content.length,
+        reasoningLen: reasoning.length,
+      });
+      finish = "length";
+      break;
     }
   }
-  if (text) handlers?.onText?.(text);
-  return {
-    content: text,
-    tool_calls: normalizeToolCalls(tool_calls),
-    finish_reason:
-      json.stop_reason === "tool_use" || tool_calls.length
-        ? "tool_calls"
-        : (json.stop_reason ?? "end_turn"),
-    usage: json.usage
-      ? {
-          prompt_tokens: json.usage.input_tokens,
-          completion_tokens: json.usage.output_tokens,
-        }
-      : undefined,
+
+  const normalized = toolCalls.filter((t) => t.function.name);
+  dbg("llm", "stream.done", {
+    provider: "anthropic",
+    finish,
+    ttftMs,
+    firstKind,
+    chunks: chunkCount,
+    contentLen: content.length,
+    reasoningLen: reasoning.length,
+    tools: normalized.map((t) => ({
+      id: t.id,
+      name: t.function.name,
+      argsPreview: t.function.arguments.slice(0, 120),
+    })),
+    inputTokens,
+    outputTokens,
     durationMs: Date.now() - t0,
-    ttftMs: Date.now() - t0,
+  });
+
+  return {
+    content,
+    reasoning: reasoning || undefined,
+    tool_calls: normalizeToolCalls(normalized),
+    finish_reason: normalized.length ? "tool_calls" : finish,
+    usage:
+      inputTokens != null || outputTokens != null
+        ? {
+            prompt_tokens: inputTokens,
+            completion_tokens: outputTokens,
+            total_tokens:
+              inputTokens != null && outputTokens != null
+                ? inputTokens + outputTokens
+                : undefined,
+          }
+        : undefined,
+    ttftMs,
+    durationMs: Date.now() - t0,
   };
 }

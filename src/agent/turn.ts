@@ -42,7 +42,14 @@ import type {
 } from "../toolcalling/permissions.js";
 import type { ToolsetId } from "../toolcalling/registry.js";
 import type { OpenAITool } from "../toolcalling/schema.js";
-import { softCompactMessages } from "./compaction.js";
+import {
+  buildCompactedSession,
+  compactBudgetForModel,
+  DEFAULT_COMPACT_TOKEN_BUDGET,
+  shouldAutoCompact,
+  softCompactMessages,
+  type CompactedSession,
+} from "./compaction.js";
 import { approxTokensFromMessages, historyToMessages } from "./history.js";
 import { createSampleProcessor } from "./processor.js";
 import { loadAgentSettings } from "./config.js";
@@ -54,13 +61,14 @@ import {
   buildMultiAgentSystemAddon,
   isMultiAgentTool,
 } from "./subagent/tools.js";
+import { getModelContextWindow } from "../auth/models.js";
 
 /** OpenCode-style step cap before max-steps nudge. */
 export const MAX_STEPS = 24;
 /** Default child/subagent step cap (still uses same core + MAX_STEPS_PROMPT). */
 export const DEFAULT_CHILD_MAX_STEPS = 8;
-/** Soft token budget before compacting old tool outputs. */
-export const COMPACT_TOKEN_BUDGET = 90_000;
+/** Fallback soft budget when model context is unknown (also 80% target uses model). */
+export const COMPACT_TOKEN_BUDGET = DEFAULT_COMPACT_TOKEN_BUDGET;
 /** Slightly tighter budget for headless children (same compact fn). */
 export const COMPACT_TOKEN_BUDGET_CHILD = 40_000;
 
@@ -149,6 +157,12 @@ export interface TurnCoreHooks {
   /** Soft compact token budget (same softCompactMessages for both). */
   compactBudget?: number;
   compactKeepRecent?: number;
+  /**
+   * After a full auto-compact that rolls into a new session.
+   * Parent should seed the UI from `compacted.uiMessages` and re-bind
+   * the live assistant message id.
+   */
+  onSessionRollover?: (compacted: CompactedSession) => void;
   /** Span namespace */
   spanNs?: string;
 }
@@ -204,14 +218,21 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
   /** Auto-continues after finish_reason=length / broken mid-stream tool args */
   let lengthContinues = 0;
 
-  const compactBudget = hooks.compactBudget ?? COMPACT_TOKEN_BUDGET;
+  const contextWindow = getModelContextWindow(provider, model);
+  const compactBudget =
+    hooks.compactBudget ??
+    compactBudgetForModel(provider, model, COMPACT_TOKEN_BUDGET);
   const keepRecent = hooks.compactKeepRecent ?? 16;
   const ns = hooks.spanNs ?? "agent";
+  /** Only one full session rollover per turn (then soft digests). */
+  let didSessionRollover = false;
 
   const turnSpan = span(ns, `${label}.turn`, {
     model: `${provider}/${model}`,
     tools: Boolean(toolSchemas?.length) && toolsEnabledInitially,
     maxSteps,
+    contextWindow,
+    compactBudget,
   });
 
   /** Finalize mid-stream UI parts even when the sample throws. */
@@ -231,7 +252,52 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
     );
   };
 
+  /** Soft digest + optional full compact → new session seed. */
+  const maybeCompact = (reason: string): void => {
+    // Always try soft digests first (cheap, pairing-safe)
+    softCompactMessages(messages, {
+      tokenBudget: compactBudget,
+      keepRecent,
+    });
+
+    if (!shouldAutoCompact(messages, compactBudget)) return;
+    if (didSessionRollover) {
+      // Already rolled once this turn — keep soft-compacting only
+      softCompactMessages(messages, {
+        tokenBudget: compactBudget,
+        keepRecent: Math.max(6, keepRecent - 4),
+        digestChars: 80,
+      });
+      return;
+    }
+
+    hooks.onPhase?.("streaming", "compacting context · new session…");
+    const compacted = buildCompactedSession(messages, {
+      budget: compactBudget,
+      keepRecent,
+      contextWindow,
+    });
+
+    // Replace live wire messages with compacted transcript
+    messages.length = 0;
+    messages.push(...compacted.wire);
+
+    didSessionRollover = true;
+    dbg(ns, "session_compact", {
+      reason,
+      before: compacted.beforeTokens,
+      after: compacted.afterTokens,
+      budget: compacted.budget,
+      contextWindow: compacted.contextWindow,
+    });
+
+    hooks.onSessionRollover?.(compacted);
+  };
+
   try {
+    // Turn-start: if history already exceeds 80% context → new session
+    maybeCompact("turn_start");
+
     while (step < maxSteps) {
       if (isAborted() || abortSignal?.aborted) {
         cancelled = true;
@@ -240,11 +306,8 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
       }
       step++;
 
-      // Same compact function for parent + child
-      softCompactMessages(messages, {
-        tokenBudget: compactBudget,
-        keepRecent,
-      });
+      // Before each sample — soft digest; full rollover if still over budget
+      maybeCompact(`step_${step}`);
 
       const isLast = step >= maxSteps;
       // Tools off only on last step OR when tools disabled for the whole turn
@@ -623,6 +686,11 @@ export async function runStoreTurn(
 
   // Processor is recreated each sample inside onSampleStart
   let processor: ReturnType<typeof createSampleProcessor> | null = null;
+  const modelBudget = compactBudgetForModel(
+    opts.provider,
+    opts.model,
+    COMPACT_TOKEN_BUDGET,
+  );
 
   try {
     return await runTurnCore({
@@ -643,9 +711,43 @@ export async function runStoreTurn(
       chat,
       hooks: {
         spanNs: "agent",
-        compactBudget: COMPACT_TOKEN_BUDGET,
+        compactBudget: modelBudget,
         onPhase: (phase, lab) => ctx.store.setPhase(phase, lab),
         onUsage: (p, c) => ctx.store.addTokens(p, c),
+        /**
+         * Full auto-compact: wipe the old transcript and seed a **new**
+         * session with the compacted context, then re-bind the live
+         * assistant message id for the remainder of this turn.
+         */
+        onSessionRollover: (compacted) => {
+          ctx.store.resetWithSeed(
+            {
+              title: compactSessionTitle(ctx.store.state.session.title),
+              model: opts.model,
+              provider: opts.provider,
+              cwd: ctx.store.state.session.cwd,
+            },
+            compacted.uiMessages,
+          );
+
+          // Continue this turn on a fresh assistant shell in the new session
+          const assistant = ctx.store.startAssistant();
+          ctx.messageId = assistant.id;
+          processor = null;
+
+          const label =
+            compacted.summary.length > 80
+              ? compacted.summary.slice(0, 77) + "…"
+              : compacted.summary;
+          ctx.store.setPhase("streaming", label);
+          dbg("agent", "session_rollover", {
+            sessionId: ctx.store.state.session.id,
+            before: compacted.beforeTokens,
+            after: compacted.afterTokens,
+            budget: compacted.budget,
+            contextWindow: compacted.contextWindow,
+          });
+        },
         onSampleStart: () => {
           processor = createSampleProcessor(ctx.store, ctx.messageId);
           return processor.handlers;
@@ -753,8 +855,14 @@ export async function runHeadlessTurn(
       chat,
       hooks: {
         spanNs: "subagent",
-        compactBudget: COMPACT_TOKEN_BUDGET_CHILD,
+        compactBudget: compactBudgetForModel(
+          opts.provider,
+          opts.model,
+          COMPACT_TOKEN_BUDGET_CHILD,
+        ),
         compactKeepRecent: 12,
+        // Headless has no UI session — wire messages are already replaced
+        // in maybeCompact; no onSessionRollover needed.
       },
     });
   } catch (err) {
@@ -784,6 +892,14 @@ function mergeToolSchemas(
     }
   }
   return out;
+}
+
+/** Title for a session after auto-compaction rollover. */
+function compactSessionTitle(prev: string): string {
+  const base = (prev || "session")
+    .replace(/\s*\(compacted(?:\s*·\s*\d+)?\)\s*$/i, "")
+    .trim();
+  return `${base || "session"} (compacted)`;
 }
 
 export type { ToolCall };

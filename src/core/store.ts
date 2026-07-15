@@ -40,6 +40,36 @@ export class HarnessStore {
     });
   }
 
+  /**
+   * Start a brand-new session (new id) seeded with pre-built messages.
+   * Used after auto-compaction: wipe the old transcript UI and continue
+   * from the compacted context.
+   *
+   * Preserves provider / model / cwd / UI toggles; clears token totals.
+   */
+  resetWithSeed(
+    session: Partial<SessionMeta> | undefined,
+    messages: Message[],
+  ): void {
+    const prev = this.state;
+    const next = createEmptyState({
+      ...prev.session,
+      ...session,
+      // Force a new session id unless the caller set one
+      id: session?.id ?? crypto.randomUUID().slice(0, 8),
+      createdAt: session?.createdAt ?? Date.now(),
+    });
+    next.messages = messages.map((m) => ({
+      ...m,
+      parts: m.parts.map((p) => ({ ...p })),
+    }));
+    next.showToolDetails = prev.showToolDetails;
+    next.showThinking = prev.showThinking;
+    next.compact = prev.compact;
+    next.tokens = { input: 0, output: 0 };
+    this.dispatch({ type: "session.reset", state: next });
+  }
+
   appendMessage(message: Message): void {
     this.dispatch({ type: "message.append", message });
   }

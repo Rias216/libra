@@ -179,6 +179,13 @@ export class TuiRenderer {
     focusCol: number;
   } | null = null;
   private copyFlash: string | null = null;
+  /**
+   * Live generation throughput (tokens/sec) from stream deltas.
+   * Sliding ~2s window; ~4 chars ≈ 1 token.
+   */
+  private tpsWindow: { t: number; tokens: number }[] = [];
+  private tpsCurrent = 0;
+  private tpsSampleStartedAt = 0;
 
   constructor(opts: RendererOptions = {}) {
     this.opts = opts;
@@ -197,8 +204,66 @@ export class TuiRenderer {
     }
   }
 
-  setState(state: HarnessState, _event?: HarnessEvent): void {
+  setState(state: HarnessState, event?: HarnessEvent): void {
     this.state = state;
+    if (event) this.noteThroughput(event);
+  }
+
+  /**
+   * Estimate live tokens/sec from stream deltas so the status bar can show
+   * `120k / 60t` while the model is generating.
+   */
+  private noteThroughput(event: HarnessEvent): void {
+    const now = Date.now();
+
+    if (event.type === "phase") {
+      if (event.phase === "streaming" || event.phase === "thinking") {
+        this.tpsWindow = [];
+        this.tpsSampleStartedAt = now;
+        this.tpsCurrent = 0;
+      } else if (event.phase === "idle" || event.phase === "error") {
+        this.tpsSampleStartedAt = 0;
+        this.tpsCurrent = 0;
+        this.tpsWindow = [];
+      }
+      return;
+    }
+
+    if (event.type === "text.delta" || event.type === "reasoning.delta") {
+      const chars = event.delta?.length ?? 0;
+      if (chars <= 0) return;
+      // ~4 chars per token (common English estimate for live rate)
+      const tokens = chars / 4;
+      if (!this.tpsSampleStartedAt) this.tpsSampleStartedAt = now;
+      this.tpsWindow.push({ t: now, tokens });
+      const cutoff = now - 2000;
+      while (this.tpsWindow.length && this.tpsWindow[0]!.t < cutoff) {
+        this.tpsWindow.shift();
+      }
+      const first = this.tpsWindow[0];
+      const last = this.tpsWindow[this.tpsWindow.length - 1];
+      const spanMs = Math.max(200, (last?.t ?? now) - (first?.t ?? now));
+      const sum = this.tpsWindow.reduce((a, s) => a + s.tokens, 0);
+      this.tpsCurrent = (sum / spanMs) * 1000;
+      return;
+    }
+
+    if (event.type === "tokens" && event.output > 0 && this.tpsSampleStartedAt) {
+      const elapsed = Math.max(0.25, (now - this.tpsSampleStartedAt) / 1000);
+      this.tpsCurrent = Math.max(this.tpsCurrent, event.output / elapsed);
+    }
+  }
+
+  /** Current tokens/sec for the status bar (0 when idle / cold). */
+  private getTokensPerSec(): number {
+    if (this.tpsCurrent <= 0) return 0;
+    const state = this.state;
+    if (state && state.phase !== "idle" && state.phase !== "error") {
+      const last = this.tpsWindow[this.tpsWindow.length - 1];
+      if (last && Date.now() - last.t > 3000) return 0;
+      return this.tpsCurrent;
+    }
+    return 0;
   }
 
   /**
@@ -1406,6 +1471,7 @@ export class TuiRenderer {
         scroll: sp,
         completeOpen: this.completeOpen && !this.picker && !this.modal,
         pickerOpen: Boolean(this.picker || this.modal),
+        tokensPerSec: this.getTokensPerSec(),
       }),
       contentWidth,
     );

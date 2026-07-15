@@ -117,7 +117,13 @@ export function renderStatus(
   width: number,
   tick: number,
   focus: "prompt" | "scrollback",
-  extra?: { scroll?: string; completeOpen?: boolean; pickerOpen?: boolean },
+  extra?: {
+    scroll?: string;
+    completeOpen?: boolean;
+    pickerOpen?: boolean;
+    /** Live generation rate (tokens / second) */
+    tokensPerSec?: number;
+  },
 ): Row {
   const phase = state.phase;
   let phaseText: string;
@@ -137,7 +143,10 @@ export function renderStatus(
   }
 
   const mode = reasoningModeDisplay(state);
-  const tokens = `${state.tokens.input + state.tokens.output} tok`;
+  const tokens = formatTokenStatus(
+    state.tokens.input + state.tokens.output,
+    extra?.tokensPerSec,
+  );
   const focusHint = focus === "prompt" ? "PROMPT" : "SCROLL";
   const scroll = extra?.scroll ? `  |  ${extra.scroll}` : "";
   const keys = extra?.pickerOpen
@@ -267,6 +276,41 @@ function statusEffortLabel(effort: string): string {
       // Title-case unknown tokens
       return effort.charAt(0).toUpperCase() + effort.slice(1);
   }
+}
+
+/**
+ * Compact count: 850 → "850", 1200 → "1.2k", 120000 → "120k".
+ */
+export function formatCompactCount(n: number): string {
+  const v = Math.max(0, Math.round(Number.isFinite(n) ? n : 0));
+  if (v < 1000) return String(v);
+  if (v < 10_000) {
+    const s = (v / 1000).toFixed(1);
+    return `${s.endsWith(".0") ? s.slice(0, -2) : s}k`;
+  }
+  if (v < 1_000_000) return `${Math.round(v / 1000)}k`;
+  if (v < 10_000_000) {
+    const s = (v / 1_000_000).toFixed(1);
+    return `${s.endsWith(".0") ? s.slice(0, -2) : s}M`;
+  }
+  return `${Math.round(v / 1_000_000)}M`;
+}
+
+/**
+ * Status-bar token label: `120k / 60t` (total · current tokens/sec).
+ * When rate is 0 / unknown, just the compact total.
+ */
+export function formatTokenStatus(
+  totalTokens: number,
+  tokensPerSec?: number,
+): string {
+  const total = formatCompactCount(totalTokens);
+  const rate =
+    tokensPerSec != null && Number.isFinite(tokensPerSec) && tokensPerSec > 0
+      ? Math.round(tokensPerSec)
+      : 0;
+  if (rate <= 0) return total;
+  return `${total} / ${rate}t`;
 }
 
 /**
