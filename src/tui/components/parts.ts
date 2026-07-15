@@ -16,6 +16,39 @@ import type {
   TextPart,
   ToolPart,
 } from "../../core/types.js";
+import { wrapStreamPlain } from "../stream-layout.js";
+
+/**
+ * Cache of fully materialised streaming body rows (borders + styles).
+ * Invalidated only when content length / width / theme role changes —
+ * tick-only paints (spinner) reuse the body so large traces don't re-layout.
+ * On append, finished lines are kept and only the open tail is rewritten.
+ */
+const streamBodyCache = new Map<
+  string,
+  {
+    width: number;
+    contentLen: number;
+    finishedLineCount: number;
+    kind: "text" | "reasoning";
+    themeKey: string;
+    /** Finished lines only (no open/caret row). */
+    finished: Row[];
+    /** Full body including open + caret — stable between content changes. */
+    body: Row[];
+    /**
+     * Stable [header, ...body] pack for reasoning — mutated in place so
+     * tick-only paints don't allocate a thousands-long spread array.
+     */
+    packed?: Row[];
+    /** Last spinner tick written into packed[0] */
+    packedTick?: number;
+  }
+>();
+
+export function clearStreamBodyCache(): void {
+  streamBodyCache.clear();
+}
 
 /** Click / keyboard target for collapsible rows (reasoning, tools, diffs). */
 export interface RowHit {
@@ -90,69 +123,112 @@ function segsToRows(lines: RenderLine[]): Row[] {
 
 function renderText(part: TextPart, theme: Theme, width: number): Row[] {
   // Streaming: plain wrap only — full markdown (with auto code fences) once finished.
-  const rows = part.streaming
-    ? wrapPlainRows(part.content, theme.fg, width)
-    : segsToRows(renderMarkdown(part.content, theme, width));
-  if (part.streaming) {
-    if (rows.length === 0) {
-      rows.push({
-        segments: [{ text: "│", style: { fg: theme.accentAssistant } }],
-      });
-    } else {
-      const last = rows[rows.length - 1]!;
-      last.segments = [
-        ...last.segments,
-        { text: "│", style: { fg: theme.accentAssistant } },
-      ];
-    }
+  if (!part.streaming) {
+    return segsToRows(renderMarkdown(part.content, theme, width));
   }
-  return rows;
+  return streamingTextRows(part, theme, width);
 }
 
-/** Fast word/line wrap without markdown — used while tokens stream in. */
-function wrapPlainRows(
-  content: string,
-  fg: Theme["fg"],
+function streamingTextRows(
+  part: TextPart,
+  theme: Theme,
   width: number,
 ): Row[] {
-  if (!content) return [];
-  const rows: Row[] = [];
-  const lines = content.replace(/\r\n/g, "\n").split("\n");
-  for (const line of lines) {
-    if (!line) {
-      rows.push({ segments: [] });
-      continue;
-    }
-    let col = 0;
-    let buf = "";
-    const flush = () => {
-      if (buf) {
-        rows.push({ segments: [{ text: buf, style: { fg } }] });
-        buf = "";
-        col = 0;
-      } else if (rows.length === 0) {
-        rows.push({ segments: [] });
-      }
-    };
-    for (let i = 0; i < line.length; ) {
-      const code = line.codePointAt(i)!;
-      const ch = String.fromCodePoint(code);
-      i += code > 0xffff ? 2 : 1;
-      const w = stringWidth(ch);
-      if (w <= 0) continue;
-      if (col + w > width && buf) {
-        rows.push({ segments: [{ text: buf, style: { fg } }] });
-        buf = ch;
-        col = w;
-      } else {
-        buf += ch;
-        col += w;
-      }
-    }
-    if (buf) rows.push({ segments: [{ text: buf, style: { fg } }] });
-    else flush();
+  const themeKey = theme.name;
+  const hit = streamBodyCache.get(part.id);
+  if (
+    hit &&
+    hit.kind === "text" &&
+    hit.width === width &&
+    hit.contentLen === part.content.length &&
+    hit.themeKey === themeKey
+  ) {
+    return hit.body;
   }
-  return rows;
+
+  const { lines, open } = wrapStreamPlain(part.id, part.content, width);
+  const fg = theme.fg;
+  const caretStyle = { fg: theme.accentAssistant };
+
+  let finished = hit?.kind === "text" &&
+    hit.width === width &&
+    hit.themeKey === themeKey &&
+    hit.contentLen <= part.content.length
+    ? hit.finished
+    : [];
+  let finishedLineCount =
+    hit?.kind === "text" &&
+    hit.width === width &&
+    hit.themeKey === themeKey &&
+    hit.contentLen <= part.content.length
+      ? hit.finishedLineCount
+      : 0;
+
+  // Append only newly completed visual lines
+  if (finishedLineCount > lines.length) {
+    finished = [];
+    finishedLineCount = 0;
+  }
+  // How many finished slots body already holds from the previous frame.
+  // Captured before we grow finishedLineCount so the body copy stays O(delta).
+  const prevFinishedLineCount = finishedLineCount;
+  for (let i = finishedLineCount; i < lines.length; i++) {
+    const line = lines[i]!;
+    finished.push({
+      segments: line ? [{ text: line, style: { fg } }] : [],
+    });
+  }
+  finishedLineCount = lines.length;
+  if (finished.length > finishedLineCount) {
+    finished.length = finishedLineCount;
+  }
+
+  // Mutate a stable body array: finished refs + one open/caret row.
+  // Only assign newly finished indices. Re-sync one prior slot so a
+  // caret-on-last-finished overlay from the previous frame is restored
+  // to the plain finished row before we write the new open/caret tail.
+  const body = hit?.kind === "text" && hit.body ? hit.body : [];
+  const copyFrom =
+    body.length === 0 || prevFinishedLineCount <= 0
+      ? 0
+      : prevFinishedLineCount - 1;
+  for (let i = copyFrom; i < finishedLineCount; i++) {
+    body[i] = finished[i]!;
+  }
+  const openRow: Row = open
+    ? {
+        segments: [
+          { text: open, style: { fg } },
+          { text: "│", style: caretStyle },
+        ],
+      }
+    : finishedLineCount === 0
+      ? { segments: [{ text: "│", style: caretStyle }] }
+      : {
+          segments: [
+            ...finished[finishedLineCount - 1]!.segments,
+            { text: "│", style: caretStyle },
+          ],
+        };
+  if (open || finishedLineCount === 0) {
+    body[finishedLineCount] = openRow;
+    body.length = finishedLineCount + 1;
+  } else {
+    // Caret lives on a copy of the last finished line
+    body[finishedLineCount - 1] = openRow;
+    body.length = finishedLineCount;
+  }
+
+  streamBodyCache.set(part.id, {
+    width,
+    contentLen: part.content.length,
+    finishedLineCount,
+    kind: "text",
+    themeKey,
+    finished,
+    body,
+  });
+  return body;
 }
 
 function renderReasoning(
@@ -162,7 +238,6 @@ function renderReasoning(
   tick: number,
   messageId?: string,
 ): Row[] {
-  const rows: Row[] = [];
   const collapsed = isReasoningCollapsed(part);
   // OpenCode-style chevron: collapsed ▶ / expanded ▼ (ASCII fallback)
   const chevron = part.streaming
@@ -187,7 +262,7 @@ function renderReasoning(
       ? { action: "toggle-collapse", messageId, partId: part.id }
       : undefined;
 
-  rows.push({
+  const header: Row = {
     segments: [
       { text: `${chevron} `, style: { fg: theme.thinking, bold: true } },
       {
@@ -200,35 +275,17 @@ function renderReasoning(
       },
     ],
     hit,
-  });
+  };
 
-  if (collapsed) return rows;
+  if (collapsed) return [header];
 
   const bodyWidth = Math.max(1, width - 2);
-  // Streaming thoughts: plain wrap; finished: markdown
+  // Streaming thoughts: incremental plain wrap; finished: markdown
   if (part.streaming) {
-    const plain = wrapPlainRows(part.content || "...", theme.fgMuted, bodyWidth);
-    for (const line of plain) {
-      rows.push({
-        segments: [
-          { text: "| ", style: { fg: theme.border } },
-          ...line.segments.map((s) => ({
-            text: s.text,
-            style: { ...s.style, italic: true },
-          })),
-        ],
-      });
-    }
-    const last = rows[rows.length - 1];
-    if (last) {
-      last.segments.push({
-        text: "|",
-        style: { fg: theme.thinking },
-      });
-    }
-    return rows;
+    return streamingReasoningPacked(part, theme, bodyWidth, header, tick);
   }
 
+  const rows: Row[] = [header];
   const body = renderMarkdown(part.content || "...", theme, bodyWidth);
   for (const line of body) {
     rows.push({
@@ -242,6 +299,161 @@ function renderReasoning(
     });
   }
   return rows;
+}
+
+/**
+ * Pack header + body into a stable array. Tick-only updates rewrite
+ * packed[0] without spreading thousands of body rows.
+ */
+function streamingReasoningPacked(
+  part: ReasoningPart,
+  theme: Theme,
+  bodyWidth: number,
+  header: Row,
+  tick: number,
+): Row[] {
+  const body = streamingReasoningBody(part, theme, bodyWidth);
+  const cached = streamBodyCache.get(part.id);
+  const packed = cached?.packed ?? [];
+  const prevBodySlots = Math.max(0, packed.length - 1);
+  packed[0] = header;
+  // Body is mutated in place; unchanged finished slots keep the same row
+  // refs. Only re-sync from the previous tail (caret/open may have moved)
+  // through the new end — O(delta) instead of O(n) per content frame.
+  // Full resync when packed is empty, body shrank, or body[0] was rebuilt
+  // (theme/width invalidation replaces finished row objects).
+  const needsFullSync =
+    body.length > 0 &&
+    (packed.length <= 1 ||
+      body.length < prevBodySlots ||
+      packed[1] !== body[0]);
+  const syncFrom = needsFullSync ? 0 : Math.max(0, prevBodySlots - 1);
+  for (let i = syncFrom; i < body.length; i++) {
+    packed[i + 1] = body[i]!;
+  }
+  packed.length = body.length + 1;
+  if (cached) {
+    cached.packed = packed;
+    cached.packedTick = tick;
+  }
+  return packed;
+}
+
+/**
+ * Incremental layout for live reasoning traces. Body rows are cached by
+ * content length so spinner/tick paints don't re-walk 100k+ chars, and
+ * finished visual lines are only materialised once as the stream grows.
+ */
+function streamingReasoningBody(
+  part: ReasoningPart,
+  theme: Theme,
+  bodyWidth: number,
+): Row[] {
+  const themeKey = theme.name;
+  const cached = streamBodyCache.get(part.id);
+  if (
+    cached &&
+    cached.kind === "reasoning" &&
+    cached.width === bodyWidth &&
+    cached.contentLen === part.content.length &&
+    cached.themeKey === themeKey
+  ) {
+    return cached.body;
+  }
+
+  const source = part.content || "...";
+  const { lines, open } = wrapStreamPlain(part.id, source, bodyWidth);
+  const fg = theme.fgMuted;
+  const border = theme.border;
+  const caret = { text: "|", style: { fg: theme.thinking } };
+
+  let finished =
+    cached?.kind === "reasoning" &&
+    cached.width === bodyWidth &&
+    cached.themeKey === themeKey &&
+    cached.contentLen <= part.content.length
+      ? cached.finished
+      : [];
+  let finishedLineCount =
+    cached?.kind === "reasoning" &&
+    cached.width === bodyWidth &&
+    cached.themeKey === themeKey &&
+    cached.contentLen <= part.content.length
+      ? cached.finishedLineCount
+      : 0;
+
+  if (finishedLineCount > lines.length) {
+    finished = [];
+    finishedLineCount = 0;
+  }
+  // How many finished slots body already holds from the previous frame.
+  // Captured before we grow finishedLineCount so the body copy stays O(delta).
+  const prevFinishedLineCount = finishedLineCount;
+  for (let i = finishedLineCount; i < lines.length; i++) {
+    finished.push({
+      segments: [
+        { text: "| ", style: { fg: border } },
+        { text: lines[i]!, style: { fg, italic: true } },
+      ],
+    });
+  }
+  finishedLineCount = lines.length;
+  if (finished.length > finishedLineCount) {
+    finished.length = finishedLineCount;
+  }
+
+  // Reuse cached body; only write new finished rows (+ one prior slot to
+  // clear a caret-on-last-finished overlay from the previous frame).
+  // finished[] grows by push only and never mutates earlier entries, so
+  // body[0..prev-1] already point at the correct finished refs.
+  const body =
+    cached?.kind === "reasoning" && cached.body ? cached.body : [];
+  const copyFrom =
+    body.length === 0 || prevFinishedLineCount <= 0
+      ? 0
+      : prevFinishedLineCount - 1;
+  for (let i = copyFrom; i < finishedLineCount; i++) {
+    body[i] = finished[i]!;
+  }
+
+  if (open) {
+    body[finishedLineCount] = {
+      segments: [
+        { text: "| ", style: { fg: border } },
+        { text: open, style: { fg, italic: true } },
+        caret,
+      ],
+    };
+    body.length = finishedLineCount + 1;
+  } else if (finishedLineCount > 0) {
+    const last = finished[finishedLineCount - 1]!;
+    body[finishedLineCount - 1] = {
+      segments: [...last.segments, caret],
+    };
+    body.length = finishedLineCount;
+  } else {
+    body[0] = {
+      segments: [
+        { text: "| ", style: { fg: border } },
+        { text: "...", style: { fg, italic: true } },
+        caret,
+      ],
+    };
+    body.length = 1;
+  }
+
+  streamBodyCache.set(part.id, {
+    width: bodyWidth,
+    contentLen: part.content.length,
+    finishedLineCount,
+    kind: "reasoning",
+    themeKey,
+    finished,
+    body,
+    packed: cached?.packed,
+    packedTick: cached?.packedTick,
+  });
+  return body;
 }
 
 function formatSizeHint(content: string): string {

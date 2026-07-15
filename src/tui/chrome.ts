@@ -79,6 +79,8 @@ export function renderHeader(
  * Top-right plain models: `xai/grok-4.5 / tencent/hy3:free`
  * No effort/mode rainbow text.
  */
+let modelsLabelCache: { key: string; value: string } | null = null;
+
 function formatMainPeerModels(state: HarnessState): string {
   const main = formatModelLabel(
     state.session.provider,
@@ -86,21 +88,30 @@ function formatMainPeerModels(state: HarnessState): string {
   );
   try {
     const cfg = loadAgentSettings();
+    const peerKey =
+      cfg.reasoning.custom === "ultra-fusion"
+        ? (cfg.reasoning.fusion.modelKeys[0] ?? "")
+        : "";
+    const cacheKey = `${main}|${cfg.reasoning.custom}|${peerKey}`;
+    if (modelsLabelCache?.key === cacheKey) return modelsLabelCache.value;
+
+    let value = main;
     if (cfg.reasoning.custom === "ultra-fusion") {
-      const peerKey = cfg.reasoning.fusion.modelKeys[0];
       if (peerKey) {
         const ref = parseModelKey(peerKey);
         const peer = ref
           ? formatModelLabel(ref.provider, ref.model)
           : peerKey;
-        return `${main} / ${peer}`;
+        value = `${main} / ${peer}`;
+      } else {
+        value = `${main} / peer:auto`;
       }
-      return `${main} / peer:auto`;
     }
+    modelsLabelCache = { key: cacheKey, value };
+    return value;
   } catch {
-    /* ignore */
+    return main;
   }
-  return main;
 }
 
 /** xai + grok-4.5 → xai/grok-4.5 ; openrouter + tencent/hy3 → tencent/hy3 */
@@ -123,6 +134,8 @@ export function renderStatus(
     pickerOpen?: boolean;
     /** Live generation rate (tokens / second) */
     tokensPerSec?: number;
+    /** Realised paint frames / second while agent is busy */
+    framesPerSec?: number;
   },
 ): Row {
   const phase = state.phase;
@@ -146,6 +159,7 @@ export function renderStatus(
   const tokens = formatTokenStatus(
     state.tokens.input + state.tokens.output,
     extra?.tokensPerSec,
+    extra?.framesPerSec,
   );
   const focusHint = focus === "prompt" ? "PROMPT" : "SCROLL";
   const scroll = extra?.scroll ? `  |  ${extra.scroll}` : "";
@@ -213,6 +227,12 @@ export interface ReasoningModeDisplay {
   kind: ReasoningModeKind;
 }
 
+/** Cached mode label — key includes config fingerprint so saves invalidate. */
+let modeDisplayCache: {
+  key: string;
+  value: ReasoningModeDisplay | null;
+} | null = null;
+
 /**
  * Bottom-right label for the active reasoning mode.
  * Ultra / Ultra + Fusion take priority over native effort.
@@ -223,31 +243,43 @@ export function reasoningModeDisplay(
   state: HarnessState,
 ): ReasoningModeDisplay | null {
   try {
-    const cfg = loadAgentSettings();
-    const custom = cfg.reasoning.custom;
-    if (custom === "ultra-fusion") {
-      return { label: "Ultra + Fusion", kind: "ultra-fusion" };
-    }
-    if (custom === "ultra") {
-      return { label: "Ultra", kind: "ultra" };
-    }
-
+    const cfg = loadAgentSettings(); // memory-cached
     const provider = state.session.provider;
     const model = state.session.model;
-    let effort: string;
-    if (
-      provider &&
-      provider !== "none" &&
-      model &&
-      model !== "unset"
-    ) {
-      effort = getEffortForModel(provider as ProviderId, model);
-    } else {
-      effort = cfg.reasoning.effort ?? "default";
+    const per =
+      cfg.reasoning.perModelEffort?.[`${provider}/${model}`] ??
+      cfg.reasoning.perModelEffort?.[model] ??
+      "";
+    const cacheKey = `${provider}|${model}|${cfg.reasoning.custom}|${cfg.reasoning.effort}|${per}`;
+    if (modeDisplayCache && modeDisplayCache.key === cacheKey) {
+      return modeDisplayCache.value;
     }
 
-    if (!effort || effort === "default") return null;
-    return { label: statusEffortLabel(effort), kind: effort };
+    const custom = cfg.reasoning.custom;
+    let value: ReasoningModeDisplay | null = null;
+    if (custom === "ultra-fusion") {
+      value = { label: "Ultra + Fusion", kind: "ultra-fusion" };
+    } else if (custom === "ultra") {
+      value = { label: "Ultra", kind: "ultra" };
+    } else {
+      let effort: string;
+      if (
+        provider &&
+        provider !== "none" &&
+        model &&
+        model !== "unset"
+      ) {
+        effort = getEffortForModel(provider as ProviderId, model);
+      } else {
+        effort = cfg.reasoning.effort ?? "default";
+      }
+
+      if (effort && effort !== "default") {
+        value = { label: statusEffortLabel(effort), kind: effort };
+      }
+    }
+    modeDisplayCache = { key: cacheKey, value };
+    return value;
   } catch {
     return null;
   }
@@ -297,20 +329,27 @@ export function formatCompactCount(n: number): string {
 }
 
 /**
- * Status-bar token label: `120k / 60t` (total · current tokens/sec).
- * When rate is 0 / unknown, just the compact total.
+ * Status-bar token label: `120k / 60t / 28f` (total · tokens/sec · paint fps).
+ * When rate is 0 / unknown, just the compact total. FPS only when provided.
  */
 export function formatTokenStatus(
   totalTokens: number,
   tokensPerSec?: number,
+  framesPerSec?: number,
 ): string {
   const total = formatCompactCount(totalTokens);
   const rate =
     tokensPerSec != null && Number.isFinite(tokensPerSec) && tokensPerSec > 0
       ? Math.round(tokensPerSec)
       : 0;
-  if (rate <= 0) return total;
-  return `${total} / ${rate}t`;
+  const fps =
+    framesPerSec != null && Number.isFinite(framesPerSec) && framesPerSec > 0
+      ? Math.round(framesPerSec)
+      : 0;
+  if (rate <= 0 && fps <= 0) return total;
+  if (rate > 0 && fps > 0) return `${total} / ${rate}t / ${fps}f`;
+  if (rate > 0) return `${total} / ${rate}t`;
+  return `${total} / ${fps}f`;
 }
 
 /**

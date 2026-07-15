@@ -74,6 +74,34 @@ import {
 import { prepareFusionForMain } from "./agent/fusion.js";
 import { buildSystemPrompt } from "./agent/loop.js";
 import { initDebug, dbg } from "./agent/debug.js";
+import {
+  buildSelfReviewSystemAddon,
+  buildSelfReviewUserPrompt,
+  collectSelfReviewSessionContext,
+  createSelfReviewBackup,
+  frictionOneLiner,
+  listSelfReviewBackups,
+  resolveLibraRoot,
+  restoreSelfReviewBackup,
+} from "./agent/self-review.js";
+import {
+  createHandoff,
+  installRelaunchSupervisor,
+  readLastRelaunchNotice,
+  signalRelaunch,
+  spawnRelaunchSupervisor,
+  type SelfReviewHandoff,
+} from "./agent/self-review-handoff.js";
+import {
+  createSessionAutosave,
+  getSessionsDir,
+  listSessionLibes,
+  loadSessionLibe,
+  resolveResumeTarget,
+  saveSessionLibe,
+  sessionLibePath,
+} from "./memory/session-store.js";
+import { getVersion } from "./version.js";
 
 /**
  * Guards handleUserSubmit against re-entrancy. AgentLoop.busy only kicks
@@ -93,6 +121,9 @@ let submissionInFlight = false;
  */
 let fusionPrepAbort: AbortController | null = null;
 
+/** Live `.libe` session autosave (set in main). */
+let sessionAutosave: ReturnType<typeof createSessionAutosave> | null = null;
+
 async function main(): Promise<void> {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
     const { getVersion } = await import("./version.js");
@@ -106,9 +137,11 @@ Usage:
   libra [options]
 
 Options:
-  --theme=<name>   Theme (libra-night, tokyo-night, …)
-  --version, -v    Print version
-  --help, -h       Show this help
+  --theme=<name>     Theme (libra-night, tokyo-night, …)
+  --resume=<id|path> Resume a .libe session (id, path, or latest)
+  --notice=<text>    Status notice after relaunch (self-review)
+  --version, -v      Print version
+  --help, -h         Show this help
 
 Environment:
   LIBRA_THEME      Default theme
@@ -132,6 +165,12 @@ After install:  bun run link   (from the libra repo)
     cfg.theme ??
     "libra-night";
   const font = process.env.LIBRA_FONT ?? cfg.font ?? "default";
+  const resumeArg = process.argv
+    .find((a) => a.startsWith("--resume="))
+    ?.slice("--resume=".length);
+  const noticeArg = process.argv
+    .find((a) => a.startsWith("--notice="))
+    ?.slice("--notice=".length);
 
   const store = new HarnessStore({
     title: "demo session",
@@ -143,6 +182,56 @@ After install:  bun run link   (from the libra repo)
     model: cfg.model,
     provider: cfg.provider,
     reasoning: loadAgentSettings().reasoning.custom,
+    resume: resumeArg ?? null,
+  });
+
+  // Resume prior .libe session (self-review relaunch path)
+  if (resumeArg) {
+    const path = resolveResumeTarget(decodeURIComponent(resumeArg));
+    if (path) {
+      const libe = loadSessionLibe(path);
+      if (libe) {
+        store.resetWithSeed(
+          {
+            ...libe.session,
+            id: libe.session.id,
+            // Keep user cwd as current launch cwd when set
+            cwd: process.cwd() || libe.session.cwd,
+          },
+          libe.messages,
+        );
+        if (libe.tokens) {
+          store.addTokens(libe.tokens.input || 0, libe.tokens.output || 0);
+        }
+        // Prefer model from session if config empty
+        if (
+          (!cfg.model || cfg.model === "unset") &&
+          libe.session.model &&
+          libe.session.model !== "unset"
+        ) {
+          store.patchSession({
+            model: libe.session.model,
+            provider: libe.session.provider,
+          });
+        }
+        dbg("cli", "session_resumed", {
+          id: libe.session.id,
+          messages: libe.messages.length,
+          path,
+        });
+      }
+    } else {
+      dbg("cli", "resume_miss", { resumeArg });
+    }
+  }
+
+  // Persist full transcripts as ~/.libra/sessions/<id>.libe for self-review
+  sessionAutosave = createSessionAutosave(() => store.state, {
+    libraVersion: getVersion(),
+    debounceMs: 700,
+  });
+  store.subscribe(() => {
+    sessionAutosave?.onEvent();
   });
 
   const mockAgent = new MockAgent(store);
@@ -162,6 +251,8 @@ After install:  bun run link   (from the libra repo)
       mockAgent.cancel();
       liveAgent.cancel();
       fusionPrepAbort?.abort();
+      sessionAutosave?.dispose();
+      sessionAutosave = null;
     },
     // OpenCode-style: click reasoning / tool headers to expand or collapse
     onTogglePart: (messageId, partId) => {
@@ -178,8 +269,31 @@ After install:  bun run link   (from the libra repo)
   // Quiet start — no welcome wall of text
   ui.setState(store.state);
 
+  // Surface self-review relaunch / restore notice
+  const notice =
+    noticeArg?.trim() ||
+    readLastRelaunchNotice()?.notice ||
+    (resumeArg ? "Session resumed." : "");
+  if (notice.trim()) {
+    const last = readLastRelaunchNotice();
+    store.appendMessage({
+      id: newId("m"),
+      role: "system",
+      createdAt: Date.now(),
+      parts: [
+        {
+          id: newId("p"),
+          type: "status",
+          level: last?.restored ? "warn" : "success",
+          message: notice.trim(),
+        },
+      ],
+    });
+  }
+
   const shutdown = () => {
     ui.stop();
+    sessionAutosave?.dispose();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -254,6 +368,9 @@ function handleCommand(
               "- `/login [provider]` — OAuth (xAI SuperGrok PKCE) or API keys; multi-login OK\n" +
               "- `/model` — pick any model from **all** connected providers (fetched live)\n" +
               "- `/reasoning` — official model effort modes + ultra / ultra-fusion\n" +
+              "- `/self-review` — **backup Libra then self-upgrade** with your active model\n" +
+              "- `/self-review list` / `restore` — source snapshots under `~/.libra/self-review-backups`\n" +
+              "- Sessions auto-save as `~/.libra/sessions/*.libe` (friction mined on self-review)\n" +
               "- `/subagent` — subagent config\n" +
               "- `/verify [provider]` — live model list proves the key\n" +
               "- `/theme` `/font` `/whoami` `/logout`\n" +
@@ -262,7 +379,13 @@ function handleCommand(
               "### Reasoning\n\n" +
               "Effort levels are **per model** (from the provider catalog). Esc goes **back** in nested pickers.\n\n" +
               "- **ultra** — max effort + Codex multi-agent (spawn/wait, proactive)\n" +
-              "- **ultra-fusion** — peer reasons; main compares, then multi-agent execute",
+              "- **ultra-fusion** — peer reasons; main compares, then multi-agent execute\n\n" +
+              "### Self-review\n\n" +
+              "Uses **your current model**. Always snapshots sources + `.libe` session first. " +
+              "After the agent finishes, an **external supervisor** verifies the build, " +
+              "**auto-restores the source backup** if typecheck/build/open fails, then " +
+              "**relaunches Libra into the same session**. " +
+              "`/self-review go` skips confirm; `/self-review restore <id>` rolls back code only.",
           },
         ],
       });
@@ -503,11 +626,27 @@ function handleCommand(
       });
       break;
 
+    case "self-review":
+    case "selfreview":
+    case "self-upgrade":
+    case "upgrade-self":
+    case "evolve":
+      void handleSelfReviewCommand(
+        store,
+        ui,
+        liveAgent,
+        args.trim(),
+      );
+      break;
+
     case "clear":
     case "new":
       agent.cancel();
       liveAgent?.cancel();
       fusionPrepAbort?.abort();
+      // Flush current transcript before wiping the UI session
+      sessionAutosave?.flush();
+      saveSessionLibe(store.state, { libraVersion: getVersion() });
       store.reset({
         title: "demo session",
         model: store.state.session.model,
@@ -938,6 +1077,8 @@ function openReasoningPicker(
       const opts = effortPickerOptions(provider, model);
       const hit = opts.find((o) => o.value === arg);
       if (hit) {
+        // Native effort selection leaves the Ultra / Ultra+Fusion harness profile
+        clearHarnessReasoningProfile();
         setEffortForModel(
           provider,
           model,
@@ -951,7 +1092,7 @@ function openReasoningPicker(
       }
       notify(
         store,
-        `"${arg}" not supported by ${model}. Supported: ${opts.map((o) => o.value).join(", ")}`,
+        `"${arg}" not supported by ${model}. Supported: ${opts.map((o) => o.value).join(", ")}, none, ultra, ultra-fusion`,
         "warn",
       );
       return;
@@ -1047,9 +1188,8 @@ async function openEffortModesPicker(
     }
   }
 
-  // ultra / ultra-fusion (not API effort levels)
+  // Harness profiles: None (leave Ultra), Ultra, Ultra + Fusion
   for (const o of CUSTOM_REASONING_OPTIONS) {
-    if (o.value === "none") continue;
     options.push({
       value: `custom:${o.value}`,
       label: o.label,
@@ -1057,10 +1197,13 @@ async function openEffortModesPicker(
     });
   }
 
+  // Highlight active harness profile when set; otherwise native effort
   const currentKey =
-    current && current !== "default"
-      ? `effort:${current}`
-      : "effort:default";
+    cur.reasoning.custom !== "none"
+      ? `custom:${cur.reasoning.custom}`
+      : current && current !== "default"
+        ? `effort:${current}`
+        : "effort:default";
 
   const effortList =
     caps?.efforts?.length
@@ -1108,6 +1251,8 @@ async function openEffortModesPicker(
           );
           return;
         }
+        // Picking a native effort exits Ultra / Ultra+Fusion so the bar updates
+        clearHarnessReasoningProfile();
         setEffortForModel(provider, model, e);
         toast(
           store,
@@ -1125,11 +1270,39 @@ async function openEffortModesPicker(
   });
 }
 
+/**
+ * Drop Libra harness profile (ultra / ultra-fusion) so native effort is
+ * what the status bar and turn path use. Does not change per-model effort.
+ */
+function clearHarnessReasoningProfile(): void {
+  const a = loadAgentSettings();
+  if (a.reasoning.custom === "none") return;
+  saveAgentSettings({
+    reasoning: {
+      ...a.reasoning,
+      custom: "none",
+    },
+    subagents: {
+      ...a.subagents,
+      autoSpawn: false,
+    },
+  });
+}
+
 function applyCustomReasoning(
   store: HarnessStore,
   ui: TuiRenderer,
   mode: CustomReasoningMode,
 ): void {
+  if (mode === "none") {
+    const a = loadAgentSettings();
+    saveAgentSettings({
+      reasoning: { ...a.reasoning, custom: "none" },
+      subagents: { ...a.subagents, autoSpawn: false },
+    });
+    notify(store, "harness mode → none (native effort only)");
+    return;
+  }
   saveAgentSettings({ reasoning: { custom: mode } });
   if (mode === "ultra" || mode === "ultra-fusion") {
     void activateUltraNative(store, mode).then(() => {
@@ -1413,6 +1586,575 @@ async function openFusionPeerPicker(
       openFusionConfig(store, ui);
     },
   });
+}
+
+// ── self-review / self-upgrade ────────────────────────
+
+async function handleSelfReviewCommand(
+  store: HarnessStore,
+  ui: TuiRenderer,
+  liveAgent: AgentLoop | undefined,
+  rawArgs: string,
+): Promise<void> {
+  const args = rawArgs.trim();
+  const lower = args.toLowerCase();
+  const [head, ...rest] = args.split(/\s+/);
+  const headL = (head ?? "").toLowerCase();
+
+  if (!args || headL === "help" || headL === "?") {
+    ui.openPickerRoot({
+      title: "Self-review / self-upgrade",
+      options: [
+        {
+          value: "start",
+          label: "Start self-upgrade",
+          description: "Mine .libe sessions + backup sources + run model",
+        },
+        {
+          value: "go",
+          label: "Start now (no confirm)",
+          description: "Same as /self-review go",
+        },
+        {
+          value: "sessions",
+          label: "Recent sessions",
+          description: "~/.libra/sessions/*.libe + friction",
+        },
+        {
+          value: "list",
+          label: "List source backups",
+          description: "~/.libra/self-review-backups",
+        },
+        {
+          value: "restore",
+          label: "Restore source backup…",
+          description: "Roll back code snapshot",
+        },
+        {
+          value: "status",
+          label: "Status",
+          description: "Root, sessions, friction, backups",
+        },
+      ],
+      onSelect: (v) => {
+        if (v === "start") {
+          void confirmAndRunSelfReview(store, ui, liveAgent);
+        } else if (v === "go") {
+          void runSelfReview(store, ui, liveAgent, {});
+        } else if (v === "sessions") {
+          showSelfReviewSessions(store);
+        } else if (v === "list") {
+          showSelfReviewBackups(store);
+        } else if (v === "restore") {
+          openSelfReviewRestorePicker(store, ui);
+        } else if (v === "status") {
+          showSelfReviewStatus(store);
+        }
+      },
+    });
+    return;
+  }
+
+  if (headL === "list" || headL === "backups") {
+    showSelfReviewBackups(store);
+    return;
+  }
+
+  if (headL === "sessions" || headL === "session" || headL === "friction") {
+    showSelfReviewSessions(store);
+    return;
+  }
+
+  if (headL === "status") {
+    showSelfReviewStatus(store);
+    return;
+  }
+
+  if (headL === "restore") {
+    const id = rest.join(" ").trim();
+    if (id) {
+      try {
+        const r = restoreSelfReviewBackup(id);
+        notify(
+          store,
+          `restored ${r.restored} files from ${r.id} → ${r.libraRoot}`,
+        );
+        store.appendMessage({
+          id: newId("m"),
+          role: "assistant",
+          createdAt: Date.now(),
+          parts: [
+            {
+              id: newId("p"),
+              type: "text",
+              content:
+                `### Self-review restore\n\n` +
+                `Restored **${r.restored}** files from \`${r.id}\`.\n` +
+                `Target: \`${r.libraRoot}\`\n\n` +
+                `A safety snapshot of the pre-restore tree was also saved. ` +
+                `Run \`bun install && bun run build\` if the binary is mid-flight.`,
+            },
+          ],
+        });
+      } catch (err) {
+        notify(
+          store,
+          err instanceof Error ? err.message : String(err),
+          "error",
+        );
+      }
+      return;
+    }
+    openSelfReviewRestorePicker(store, ui);
+    return;
+  }
+
+  // /self-review go [optional focus…]
+  if (headL === "go" || headL === "now" || headL === "start") {
+    const focus = rest.join(" ").trim() || undefined;
+    await runSelfReview(store, ui, liveAgent, { focus, skipConfirm: true });
+    return;
+  }
+
+  // Free-form focus text: /self-review fix windows shell
+  await confirmAndRunSelfReview(store, ui, liveAgent, args);
+}
+
+function showSelfReviewStatus(store: HarnessStore): void {
+  try {
+    const root = resolveLibraRoot();
+    const backups = listSelfReviewBackups();
+    const latest = backups[0];
+    const provider = store.state.session.provider;
+    const model = store.state.session.model;
+    // Flush live session so status includes this run
+    sessionAutosave?.flush();
+    const sessions = listSessionLibes(12);
+    const { friction } = collectSelfReviewSessionContext({ limit: 20 });
+    const frictionLine = frictionOneLiner(friction);
+    const sessionLines =
+      sessions.length === 0
+        ? "_No `.libe` sessions saved yet._"
+        : sessions
+            .slice(0, 8)
+            .map((s) => {
+              const e = s.summary
+                ? ` · err ${s.summary.toolErrors + s.summary.statusErrors}`
+                : "";
+              return `- \`${s.id}\` ${s.provider}/${s.model}${e} · ${s.savedAt}`;
+            })
+            .join("\n");
+
+    store.appendMessage({
+      id: newId("m"),
+      role: "assistant",
+      createdAt: Date.now(),
+      parts: [
+        {
+          id: newId("p"),
+          type: "text",
+          content:
+            `### Self-review status\n\n` +
+            `- **Install root:** \`${root}\`\n` +
+            `- **Active model:** \`${provider}/${model}\`\n` +
+            `- **Source backups:** ${backups.length}` +
+            (latest
+              ? ` (latest \`${latest.id}\` · ${latest.fileCount} files · ${latest.createdAt})`
+              : "") +
+            `\n` +
+            `- **Session dir:** \`${getSessionsDir()}\`\n` +
+            `- **Saved sessions:** ${sessions.length} (showing recent)\n` +
+            `- **Friction (recent):** ${frictionLine}\n\n` +
+            `#### Recent .libe sessions\n\n${sessionLines}\n\n` +
+            `Run \`/self-review\` to upgrade from this evidence, or \`/self-review restore\` to roll back source.`,
+        },
+      ],
+    });
+  } catch (err) {
+    notify(store, err instanceof Error ? err.message : String(err), "error");
+  }
+}
+
+function showSelfReviewSessions(store: HarnessStore): void {
+  sessionAutosave?.flush();
+  saveSessionLibe(store.state, { libraVersion: getVersion() });
+  const { friction, sessionListMarkdown } = collectSelfReviewSessionContext({
+    limit: 20,
+  });
+  store.appendMessage({
+    id: newId("m"),
+    role: "assistant",
+    createdAt: Date.now(),
+    parts: [
+      {
+        id: newId("p"),
+        type: "text",
+        content:
+          `### Recent sessions (.libe)\n\n` +
+          `Dir: \`${getSessionsDir()}\`\n\n` +
+          sessionListMarkdown +
+          `\n\n` +
+          friction.markdown +
+          `\n\nSelf-review will prioritize these signals: \`/self-review go\``,
+      },
+    ],
+  });
+}
+
+function showSelfReviewBackups(store: HarnessStore): void {
+  const backups = listSelfReviewBackups();
+  if (backups.length === 0) {
+    notify(store, "no self-review backups yet — run /self-review first", "info");
+    return;
+  }
+  const lines = backups.slice(0, 20).map((b, i) => {
+    const model =
+      b.provider && b.model ? ` · ${b.provider}/${b.model}` : "";
+    const focus = b.focus ? ` · focus: ${b.focus}` : "";
+    return `${i + 1}. \`${b.id}\` — ${b.fileCount} files${model}${focus}`;
+  });
+  store.appendMessage({
+    id: newId("m"),
+    role: "assistant",
+    createdAt: Date.now(),
+    parts: [
+      {
+        id: newId("p"),
+        type: "text",
+        content:
+          `### Self-review backups\n\n` +
+          lines.join("\n") +
+          `\n\nRestore: \`/self-review restore <id>\``,
+      },
+    ],
+  });
+}
+
+function openSelfReviewRestorePicker(
+  store: HarnessStore,
+  ui: TuiRenderer,
+): void {
+  const backups = listSelfReviewBackups();
+  if (backups.length === 0) {
+    notify(store, "no backups to restore", "warn");
+    return;
+  }
+  ui.openPickerRoot({
+    title: "Restore self-review backup",
+    options: backups.slice(0, 30).map((b) => ({
+      value: b.id,
+      label: b.id,
+      description: `${b.fileCount} files · ${b.model ?? "?"} · ${b.note ?? ""}`,
+    })),
+    onSelect: (id) => {
+      try {
+        const r = restoreSelfReviewBackup(id);
+        notify(store, `restored ${r.restored} files from ${r.id}`);
+        toast(store, `restored ${id}`);
+      } catch (err) {
+        notify(
+          store,
+          err instanceof Error ? err.message : String(err),
+          "error",
+        );
+      }
+    },
+  });
+}
+
+async function confirmAndRunSelfReview(
+  store: HarnessStore,
+  ui: TuiRenderer,
+  liveAgent: AgentLoop | undefined,
+  focus?: string,
+): Promise<void> {
+  const provider = store.state.session.provider as ProviderId;
+  const model = store.state.session.model;
+  let root: string;
+  try {
+    root = resolveLibraRoot();
+  } catch (err) {
+    notify(store, err instanceof Error ? err.message : String(err), "error");
+    return;
+  }
+
+  ui.openPickerRoot({
+    title: "Self-upgrade Libra?",
+    options: [
+      {
+        value: "yes",
+        label: "Backup + upgrade + relaunch",
+        description: `${provider}/${model} · auto-restore if relaunch fails`,
+      },
+      {
+        value: "no",
+        label: "Cancel",
+        description: "Do nothing",
+      },
+    ],
+    onSelect: (v) => {
+      if (v !== "yes") {
+        notify(store, "self-review cancelled");
+        return;
+      }
+      void runSelfReview(store, ui, liveAgent, { focus, skipConfirm: true });
+    },
+  });
+}
+
+/**
+ * Snapshot sources, mine .libe friction, run AgentLoop on Libra, then hand
+ * off to an **external** supervisor that verifies build and relaunches into
+ * this session (auto-restores source backup if open/build fails).
+ */
+async function runSelfReview(
+  store: HarnessStore,
+  ui: TuiRenderer,
+  liveAgent: AgentLoop | undefined,
+  opts: { focus?: string; skipConfirm?: boolean },
+): Promise<void> {
+  if (submissionInFlight || liveAgent?.isBusy) {
+    notify(store, "wait for the current turn to finish", "warn");
+    return;
+  }
+  if (!liveAgent) {
+    notify(store, "live agent unavailable", "error");
+    return;
+  }
+
+  const provider = store.state.session.provider as ProviderId;
+  const model = store.state.session.model;
+  const hasAuth =
+    Boolean(getProvider(provider) && resolveToken(provider)) &&
+    model &&
+    model !== "unset" &&
+    model !== "libra-mock" &&
+    model !== "libra-demo";
+
+  if (!hasAuth) {
+    notify(
+      store,
+      "self-review needs a logged-in model — /login then /model",
+      "warn",
+    );
+    return;
+  }
+
+  let libraRoot: string;
+  try {
+    libraRoot = resolveLibraRoot();
+  } catch (err) {
+    notify(store, err instanceof Error ? err.message : String(err), "error");
+    return;
+  }
+
+  submissionInFlight = true;
+  // Flush current transcript so this session is included in friction mining
+  sessionAutosave?.flush();
+  const saved = saveSessionLibe(store.state, { libraVersion: getVersion() });
+  const sessionPath =
+    saved?.path ?? sessionLibePath(store.state.session.id);
+
+  store.setPhase("thinking", "self-review: mining sessions + backup…");
+  const { friction, sessionListMarkdown } = collectSelfReviewSessionContext({
+    limit: 20,
+  });
+  const frictionLine = frictionOneLiner(friction);
+
+  let backup;
+  try {
+    backup = createSelfReviewBackup({
+      libraRoot,
+      provider,
+      model,
+      focus: opts.focus,
+      note: "pre-self-review snapshot",
+    });
+  } catch (err) {
+    submissionInFlight = false;
+    store.setPhase("idle");
+    notify(store, err instanceof Error ? err.message : String(err), "error");
+    return;
+  }
+
+  // External supervisor — OUTSIDE agent loop; survives broken installs
+  let handoff: SelfReviewHandoff | null = null;
+  let supervisorPid = 0;
+  try {
+    const supervisorScript = installRelaunchSupervisor(libraRoot);
+    handoff = createHandoff({
+      libraRoot,
+      backupId: backup.id,
+      backupDir: backup.dir,
+      sessionPath,
+      sessionId: store.state.session.id,
+      userCwd: process.cwd(),
+      theme: ui.getThemeName(),
+    });
+    supervisorPid = spawnRelaunchSupervisor(handoff, supervisorScript);
+    dbg("self-review", "supervisor_spawned", {
+      pid: supervisorPid,
+      handoff: handoff.handoffPath,
+    });
+  } catch (err) {
+    submissionInFlight = false;
+    store.setPhase("idle");
+    notify(
+      store,
+      `could not start relaunch supervisor: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      "error",
+    );
+    return;
+  }
+
+  toast(
+    store,
+    `backup ${backup.id} · sessions ${friction.sessionsScanned} · relaunch armed`,
+  );
+  store.appendMessage({
+    id: newId("m"),
+    role: "system",
+    createdAt: Date.now(),
+    parts: [
+      {
+        id: newId("p"),
+        type: "status",
+        level: "info",
+        message:
+          `Self-review: source backup \`${backup.id}\` (${backup.manifest.fileCount} files). ` +
+          `Mined ${friction.sessionsScanned} .libe session(s) — ${frictionLine}. ` +
+          `Model: \`${provider}/${model}\`. ` +
+          `External supervisor pid=${supervisorPid} will verify, auto-restore if broken, ` +
+          `and relaunch into this session (\`${store.state.session.id}\`).`,
+      },
+    ],
+  });
+
+  const systemAddon = buildSelfReviewSystemAddon({
+    libraRoot,
+    backupId: backup.id,
+    backupDir: backup.dir,
+    provider,
+    model,
+    focus: opts.focus,
+    frictionMarkdown: friction.markdown,
+    sessionListMarkdown,
+  });
+  const userPrompt = buildSelfReviewUserPrompt({
+    backupId: backup.id,
+    provider,
+    model,
+    focus: opts.focus,
+    sessionsScanned: friction.sessionsScanned,
+    frictionSummary: frictionLine,
+  });
+  const settings = loadAgentSettings();
+  const system =
+    buildSystemPrompt({
+      extra: settings.reasoning.customInstructions,
+      model,
+      provider,
+      cwd: libraRoot,
+    }) +
+    "\n\n" +
+    systemAddon;
+
+  dbg("self-review", "start", {
+    backupId: backup.id,
+    root: libraRoot,
+    model: `${provider}/${model}`,
+    focus: opts.focus ?? null,
+    sessionsScanned: friction.sessionsScanned,
+    friction: friction.counts,
+    sessionPath,
+  });
+
+  let agentFailed: string | undefined;
+  try {
+    // Force tools + auto-approve so the model can actually ship upgrades.
+    // cwd is the Libra install — not the user's unrelated project cwd.
+    await liveAgent.handle(userPrompt, {
+      provider,
+      model,
+      cwd: libraRoot,
+      tools: true,
+      systemPrompt: system,
+      autoApprove: true,
+      label: "self-review",
+      maxSteps: 48,
+      // Prefer multi-agent if the user already enabled it / ultra
+      subagents: loadAgentSettings().subagents.enabled,
+    });
+  } catch (err) {
+    agentFailed = err instanceof Error ? err.message : String(err);
+    notify(store, agentFailed, "error");
+    store.setPhase("idle");
+  } finally {
+    // Always flush session so relaunch restores full transcript
+    sessionAutosave?.flush();
+    saveSessionLibe(store.state, { libraVersion: getVersion() });
+
+    if (handoff) {
+      signalRelaunch(
+        handoff,
+        agentFailed ? "agent_failed" : "agent_done",
+        agentFailed,
+      );
+    }
+
+    store.appendMessage({
+      id: newId("m"),
+      role: "system",
+      createdAt: Date.now(),
+      parts: [
+        {
+          id: newId("p"),
+          type: "status",
+          level: agentFailed ? "warn" : "success",
+          message: agentFailed
+            ? `Self-review agent error — supervisor will still verify build; auto-restore if needed. Exiting for relaunch…`
+            : `Self-review finished — exiting so supervisor can verify + relaunch into this session…`,
+        },
+      ],
+    });
+    // Paint the final status once
+    try {
+      ui.setState(store.state);
+      ui.requestPaint();
+    } catch {
+      /* */
+    }
+
+    submissionInFlight = false;
+    dbg("self-review", "end", {
+      backupId: backup.id,
+      agentFailed: agentFailed ?? null,
+      supervisorPid,
+    });
+
+    // Hand TTY back; supervisor relaunches into the same .libe session
+    await exitForSelfReviewRelaunch(ui);
+  }
+}
+
+/** Stop TUI cleanly and exit so the external supervisor owns the next launch. */
+async function exitForSelfReviewRelaunch(ui: TuiRenderer): Promise<void> {
+  try {
+    sessionAutosave?.dispose();
+    sessionAutosave = null;
+  } catch {
+    /* */
+  }
+  try {
+    ui.stop();
+  } catch {
+    /* */
+  }
+  // Brief pause so status paints / supervisor sees parent exit cleanly
+  await new Promise((r) => setTimeout(r, 400));
+  process.exit(0);
 }
 
 /** Route: ultra-fusion prep → live agent (if auth+model) → mock demo. */

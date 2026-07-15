@@ -28,7 +28,17 @@ function hasFlag(name: string): boolean {
 }
 
 async function main(): Promise<void> {
-  initDebug("trace");
+  // Respect LIBRA_DEBUG (info/trace/off). Default to info for benches —
+  // forcing "trace" floods stderr + disk with every SSE chunk and is a
+  // major lag source when reasoning streams are large/fast.
+  const envDbg = (process.env.LIBRA_DEBUG ?? "info").trim().toLowerCase();
+  const dbgLevel =
+    envDbg === "0" || envDbg === "false" || envDbg === "off"
+      ? "off"
+      : envDbg === "trace" || envDbg === "2" || envDbg === "verbose"
+        ? "trace"
+        : "info";
+  initDebug(dbgLevel);
   const cfg = loadConfig();
   const provider = (arg("--provider") ?? cfg.provider ?? "openrouter") as ProviderId;
   const model = arg("--model") ?? cfg.model ?? "tencent/hy3:free";

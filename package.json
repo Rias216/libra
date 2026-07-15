@@ -18,15 +18,19 @@
     "start": "bun dist/cli.js",
     "dev": "bun src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test/harness.test.ts && bun test/web-tools.test.ts",
+    "test": "bun test/harness.test.ts && bun test/web-tools.test.ts && bun test/stream-layout.test.ts",
     "test:web": "bun test/web-tools.test.ts",
     "test:harness": "bun test/harness.test.ts",
+    "test:layout": "bun test/stream-layout.test.ts",
     "demo": "bun src/cli.ts",
     "compile": "bun build src/cli.ts --compile --outfile dist/libra",
     "link": "bun run build && bun link",
     "unlink": "bun unlink",
     "bench:live": "bun scripts/debug-live-run.ts",
-    "bench:score": "bun scripts/score-bench.ts"
+    "bench:score": "bun scripts/score-bench.ts",
+    "bench:layout": "bun scripts/bench-tui-stream.ts",
+    "bench:heavy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-heavy-benches.ps1",
+    "self-review:relaunch": "bun scripts/self-review-relaunch.mjs"
   },
   "keywords": [
     "tui",

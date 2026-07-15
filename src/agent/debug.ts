@@ -102,9 +102,13 @@ function ms(): number {
   return Date.now() - t0;
 }
 
-function writeLine(line: string): void {
-  // stderr so it doesn't pollute JSON/stdout scripts
-  process.stderr.write(line + "\n");
+function writeLine(line: string, opts?: { stderr?: boolean }): void {
+  // Default: stderr + file. High-volume trace events (SSE chunks) should
+  // pass stderr:false — writing every token to the console is a major lag
+  // source when reasoning streams are large/fast.
+  if (opts?.stderr !== false) {
+    process.stderr.write(line + "\n");
+  }
   if (logPath) {
     try {
       appendFileSync(logPath, line + "\n", "utf8");
@@ -129,20 +133,30 @@ function safeJson(v: unknown, max = 2000): string {
   }
 }
 
+/** Events so frequent that stderr would dominate the event loop under load. */
+const FILE_ONLY_EVENTS = new Set([
+  "sse.chunk",
+  "sse.raw",
+  "delta",
+  "reasoning.delta",
+  "text.delta",
+]);
+
 /** Core log: category, event, optional data */
 export function dbg(
   category: string,
   event: string,
   data?: Record<string, unknown>,
+  opts?: { stderr?: boolean },
 ): void {
   if (!isDebug()) return;
   const id = ++seq;
   const base = `[${String(ms()).padStart(6)}ms #${id}] [${category}] ${event}`;
-  if (data && Object.keys(data).length) {
-    writeLine(`${base} ${safeJson(data)}`);
-  } else {
-    writeLine(base);
-  }
+  const line =
+    data && Object.keys(data).length
+      ? `${base} ${safeJson(data)}`
+      : base;
+  writeLine(line, opts);
 }
 
 /** Trace-only (raw chunks, full messages) */
@@ -152,7 +166,9 @@ export function dbgTrace(
   data?: Record<string, unknown>,
 ): void {
   if (!isTrace()) return;
-  dbg(category, event, data);
+  // High-volume stream events → file only (still available for postmortem).
+  const fileOnly = FILE_ONLY_EVENTS.has(event);
+  dbg(category, event, data, fileOnly ? { stderr: false } : undefined);
 }
 
 /** Time a named span */

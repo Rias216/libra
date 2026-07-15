@@ -54,7 +54,6 @@ import {
   renderHeader,
   renderStatus,
 } from "./chrome.js";
-import type { RowHit } from "./components/parts.js";
 import { computeScrollbar, scrollPercent } from "./scrollbar.js";
 import { decodeInput, type KeyEvent } from "./input.js";
 import {
@@ -92,6 +91,7 @@ import {
 import { copyText } from "./clipboard.js";
 import type { Row } from "./components/parts.js";
 import { CoalescedScheduler } from "../core/coalesce.js";
+import { dbg, isDebug } from "../agent/debug.js";
 
 export interface RendererOptions {
   theme?: string;
@@ -135,8 +135,15 @@ export class TuiRenderer {
    * something is actually animating (see `armAnimation()`).
    */
   private frames: CoalescedScheduler;
-  private static readonly PAINT_MAX_HZ = 30;
-  private static readonly SPINNER_INTERVAL_MS = 50;
+  /**
+   * Cap paints at 60/s. Dirty-cell encoding means idle viewport rows are free,
+   * so a higher ceiling no longer means rewriting the whole terminal.
+   */
+  private static readonly PAINT_MAX_HZ = 60;
+  private static readonly SPINNER_INTERVAL_MS = 33;
+  /** Log / surface when realised paint rate falls below this. */
+  private static readonly FPS_WARN = 24;
+  private static readonly PAINT_MS_WARN = 20;
   private opts: RendererOptions;
   private stdin: NodeJS.ReadStream;
   private stdout: NodeJS.WriteStream;
@@ -168,8 +175,8 @@ export class TuiRenderer {
   private lastScrollH = 0;
   /** Plain-text lines of last painted scrollback document (for selection copy) */
   private lastDocPlain: string[] = [];
-  /** Per-line click targets (reasoning/tool headers) for expand/collapse */
-  private lastDocHits: (RowHit | null)[] = [];
+  /** Last laid-out scroll document — hit targets live on `row.hit` */
+  private lastDocRows: Row[] = [];
   /** Geometry of last paint (for mouse hit-testing) */
   private layout = {
     padX: 2,
@@ -194,11 +201,22 @@ export class TuiRenderer {
   private copyFlash: string | null = null;
   /**
    * Live generation throughput (tokens/sec) from stream deltas.
-   * Sliding ~2s window; ~4 chars ≈ 1 token.
+   * Sliding ~2s window; ~4 chars ≈ 1 token. Running sum avoids O(n) reduce.
    */
   private tpsWindow: { t: number; tokens: number }[] = [];
+  private tpsWindowSum = 0;
   private tpsCurrent = 0;
   private tpsSampleStartedAt = 0;
+  /** Paint timing: ring of recent frame timestamps for realised FPS. */
+  private paintTimes: number[] = [];
+  private paintFps = 0;
+  private lastPaintMs = 0;
+  private lastFpsWarnAt = 0;
+  private lastTpsWarnAt = 0;
+  private peakTps = 0;
+  /** Cached live-sig from last full scroll layout. */
+  private lastLiveSig = "";
+  private lastContentWidth = 0;
 
   constructor(opts: RendererOptions = {}) {
     this.opts = opts;
@@ -236,12 +254,15 @@ export class TuiRenderer {
     if (event.type === "phase") {
       if (event.phase === "streaming" || event.phase === "thinking") {
         this.tpsWindow = [];
+        this.tpsWindowSum = 0;
         this.tpsSampleStartedAt = now;
         this.tpsCurrent = 0;
+        this.peakTps = 0;
       } else if (event.phase === "idle" || event.phase === "error") {
         this.tpsSampleStartedAt = 0;
         this.tpsCurrent = 0;
         this.tpsWindow = [];
+        this.tpsWindowSum = 0;
       }
       return;
     }
@@ -253,21 +274,31 @@ export class TuiRenderer {
       const tokens = chars / 4;
       if (!this.tpsSampleStartedAt) this.tpsSampleStartedAt = now;
       this.tpsWindow.push({ t: now, tokens });
+      this.tpsWindowSum += tokens;
       const cutoff = now - 2000;
       while (this.tpsWindow.length && this.tpsWindow[0]!.t < cutoff) {
-        this.tpsWindow.shift();
+        const dropped = this.tpsWindow.shift()!;
+        this.tpsWindowSum -= dropped.tokens;
       }
+      // Cap sample count so pathological micro-deltas can't bloat the window
+      while (this.tpsWindow.length > 400) {
+        const dropped = this.tpsWindow.shift()!;
+        this.tpsWindowSum -= dropped.tokens;
+      }
+      if (this.tpsWindowSum < 0) this.tpsWindowSum = 0;
       const first = this.tpsWindow[0];
       const last = this.tpsWindow[this.tpsWindow.length - 1];
       const spanMs = Math.max(200, (last?.t ?? now) - (first?.t ?? now));
-      const sum = this.tpsWindow.reduce((a, s) => a + s.tokens, 0);
-      this.tpsCurrent = (sum / spanMs) * 1000;
+      this.tpsCurrent = (this.tpsWindowSum / spanMs) * 1000;
+      if (this.tpsCurrent > this.peakTps) this.peakTps = this.tpsCurrent;
+      this.maybeWarnTpsDrop(now);
       return;
     }
 
     if (event.type === "tokens" && event.output > 0 && this.tpsSampleStartedAt) {
       const elapsed = Math.max(0.25, (now - this.tpsSampleStartedAt) / 1000);
       this.tpsCurrent = Math.max(this.tpsCurrent, event.output / elapsed);
+      if (this.tpsCurrent > this.peakTps) this.peakTps = this.tpsCurrent;
     }
   }
 
@@ -281,6 +312,77 @@ export class TuiRenderer {
       return this.tpsCurrent;
     }
     return 0;
+  }
+
+  /** Realised paint frames/sec over the last ~1s (0 when idle). */
+  getPaintFps(): number {
+    return this.paintFps;
+  }
+
+  getLastPaintMs(): number {
+    return this.lastPaintMs;
+  }
+
+  private notePaintTiming(paintMs: number, docRows: number): void {
+    const now = Date.now();
+    this.lastPaintMs = paintMs;
+    this.paintTimes.push(now);
+    const cutoff = now - 1000;
+    while (this.paintTimes.length && this.paintTimes[0]! < cutoff) {
+      this.paintTimes.shift();
+    }
+    this.paintFps = this.paintTimes.length;
+
+    const busy =
+      this.state &&
+      this.state.phase !== "idle" &&
+      this.state.phase !== "error";
+    if (!busy) return;
+
+    const slow =
+      paintMs >= TuiRenderer.PAINT_MS_WARN ||
+      this.paintFps < TuiRenderer.FPS_WARN;
+    if (!slow) return;
+    if (now - this.lastFpsWarnAt < 1500) return;
+    this.lastFpsWarnAt = now;
+    const tps = Math.round(this.getTokensPerSec());
+    // Always cheap structured log when debug is on; stderr one-liner otherwise
+    // so heavy hy3 runs still surface frame drops without LIBRA_DEBUG.
+    const payload = {
+      paintMs: Math.round(paintMs * 10) / 10,
+      fps: this.paintFps,
+      tps,
+      docRows,
+      phase: this.state?.phase,
+    };
+    if (isDebug()) {
+      dbg("tui", "paint.slow", payload);
+    } else if (process.env.LIBRA_PERF === "1" || process.env.LIBRA_PERF === "true") {
+      process.stderr.write(
+        `[libra:perf] fps=${payload.fps} paintMs=${payload.paintMs} tps=${payload.tps} rows=${payload.docRows}\n`,
+      );
+    }
+  }
+
+  private maybeWarnTpsDrop(now: number): void {
+    if (this.peakTps < 30) return;
+    // Sudden collapse: current rate < 35% of peak after we were healthy
+    if (this.tpsCurrent > this.peakTps * 0.35) return;
+    if (now - this.lastTpsWarnAt < 2000) return;
+    this.lastTpsWarnAt = now;
+    const payload = {
+      tps: Math.round(this.tpsCurrent),
+      peakTps: Math.round(this.peakTps),
+      fps: this.paintFps,
+      paintMs: Math.round(this.lastPaintMs * 10) / 10,
+    };
+    if (isDebug()) {
+      dbg("tui", "tps.drop", payload);
+    } else if (process.env.LIBRA_PERF === "1" || process.env.LIBRA_PERF === "true") {
+      process.stderr.write(
+        `[libra:perf] tps drop ${payload.tps} (peak ${payload.peakTps}) fps=${payload.fps} paintMs=${payload.paintMs}\n`,
+      );
+    }
   }
 
   /**
@@ -562,8 +664,12 @@ export class TuiRenderer {
 
   private hasStreaming(): boolean {
     if (!this.state) return false;
-    for (const m of this.state.messages) {
-      for (const p of m.parts) {
+    // Hot path: only the live tail (last 1–2 messages) can be streaming.
+    // Walking the entire 60k-token transcript every animation tick was pure tax.
+    const messages = this.state.messages;
+    const start = Math.max(0, messages.length - 2);
+    for (let mi = start; mi < messages.length; mi++) {
+      for (const p of messages[mi]!.parts) {
         if ((p.type === "text" || p.type === "reasoning") && p.streaming) {
           return true;
         }
@@ -773,7 +879,7 @@ export class TuiRenderer {
 
       // Pure click on a collapsible header → expand/collapse (OpenCode)
       if (wasClick) {
-        const hit = this.lastDocHits[line];
+        const hit = this.lastDocRows[line]?.hit;
         if (hit?.action === "toggle-collapse") {
           this.selection = null;
           this.opts.onTogglePart?.(hit.messageId, hit.partId);
@@ -1317,6 +1423,7 @@ export class TuiRenderer {
     if (!this.running) return;
     const state = this.state;
     if (!state) return;
+    const paintStarted = performance.now();
 
     const { cols, rows } = this.size();
     if (cols !== this.buf.width || rows !== this.buf.height) {
@@ -1396,16 +1503,19 @@ export class TuiRenderer {
 
     // Plain text only when selecting (copy) — skip join cost during stream
     const needPlain = Boolean(this.selection) || this.focus === "scrollback";
-    const { rows: doc, plain, hits } = buildScrollDocument(
+    const { rows: doc, plain, liveSig } = buildScrollDocument(
       state,
       this.theme,
       contentWidth,
       this.tick,
       { needPlain },
     );
+    this.lastLiveSig = liveSig;
+    this.lastContentWidth = contentWidth;
     this.lastDocLen = doc.length;
     this.lastScrollH = scrollH;
-    this.lastDocHits = hits;
+    // Snapshot — doc is a reused scratch buffer; don't alias it for clicks.
+    this.lastDocRows = doc.slice();
     if (needPlain) this.lastDocPlain = plain;
 
     if (this.following) {
@@ -1432,6 +1542,12 @@ export class TuiRenderer {
     const scrollTop = y;
     this.layout = { padX, scrollTop, scrollH, contentWidth };
     const viewEnd = Math.min(doc.length, this.scrollOffset + scrollH);
+
+    // Always paint the full viewport. Dirty-cell encoding means unchanged
+    // lines are not re-written to the terminal (most stream frames only
+    // touch the last open line + status). A previous "soft scroll" path
+    // shifted the cell buffer without scrolling the terminal and broke
+    // the display — do not reintroduce that.
     for (let i = 0; i < scrollH; i++) {
       const docLine = this.scrollOffset + i;
       const row = docLine < viewEnd ? doc[docLine] : undefined;
@@ -1497,6 +1613,12 @@ export class TuiRenderer {
       this.copyFlash && state.phase === "idle"
         ? { ...state, activityLabel: this.copyFlash }
         : state;
+    const tokensPerSec = this.getTokensPerSec();
+    // FPS is only meaningful while the agent is busy / stream is live
+    const showFps =
+      state.phase !== "idle" &&
+      state.phase !== "error" &&
+      this.paintFps > 0;
     this.paintRow(
       padX,
       rows - 1,
@@ -1504,7 +1626,8 @@ export class TuiRenderer {
         scroll: sp,
         completeOpen: this.completeOpen && !this.picker && !this.modal,
         pickerOpen: Boolean(this.picker || this.modal),
-        tokensPerSec: this.getTokensPerSec(),
+        tokensPerSec,
+        framesPerSec: showFps ? this.paintFps : undefined,
       }),
       contentWidth,
     );
@@ -1531,6 +1654,8 @@ export class TuiRenderer {
     // the only thing that keeps redraws happening with no other events —
     // it stops on its own the instant isAnimating() goes false.
     this.armAnimation();
+
+    this.notePaintTiming(performance.now() - paintStarted, doc.length);
   }
 
   private paintRow(
@@ -1543,7 +1668,6 @@ export class TuiRenderer {
     let col = x;
     const end = x + maxWidth;
     let textCol = 0;
-    const bg = this.theme.bg;
     const selecting =
       docLine !== undefined &&
       this.selection &&
@@ -1551,28 +1675,36 @@ export class TuiRenderer {
 
     for (const seg of row.segments) {
       if (col >= end) break;
-      // Reuse segment style object when bg already set
-      const style =
-        seg.style.bg !== undefined
-          ? seg.style
-          : ({ ...seg.style, bg } as typeof seg.style);
+      // Memoized bg attach — no per-segment object churn on the hot path
+      const style = this.buf.withBg(seg.style);
 
       if (selecting) {
-        for (const ch of [...seg.text]) {
+        // Avoid [...seg.text] spread (allocates full codepoint array)
+        for (let i = 0; i < seg.text.length; ) {
           if (col >= end) break;
+          const code = seg.text.codePointAt(i)!;
+          const cpLen = code > 0xffff ? 2 : 1;
+          const ch = seg.text.slice(i, i + cpLen);
+          i += cpLen;
           const selected = this.cellSelected(docLine!, textCol);
-          const w = this.buf.write(col, y, ch, {
-            ...style,
-            bg: selected ? this.theme.selection : style.bg,
-            inverse: selected ? true : style.inverse,
-          });
+          const w = this.buf.write(
+            col,
+            y,
+            ch,
+            selected
+              ? {
+                  ...style,
+                  bg: this.theme.selection,
+                  inverse: true,
+                }
+              : style,
+          );
           col += w;
           textCol += w > 0 ? 1 : 0;
         }
       } else {
         const written = this.buf.write(col, y, seg.text, style);
         col += written;
-        // Approximate textCol without spreading full string (only for selection)
         textCol += written > 0 ? seg.text.length : 0;
         if (written === 0 && seg.text) break;
       }
@@ -1581,7 +1713,8 @@ export class TuiRenderer {
     if (col < end) {
       this.buf.clearRowRest(col, y);
     } else {
-      this.buf.markRow(y);
+      // Content filled the row — touch without forcing dirty (cells already set)
+      this.buf.touchRow(y);
     }
   }
 

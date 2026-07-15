@@ -104,8 +104,15 @@ export class CoalescedScheduler {
     const deadline = this.nextDeadline;
     this.nextDeadline = null;
     if (deadline == null || this.stopped) return;
-    this.limiter.markFired(Date.now());
-    this.onFire();
+    // Fire first, then mark — so a slow callback doesn't "use up" the slot
+    // before work starts, and the next schedule measures from completion.
+    // (marking before onFire made long paints look like they started earlier
+    // and let the next frame be scheduled during the same turn via overdue timers.)
+    try {
+      this.onFire();
+    } finally {
+      this.limiter.markFired(Date.now());
+    }
   }
 
   /** Cancel any pending callback without firing it. */

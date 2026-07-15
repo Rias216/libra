@@ -1,6 +1,12 @@
 /**
  * Cell-based frame buffer with dirty-line diffing.
  * Optimized for high-frequency agent streaming paints.
+ *
+ * Hot-path rules:
+ *  - Only mark a row dirty when a cell's glyph or style *actually* changes.
+ *    During stream follow the status + last 1–2 lines change; the rest of the
+ *    viewport must not be re-encoded / re-written to the terminal.
+ *  - ASCII text uses a 1-cell width fast path (no string-width package).
  */
 
 import { ansi, paint, stringWidth, styleOpen, type Style } from "./ansi.js";
@@ -24,9 +30,12 @@ export class FrameBuffer {
   private bg: Rgb;
   /** Shared default bg style — avoid per-cell allocations on clear */
   private bgStyle: Style;
-  /** Rows touched this frame; only these are re-encoded on flushDiff */
+  /** Rows whose encoded ANSI may need rewrite */
   private dirty: Uint8Array;
+  /** Rows that received content this frame (for clearUntouched) */
   private rowTouched: Uint8Array;
+  /** Weak memo: Style without bg → Style with this.bg attached */
+  private styleWithBgCache = new WeakMap<Style, Style>();
 
   constructor(width: number, height: number, level: ColorLevel, bg: Rgb) {
     this.width = Math.max(1, width);
@@ -56,6 +65,7 @@ export class FrameBuffer {
     if (bg) {
       this.bg = bg;
       this.bgStyle = { bg };
+      this.styleWithBgCache = new WeakMap();
     }
     this.cells = this.alloc();
     this.prevLines = [];
@@ -77,30 +87,33 @@ export class FrameBuffer {
     if (bg && (bg.r !== this.bg.r || bg.g !== this.bg.g || bg.b !== this.bg.b)) {
       this.bg = bg;
       this.bgStyle = { bg };
+      this.styleWithBgCache = new WeakMap();
     }
     this.rowTouched.fill(0);
   }
 
   /**
-   * Clear only rows that were not rewritten this frame (and mark dirty).
-   * Call after all paintRow calls, before flush.
+   * Clear only rows that were not rewritten this frame (and mark dirty
+   * only when they actually held content).
    */
   clearUntouched(): void {
     const bg = this.bgStyle;
     const w = this.width;
     for (let y = 0; y < this.height; y++) {
       if (this.rowTouched[y]) continue;
-      // Skip work if prev line was already blank-looking empty
       const prev = this.prevLines[y];
       if (prev === undefined || prev.length === 0) continue;
-      // Clear cells for this row
       const base = y * w;
+      let changed = false;
       for (let x = 0; x < w; x++) {
         const cell = this.cells[base + x]!;
-        cell.ch = " ";
-        cell.style = bg;
+        if (cell.ch !== " " || cell.style !== bg) {
+          cell.ch = " ";
+          cell.style = bg;
+          changed = true;
+        }
       }
-      this.dirty[y] = 1;
+      if (changed) this.dirty[y] = 1;
     }
   }
 
@@ -109,6 +122,7 @@ export class FrameBuffer {
     if (bg) {
       this.bg = bg;
       this.bgStyle = { bg };
+      this.styleWithBgCache = new WeakMap();
     }
     const s = this.bgStyle;
     for (const cell of this.cells) {
@@ -123,6 +137,11 @@ export class FrameBuffer {
     return y * this.width + x;
   }
 
+  /** Mark row as painted this frame without forcing re-encode. */
+  touchRow(y: number): void {
+    if (y >= 0 && y < this.height) this.rowTouched[y] = 1;
+  }
+
   markRow(y: number): void {
     if (y >= 0 && y < this.height) {
       this.rowTouched[y] = 1;
@@ -130,85 +149,115 @@ export class FrameBuffer {
     }
   }
 
-  put(x: number, y: number, ch: string, style: Style = {}): void {
-    if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
-    const cell = this.cells[this.idx(x, y)]!;
-    cell.ch = ch || " ";
-    // Prefer shared bg style when no extra attrs
+  /** Attach theme bg to a style, memoized by object identity. */
+  withBg(style: Style): Style {
+    if (style.bg !== undefined) return style;
     if (
       !style.fg &&
       !style.bold &&
       !style.dim &&
       !style.italic &&
       !style.underline &&
-      !style.inverse &&
-      (style.bg === undefined || style.bg === this.bg)
+      !style.inverse
     ) {
-      cell.style = this.bgStyle;
-    } else if (style.bg === undefined) {
-      // Attach bg without spreading when style is already "complete enough"
-      cell.style = style.bg === this.bg ? style : { ...style, bg: this.bg };
-    } else {
-      cell.style = style;
+      return this.bgStyle;
     }
+    let hit = this.styleWithBgCache.get(style);
+    if (!hit) {
+      hit = { ...style, bg: this.bg };
+      this.styleWithBgCache.set(style, hit);
+    }
+    return hit;
+  }
+
+  put(x: number, y: number, ch: string, style: Style = {}): void {
+    if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
     this.rowTouched[y] = 1;
+    const cell = this.cells[this.idx(x, y)]!;
+    const glyph = ch || " ";
+    const st = this.normalizeStyle(style);
+    if (cell.ch === glyph && stylesEqualFast(cell.style, st)) return;
+    cell.ch = glyph;
+    cell.style = st;
     this.dirty[y] = 1;
   }
 
   write(x: number, y: number, text: string, style: Style = {}): number {
-    if (y < 0 || y >= this.height || x >= this.width) return 0;
-    this.markRow(y);
-    // Normalize style once per write
-    const st =
-      style.bg !== undefined
-        ? style
-        : !style.fg &&
-            !style.bold &&
-            !style.dim &&
-            !style.italic &&
-            !style.underline &&
-            !style.inverse
-          ? this.bgStyle
-          : { ...style, bg: this.bg };
+    if (y < 0 || y >= this.height || x >= this.width || !text) return 0;
+    this.rowTouched[y] = 1;
+    const st = this.normalizeStyle(style);
 
     let col = x;
     let i = 0;
     const wmax = this.width;
+    let anyDirty = false;
+    const base = y * this.width;
+
+    // Fast path: pure ASCII printable — 1 cell per byte, no stringWidth
+    if (isAsciiPrintable(text)) {
+      const limit = Math.min(text.length, wmax - col);
+      for (let k = 0; k < limit; k++) {
+        const ch = text[k]!;
+        const cell = this.cells[base + col]!;
+        if (cell.ch !== ch || !stylesEqualFast(cell.style, st)) {
+          cell.ch = ch;
+          cell.style = st;
+          anyDirty = true;
+        }
+        col++;
+      }
+      if (anyDirty) this.dirty[y] = 1;
+      return col - x;
+    }
+
     while (i < text.length && col < wmax) {
       const code = text.codePointAt(i)!;
-      const ch = String.fromCodePoint(code);
-      i += code > 0xffff ? 2 : 1;
-      const w = stringWidth(ch);
+      const cpLen = code > 0xffff ? 2 : 1;
+      const ch = text.slice(i, i + cpLen);
+      i += cpLen;
+      const w = asciiOrWidth(code, ch);
       if (w <= 0) continue;
       if (col + w > wmax) break;
-      const cell = this.cells[this.idx(col, y)]!;
-      cell.ch = ch;
-      cell.style = st;
+      const cell = this.cells[base + col]!;
+      if (cell.ch !== ch || !stylesEqualFast(cell.style, st)) {
+        cell.ch = ch;
+        cell.style = st;
+        anyDirty = true;
+      }
       for (let p = 1; p < w; p++) {
-        const pad = this.cells[this.idx(col + p, y)]!;
-        pad.ch = " ";
-        pad.style = st;
+        const pad = this.cells[base + col + p]!;
+        if (pad.ch !== " " || !stylesEqualFast(pad.style, st)) {
+          pad.ch = " ";
+          pad.style = st;
+          anyDirty = true;
+        }
       }
       col += w;
     }
+    if (anyDirty) this.dirty[y] = 1;
     return col - x;
   }
 
   /** Fill rest of row with bg after writing content (avoids stale glyphs) */
   clearRowRest(x: number, y: number): void {
     if (y < 0 || y >= this.height) return;
-    this.markRow(y);
+    this.rowTouched[y] = 1;
     const bg = this.bgStyle;
     const base = y * this.width;
+    let anyDirty = false;
     for (let col = Math.max(0, x); col < this.width; col++) {
       const cell = this.cells[base + col]!;
-      cell.ch = " ";
-      cell.style = bg;
+      if (cell.ch !== " " || cell.style !== bg) {
+        cell.ch = " ";
+        cell.style = bg;
+        anyDirty = true;
+      }
     }
+    if (anyDirty) this.dirty[y] = 1;
   }
 
   fill(x: number, y: number, width: number, ch: string, style: Style = {}): void {
-    this.markRow(y);
+    this.rowTouched[y] = 1;
     for (let i = 0; i < width; i++) {
       this.put(x + i, y, ch, style);
     }
@@ -227,6 +276,10 @@ export class FrameBuffer {
     ellipsis = true,
   ): void {
     if (maxWidth <= 0) return;
+    if (isAsciiPrintable(text) && text.length <= maxWidth) {
+      this.write(x, y, text, style);
+      return;
+    }
     const w = stringWidth(text);
     if (w <= maxWidth) {
       this.write(x, y, text, style);
@@ -240,7 +293,7 @@ export class FrameBuffer {
         const code = text.codePointAt(i)!;
         const ch = String.fromCodePoint(code);
         i += code > 0xffff ? 2 : 1;
-        const cw = stringWidth(ch);
+        const cw = asciiOrWidth(code, ch);
         if (col + cw > maxWidth) break;
         out += ch;
         col += cw;
@@ -256,12 +309,28 @@ export class FrameBuffer {
       const code = text.codePointAt(i)!;
       const ch = String.fromCodePoint(code);
       i += code > 0xffff ? 2 : 1;
-      const cw = stringWidth(ch);
+      const cw = asciiOrWidth(code, ch);
       if (col + cw > budget) break;
       out += ch;
       col += cw;
     }
     this.write(x, y, out + "…", style);
+  }
+
+  private normalizeStyle(style: Style): Style {
+    if (
+      !style.fg &&
+      !style.bold &&
+      !style.dim &&
+      !style.italic &&
+      !style.underline &&
+      !style.inverse &&
+      (style.bg === undefined || style.bg === this.bg)
+    ) {
+      return this.bgStyle;
+    }
+    if (style.bg === undefined) return this.withBg(style);
+    return style;
   }
 
   private encodeLine(y: number): string {
@@ -271,11 +340,10 @@ export class FrameBuffer {
     let runStyle: Style | null = null;
     let run = "";
     const level = this.level;
-    const bg = this.bg;
 
     const flush = () => {
       if (!run) return;
-      out += paintCached(run, runStyle ?? { bg }, level);
+      out += paintCached(run, runStyle ?? this.bgStyle, level);
       run = "";
     };
 
@@ -323,6 +391,27 @@ export class FrameBuffer {
     }
     return out;
   }
+
+  /** How many rows are dirty (for perf probes). */
+  dirtyCount(): number {
+    let n = 0;
+    for (let i = 0; i < this.height; i++) if (this.dirty[i]) n++;
+    return n;
+  }
+}
+
+function isAsciiPrintable(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 0x20 || c > 0x7e) return false;
+  }
+  return true;
+}
+
+function asciiOrWidth(code: number, ch: string): number {
+  if (code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return 0;
+  if (code < 0x7f) return 1;
+  return stringWidth(ch);
 }
 
 function paintCached(text: string, style: Style, level: ColorLevel): string {
@@ -332,7 +421,6 @@ function paintCached(text: string, style: Style, level: ColorLevel): string {
   if (open === undefined) {
     open = styleOpen(style, level);
     if (styleOpenCache.size >= STYLE_CACHE_MAX) {
-      // Drop oldest half
       let n = 0;
       for (const k of styleOpenCache.keys()) {
         styleOpenCache.delete(k);

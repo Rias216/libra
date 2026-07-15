@@ -885,6 +885,214 @@ test("fusion formatFusionReasoningDisplay + prepareFusionForMain with chatImpl",
   assert.match(display, /Ultra \+ Fusion/);
 });
 
+// ─── self-review backup / restore ───────────────────────────────────
+
+test("self-review handoff write + resume path resolve", async () => {
+  const {
+    createHandoff,
+    writeHandoff,
+    writeHandoffStatus,
+    readHandoffStatus,
+  } = await import("../src/agent/self-review-handoff.js");
+  const { resolveResumeTarget, saveSessionLibe, sessionLibePath } =
+    await import("../src/memory/session-store.js");
+  const { createEmptyState, newId } = await import("../src/core/types.js");
+  const { mkdirSync, rmSync, existsSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+
+  const dir = join(tmpdir(), `libra-handoff-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  process.env.LIBRA_SESSIONS_DIR = dir;
+
+  const state = createEmptyState({
+    id: "resume_me",
+    title: "handoff",
+    model: "m",
+    provider: "p",
+    cwd: dir,
+  });
+  state.messages = [
+    {
+      id: newId("m"),
+      role: "user",
+      createdAt: Date.now(),
+      parts: [{ id: newId("p"), type: "text", content: "hi" }],
+    },
+  ];
+  const saved = saveSessionLibe(state);
+  assert.ok(saved);
+  const resolved = resolveResumeTarget("resume_me");
+  assert.equal(resolved, saved!.path);
+  assert.equal(resolveResumeTarget(saved!.path), saved!.path);
+
+  const handoff = createHandoff({
+    libraRoot: dir,
+    backupId: "b1",
+    backupDir: join(dir, "b1"),
+    sessionPath: saved!.path,
+    sessionId: "resume_me",
+    userCwd: dir,
+  });
+  // point handoff files into tmp
+  handoff.handoffPath = join(dir, "handoff.json");
+  handoff.statusPath = join(dir, "status.json");
+  handoff.logPath = join(dir, "log.txt");
+  writeHandoff(handoff);
+  assert.ok(existsSync(handoff.handoffPath));
+  writeHandoffStatus(handoff.statusPath, {
+    phase: "agent_done",
+    at: new Date().toISOString(),
+  });
+  const st = readHandoffStatus(handoff.statusPath);
+  assert.equal(st?.phase, "agent_done");
+  assert.ok(sessionLibePath("resume_me").endsWith(".libe"));
+
+  rmSync(dir, { recursive: true, force: true });
+  delete process.env.LIBRA_SESSIONS_DIR;
+});
+
+test("session .libe save + friction analysis", async () => {
+  const {
+    saveSessionLibe,
+    loadSessionLibe,
+    analyzeSessionFriction,
+    sessionLibePath,
+  } = await import("../src/memory/session-store.js");
+  const { createEmptyState, newId } = await import("../src/core/types.js");
+  const { existsSync, readFileSync, rmSync, mkdirSync } = await import(
+    "node:fs"
+  );
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+
+  const dir = join(tmpdir(), `libra-libe-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  process.env.LIBRA_SESSIONS_DIR = dir;
+
+  const state = createEmptyState({
+    id: "sess_test1",
+    title: "friction test",
+    model: "mock",
+    provider: "test",
+    cwd: dir,
+  });
+  state.messages = [
+    {
+      id: newId("m"),
+      role: "user",
+      createdAt: Date.now(),
+      parts: [{ id: newId("p"), type: "text", content: "do the thing" }],
+    },
+    {
+      id: newId("m"),
+      role: "assistant",
+      createdAt: Date.now(),
+      parts: [
+        {
+          id: newId("p"),
+          type: "tool",
+          toolName: "run_terminal_command",
+          args: { command: "nope" },
+          status: "error",
+          error: "Command not found: nope",
+          finishedAt: Date.now(),
+        },
+        {
+          id: newId("p"),
+          type: "status",
+          level: "error",
+          message: "turn failed hard",
+        },
+      ],
+    },
+    {
+      id: newId("m"),
+      role: "user",
+      createdAt: Date.now() + 1,
+      parts: [{ id: newId("p"), type: "text", content: "try again please" }],
+    },
+  ];
+
+  const saved = saveSessionLibe(state, { libraVersion: "0.0.0-test" });
+  assert.ok(saved);
+  assert.ok(existsSync(saved!.path));
+  assert.ok(saved!.path.endsWith(".libe"));
+  assert.equal(saved!.summary.toolErrors, 1);
+  assert.equal(saved!.summary.statusErrors, 1);
+
+  const loaded = loadSessionLibe(saved!.path);
+  assert.ok(loaded);
+  assert.equal(loaded!.format, "libe");
+  assert.equal(loaded!.session.id, "sess_test1");
+  assert.equal(loaded!.messages.length, 3);
+
+  // Same path helper
+  assert.equal(sessionLibePath("sess_test1"), saved!.path);
+
+  const report = analyzeSessionFriction({ limit: 5 });
+  assert.ok(report.sessionsScanned >= 1);
+  assert.ok((report.counts.tool_error ?? 0) >= 1);
+  assert.ok((report.counts.status_error ?? 0) >= 1);
+  assert.ok((report.counts.user_retry ?? 0) >= 1);
+  assert.match(report.markdown, /tool_error|run_terminal_command/);
+  assert.ok(readFileSync(join(dir, "latest.libe"), "utf8").includes("libe"));
+
+  rmSync(dir, { recursive: true, force: true });
+  delete process.env.LIBRA_SESSIONS_DIR;
+});
+
+test("self-review backup + restore round-trip", async () => {
+  const {
+    createSelfReviewBackup,
+    restoreSelfReviewBackup,
+    listProjectFiles,
+    isLibraPackageRoot,
+  } = await import("../src/agent/self-review.js");
+  const { readFileSync, existsSync } = await import("node:fs");
+
+  const root = join(tmpdir(), `libra-self-review-${Date.now()}`);
+  mkdirSync(join(root, "src"), { recursive: true });
+  writeFileSync(
+    join(root, "package.json"),
+    JSON.stringify({ name: "libra", version: "0.0.0-test" }) + "\n",
+  );
+  writeFileSync(join(root, "src", "marker.ts"), "export const X = 1;\n");
+  writeFileSync(join(root, "README.md"), "# test\n");
+
+  assert.equal(isLibraPackageRoot(root), true);
+  const files = listProjectFiles(root);
+  assert.ok(files.includes("src/marker.ts"));
+  assert.ok(files.includes("package.json"));
+
+  process.env.LIBRA_SELF_REVIEW_BACKUPS = join(root, ".backups");
+  const snap = createSelfReviewBackup({
+    libraRoot: root,
+    provider: "test",
+    model: "mock",
+    note: "unit-test",
+  });
+  assert.ok(snap.id);
+  assert.ok(snap.manifest.fileCount >= 2);
+  assert.ok(existsSync(join(snap.dir, "MANIFEST.json")));
+  assert.ok(existsSync(join(snap.dir, "src", "marker.ts")));
+
+  // Mutate live tree, then restore
+  writeFileSync(join(root, "src", "marker.ts"), "export const X = 999;\n");
+  const restored = restoreSelfReviewBackup(snap.id, {
+    libraRoot: root,
+    skipSafetyBackup: true,
+  });
+  assert.equal(restored.restored > 0, true);
+  assert.equal(
+    readFileSync(join(root, "src", "marker.ts"), "utf8"),
+    "export const X = 1;\n",
+  );
+
+  rmSync(root, { recursive: true, force: true });
+  delete process.env.LIBRA_SELF_REVIEW_BACKUPS;
+});
+
 // ─── runner ─────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {

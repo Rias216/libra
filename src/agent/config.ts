@@ -342,7 +342,8 @@ export const CUSTOM_REASONING_OPTIONS: {
   {
     value: "none",
     label: "None",
-    description: "No Libra harness profile",
+    description:
+      "No Libra harness profile — status bar uses native model effort only",
   },
   {
     value: "ultra",

@@ -36,6 +36,17 @@ export {
   extractSessionTokens,
   type SessionTokens,
 } from "./memory/session-memory.js";
+export {
+  saveSessionLibe,
+  loadSessionLibe,
+  listSessionLibes,
+  analyzeSessionFriction,
+  getSessionsDir,
+  createSessionAutosave,
+  type LibeFile,
+  type FrictionReport,
+  type SessionSummary,
+} from "./memory/session-store.js";
 
 // ── toolcalling ───────────────────────────────────────
 export { MockAgent } from "./toolcalling/mock-agent.js";

@@ -913,9 +913,8 @@ export function reasoningCompleteValues(
     return values;
   }
 
-  // Same as openEffortModesPicker: skip "none", add ultra / ultra-fusion
+  // Harness profiles including "none" so users can leave Ultra from complete/slash
   for (const o of CUSTOM_REASONING_OPTIONS) {
-    if (o.value === "none") continue;
     values.push({
       value: o.value,
       label: o.label,

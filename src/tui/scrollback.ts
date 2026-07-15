@@ -11,10 +11,15 @@ import type { HarnessState, Message, Part } from "../core/types.js";
 import type { Theme } from "./theme.js";
 import { formatCompactCount } from "./chrome.js";
 import {
+  clearStreamBodyCache,
   renderPart,
   renderRoleHeader,
   type Row,
 } from "./components/parts.js";
+import {
+  clearStreamLayouts,
+  gcStreamLayouts,
+} from "./stream-layout.js";
 
 export interface ScrollModel {
   rows: Row[];
@@ -31,6 +36,20 @@ let prefixCache: {
   plain: string[];
 } | null = null;
 
+/**
+ * Reused document array — avoids allocating prefix.concat(tail) every paint
+ * (that alone was multi-ms and GC pressure at 60k+ token transcripts).
+ */
+let docScratch: Row[] = [];
+
+export interface ScrollDocument {
+  rows: Row[];
+  plain: string[];
+  hits: (import("./components/parts.js").RowHit | null)[];
+  /** Live content fingerprint for tick-only short-circuit in the renderer */
+  liveSig: string;
+}
+
 export function buildScrollRows(
   state: HarnessState,
   theme: Theme,
@@ -46,7 +65,7 @@ export function buildScrollDocument(
   contentWidth: number,
   tick: number,
   opts?: { needPlain?: boolean },
-): { rows: Row[]; plain: string[]; hits: (import("./components/parts.js").RowHit | null)[] } {
+): ScrollDocument {
   const needPlain = opts?.needPlain ?? false;
   const liveIds = new Set<string>();
   const layoutOpts = {
@@ -63,7 +82,8 @@ export function buildScrollDocument(
     return {
       rows,
       plain: needPlain ? rowsToPlain(rows) : [],
-      hits: rows.map(() => null),
+      hits: [],
+      liveSig: "empty",
     };
   }
 
@@ -129,19 +149,57 @@ export function buildScrollDocument(
       if (!liveIds.has(id)) partCache.delete(id);
     }
   }
+  gcStreamLayouts(liveIds);
 
-  const rows =
-    tailRows.length === 0 ? prefixRows : prefixRows.concat(tailRows);
+  // Assemble into reusable scratch — no new giant array per paint
+  const n = prefixRows.length + tailRows.length;
+  if (docScratch.length < n) {
+    // Grow only; never shrink (keep capacity)
+    docScratch.length = n;
+  }
+  for (let i = 0; i < prefixRows.length; i++) {
+    docScratch[i] = prefixRows[i]!;
+  }
+  for (let i = 0; i < tailRows.length; i++) {
+    docScratch[prefixRows.length + i] = tailRows[i]!;
+  }
+  docScratch.length = n;
+  const rows = docScratch;
 
-  const hits = rows.map((r) => r.hit ?? null);
+  const liveSig = makeLiveSig(state, split, n);
 
-  if (!needPlain) return { rows, plain: [], hits };
+  if (!needPlain) {
+    return { rows, plain: [], hits: [], liveSig };
+  }
 
   const plain =
     tailRows.length === 0
       ? prefixPlain
       : prefixPlain.concat(rowsToPlain(tailRows));
-  return { rows, plain, hits };
+  return { rows, plain, hits: [], liveSig };
+}
+
+/** Cheap fingerprint of the live tail so the renderer can skip full rebuilds. */
+function makeLiveSig(
+  state: HarnessState,
+  split: number,
+  docLen: number,
+): string {
+  let sig = `${state.phase}|${state.activityLabel ?? ""}|${docLen}|${split}`;
+  for (let mi = split; mi < state.messages.length; mi++) {
+    const m = state.messages[mi]!;
+    sig += `|${m.id}`;
+    for (const p of m.parts) {
+      if (p.type === "text" || p.type === "reasoning") {
+        sig += `,${p.id}:${p.content.length}:${p.streaming ? 1 : 0}`;
+      } else if (p.type === "tool") {
+        sig += `,${p.id}:${p.status}:${p.result?.length ?? 0}`;
+      } else {
+        sig += `,${p.id}:${p.type}`;
+      }
+    }
+  }
+  return sig;
 }
 
 function makePrefixKey(
@@ -324,6 +382,8 @@ function rowsToPlain(rows: Row[]): string[] {
 export function clearScrollCache(): void {
   partCache.clear();
   prefixCache = null;
+  clearStreamLayouts();
+  clearStreamBodyCache();
 }
 
 function emptyStateRows(theme: Theme, width: number): Row[] {

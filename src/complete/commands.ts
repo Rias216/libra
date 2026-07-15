@@ -258,6 +258,48 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     description: "Reset the session",
   },
   {
+    name: "self-review",
+    aliases: ["selfreview", "self-upgrade", "upgrade-self", "evolve"],
+    description:
+      "Mine .libe sessions for friction, backup sources, self-upgrade with active model",
+    picker: "select",
+    params: [
+      {
+        name: "action",
+        description:
+          "go | sessions | list | restore | status | or free-form focus text",
+        freeform: true,
+        values: [
+          {
+            value: "go",
+            label: "Start now",
+            description: "Mine sessions + backup + run (no confirm)",
+          },
+          {
+            value: "sessions",
+            label: "Sessions + friction",
+            description: "List ~/.libra/sessions/*.libe and error signals",
+          },
+          {
+            value: "list",
+            label: "List source backups",
+            description: "Self-review code snapshots",
+          },
+          {
+            value: "restore",
+            label: "Restore source",
+            description: "Restore a previous code backup",
+          },
+          {
+            value: "status",
+            label: "Status",
+            description: "Root, sessions, friction, backups",
+          },
+        ],
+      },
+    ],
+  },
+  {
     name: "quit",
     aliases: ["exit", "q"],
     description: "Exit Libra",
