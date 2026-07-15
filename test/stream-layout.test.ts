@@ -258,5 +258,30 @@ test("formatTokenStatus fps field (chrome)", async () => {
   assert.equal(formatTokenStatus(1200, 0, 28), "1.2k / 28f");
 });
 
+test("renderMarkdown cache hits on large finished messages", async () => {
+  const {
+    renderMarkdown,
+    markdownCacheStats,
+    clearMarkdownCache,
+  } = await import("../src/tui/markdown.js");
+  clearMarkdownCache();
+  const big =
+    "# Title\n\n" +
+    "Some **bold** and `code`.\n\n".repeat(200) +
+    "```ts\nconst x = 1;\n```\n";
+  const a = renderMarkdown(big, theme, 80);
+  const b = renderMarkdown(big, theme, 80);
+  const c = renderMarkdown(big, theme, 80);
+  assert.equal(a, b);
+  assert.equal(b, c);
+  const stats = markdownCacheStats();
+  assert.equal(stats.misses, 1);
+  assert.equal(stats.hits, 2);
+  assert.ok(stats.hitRate >= 0.66, `hitRate=${stats.hitRate}`);
+  // width change must miss
+  renderMarkdown(big, theme, 100);
+  assert.equal(markdownCacheStats().misses, 2);
+});
+
 console.log(`\nstream-layout: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

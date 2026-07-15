@@ -26,6 +26,11 @@ export class FrameBuffer {
   height: number;
   private cells: Cell[];
   private prevLines: string[] = [];
+  /**
+   * FNV-1a hash of each row's cells. Compared before encodeLine so wide
+   * terminals can skip ANSI string build when dirty was over-set.
+   */
+  private prevHashes: Uint32Array;
   private level: ColorLevel;
   private bg: Rgb;
   /** Shared default bg style — avoid per-cell allocations on clear */
@@ -46,6 +51,7 @@ export class FrameBuffer {
     this.cells = this.alloc();
     this.dirty = new Uint8Array(this.height);
     this.rowTouched = new Uint8Array(this.height);
+    this.prevHashes = new Uint32Array(this.height);
     this.dirty.fill(1);
   }
 
@@ -71,6 +77,7 @@ export class FrameBuffer {
     this.prevLines = [];
     this.dirty = new Uint8Array(this.height);
     this.rowTouched = new Uint8Array(this.height);
+    this.prevHashes = new Uint32Array(this.height);
     this.dirty.fill(1);
   }
 
@@ -79,6 +86,7 @@ export class FrameBuffer {
       this.level = level;
       styleOpenCache.clear();
       this.dirty.fill(1);
+      this.prevHashes.fill(0);
     }
   }
 
@@ -333,6 +341,45 @@ export class FrameBuffer {
     return style;
   }
 
+  /**
+   * Cheap content fingerprint for a row — no string allocations.
+   * Mixes glyph codes + style RGB/flags so equal visual rows collide only
+   * on 32-bit hash (acceptable for skip-encode; false miss just re-encodes).
+   */
+  private hashRow(y: number): number {
+    const w = this.width;
+    const base = y * w;
+    let h = 2166136261 >>> 0;
+    for (let x = 0; x < w; x++) {
+      const cell = this.cells[base + x]!;
+      const ch = cell.ch;
+      let code = ch.charCodeAt(0) || 32;
+      if (ch.length > 1) code = ((code << 8) ^ (ch.charCodeAt(1) || 0)) >>> 0;
+      h = Math.imul(h ^ code, 16777619) >>> 0;
+      const s = cell.style;
+      const fg = s.fg;
+      if (fg) {
+        h = Math.imul(h ^ ((fg.r << 16) | (fg.g << 8) | fg.b), 16777619) >>> 0;
+      } else {
+        h = Math.imul(h ^ 0x9e3779b9, 16777619) >>> 0;
+      }
+      const bg = s.bg;
+      if (bg) {
+        h =
+          Math.imul(h ^ (((bg.r << 16) | (bg.g << 8) | bg.b) ^ 0x1000000), 16777619) >>>
+          0;
+      }
+      let flags = 0;
+      if (s.bold) flags |= 1;
+      if (s.dim) flags |= 2;
+      if (s.italic) flags |= 4;
+      if (s.underline) flags |= 8;
+      if (s.inverse) flags |= 16;
+      if (flags) h = Math.imul(h ^ flags, 16777619) >>> 0;
+    }
+    return h;
+  }
+
   private encodeLine(y: number): string {
     const w = this.width;
     const base = y * w;
@@ -366,11 +413,19 @@ export class FrameBuffer {
     let out = "";
     for (let y = 0; y < this.height; y++) {
       if (!this.dirty[y] && this.prevLines[y] !== undefined) continue;
+      // Hash-first: skip encodeLine when cells match last flushed row
+      // (dirty can be over-set; wide terminals pay O(width) string thrash otherwise).
+      const h = this.hashRow(y);
+      if (this.prevHashes[y] === h && this.prevLines[y] !== undefined) {
+        this.dirty[y] = 0;
+        continue;
+      }
       const line = this.encodeLine(y);
       if (this.prevLines[y] !== line) {
         out += ansi.move(y + 1, 1) + ansi.clearLine + line;
         this.prevLines[y] = line;
       }
+      this.prevHashes[y] = h;
       this.dirty[y] = 0;
     }
     if (this.prevLines.length > this.height) {
@@ -381,12 +436,15 @@ export class FrameBuffer {
 
   flushFull(): string {
     this.prevLines = [];
+    this.prevHashes.fill(0);
     this.dirty.fill(1);
     let out = ansi.home;
     for (let y = 0; y < this.height; y++) {
+      const h = this.hashRow(y);
       const line = this.encodeLine(y);
       out += ansi.move(y + 1, 1) + ansi.clearLine + line;
       this.prevLines[y] = line;
+      this.prevHashes[y] = h;
       this.dirty[y] = 0;
     }
     return out;

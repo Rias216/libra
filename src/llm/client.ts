@@ -143,7 +143,28 @@ export const OUTPUT_TOKEN_FREE = ANTHROPIC_REQUIRED_MAX_TOKENS;
 /** @deprecated No longer applied. */
 export const OUTPUT_TOKEN_CHAT = ANTHROPIC_REQUIRED_MAX_TOKENS;
 /** Max auto-continuations after finish_reason=length (provider hit its own cap). */
-export const MAX_LENGTH_CONTINUATIONS = 2;
+/** Shared budget for length-cut text continues + truncated tool-arg retries. */
+export const MAX_LENGTH_CONTINUATIONS = 4;
+
+/**
+ * Nudge after a tool call arrived with incomplete/invalid JSON arguments
+ * (often a large `write` cut mid-stream). Prefer small chunks over one giant call.
+ */
+export function brokenToolArgsNudge(toolNames: string[]): string {
+  const names = toolNames.length ? toolNames.join(", ") : "tool";
+  const writeHeavy = toolNames.some((n) =>
+    /write|search_replace|edit/i.test(n),
+  );
+  const chunkHint = writeHeavy
+    ? " For large files, prefer multiple smaller write/search_replace calls " +
+      "(e.g. skeleton first, then fill sections) instead of one huge write."
+    : "";
+  return (
+    `Your previous tool call(s) [${names}] were truncated (incomplete JSON arguments). ` +
+    `Retry with complete, valid JSON. Do not invent results — call the tool again.` +
+    chunkHint
+  );
+}
 
 export function isFreeModelId(model: string): boolean {
   return /:free$/i.test(model) || /\/free$/i.test(model);
@@ -216,6 +237,131 @@ export function hasBrokenToolCallArgs(
   return toolCalls.some((tc) =>
     isIncompleteToolArguments(tc.function?.arguments),
   );
+}
+
+/**
+ * Attempt to repair truncated tool-call JSON in place (balance braces / close
+ * open strings). Only for large write / search_replace payloads that hit the
+ * output cap mid JSON — better to apply a partial file + continue than stall.
+ *
+ * Does NOT salvage list_dir/shell/etc. (those should re-prompt).
+ * Returns the number of tool calls salvaged. Mutates `toolCalls` arguments.
+ */
+export function salvageBrokenToolCallArgs(
+  toolCalls: Array<{
+    function?: { name?: string; arguments?: string };
+  }>,
+): number {
+  let salvaged = 0;
+  for (const tc of toolCalls) {
+    const raw = tc.function?.arguments;
+    if (!isIncompleteToolArguments(raw)) continue;
+    const name = (tc.function?.name ?? "").toLowerCase();
+    const isWrite = name === "write" || name === "write_file";
+    const isEdit =
+      name === "search_replace" ||
+      name === "edit_file" ||
+      name === "edit" ||
+      name === "str_replace";
+    if (!isWrite && !isEdit) continue;
+
+    // 1) Structured repair (balance braces / close open strings)
+    let obj: Record<string, unknown> | null = null;
+    const fixed = repairToolArgumentsJson(raw);
+    if (fixed && fixed !== "{}") {
+      try {
+        const v = JSON.parse(fixed);
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          obj = v as Record<string, unknown>;
+        }
+      } catch {
+        obj = null;
+      }
+    }
+
+    // 2) Regex fallback when mid-escape truncation breaks JSON balance
+    if (!obj || !usableWriteOrEdit(obj, isWrite)) {
+      obj = extractWriteLikePartial(String(raw ?? ""), isWrite);
+    }
+    if (!obj || !usableWriteOrEdit(obj, isWrite)) continue;
+
+    if (tc.function) {
+      tc.function.arguments = JSON.stringify(obj);
+      salvaged++;
+    }
+  }
+  return salvaged;
+}
+
+function usableWriteOrEdit(
+  obj: Record<string, unknown>,
+  isWrite: boolean,
+): boolean {
+  const path = obj.file_path ?? obj.path;
+  if (typeof path !== "string" || !path.trim()) return false;
+  if (isWrite) {
+    return typeof obj.content === "string" && obj.content.length >= 20;
+  }
+  return (
+    typeof obj.old_string === "string" || typeof obj.new_string === "string"
+  );
+}
+
+/**
+ * Best-effort extract file_path + content from truncated write JSON when
+ * strict/balance repair fails (e.g. cut mid-escape sequence).
+ */
+export function extractWriteLikePartial(
+  raw: string,
+  isWrite: boolean,
+): Record<string, unknown> | null {
+  const pathMatch =
+    raw.match(/"file_path"\s*:\s*"((?:\\.|[^"\\])*)"/) ??
+    raw.match(/"path"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (!pathMatch) return null;
+  let path: string;
+  try {
+    path = JSON.parse(`"${pathMatch[1]}"`) as string;
+  } catch {
+    path = pathMatch[1]!.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  }
+  if (!path.trim()) return null;
+
+  if (!isWrite) {
+    // Partial search_replace: only salvage if we at least have new_string start
+    const ns = raw.match(/"new_string"\s*:\s*"([\s\S]*)$/);
+    if (!ns) return null;
+    const body = unescapePartialJsonString(ns[1]!);
+    if (body.length < 10) return null;
+    return { file_path: path, old_string: "", new_string: body };
+  }
+
+  const cm = raw.match(/"content"\s*:\s*"/);
+  if (!cm || cm.index == null) return null;
+  const after = raw.slice(cm.index + cm[0].length);
+  // Content runs to end of truncated payload (no closing quote expected)
+  const body = unescapePartialJsonString(after);
+  if (body.length < 20) return null;
+  return { file_path: path, content: body };
+}
+
+/** Unescape a possibly-truncated JSON string body (no surrounding quotes). */
+function unescapePartialJsonString(s: string): string {
+  // Drop a trailing incomplete escape (e.g. lone `\`)
+  let t = s;
+  if (/\\$/.test(t) && !/\\\\$/.test(t)) t = t.slice(0, -1);
+  // If a closing quote+braces leaked at end, strip them
+  t = t.replace(/"\s*[,}][\s\S]*$/, "");
+  try {
+    return JSON.parse(`"${t}"`) as string;
+  } catch {
+    return t
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\r/g, "\r")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
 }
 
 let toolIdSeq = 0;

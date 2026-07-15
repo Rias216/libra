@@ -141,6 +141,8 @@ export class TuiRenderer {
    */
   private static readonly PAINT_MAX_HZ = 60;
   private static readonly SPINNER_INTERVAL_MS = 33;
+  private static readonly TPS_MAX = 400;
+  private static readonly PAINT_TIME_MAX = 120;
   /** Log / surface when realised paint rate falls below this. */
   private static readonly FPS_WARN = 24;
   private static readonly PAINT_MS_WARN = 20;
@@ -201,14 +203,19 @@ export class TuiRenderer {
   private copyFlash: string | null = null;
   /**
    * Live generation throughput (tokens/sec) from stream deltas.
-   * Sliding ~2s window; ~4 chars ≈ 1 token. Running sum avoids O(n) reduce.
+   * Sliding ~2s ring; ~4 chars ≈ 1 token. Fixed buffers avoid shift() GC.
    */
-  private tpsWindow: { t: number; tokens: number }[] = [];
+  private tpsTimes = new Float64Array(TuiRenderer.TPS_MAX);
+  private tpsTokens = new Float64Array(TuiRenderer.TPS_MAX);
+  private tpsHead = 0;
+  private tpsCount = 0;
   private tpsWindowSum = 0;
   private tpsCurrent = 0;
   private tpsSampleStartedAt = 0;
-  /** Paint timing: ring of recent frame timestamps for realised FPS. */
-  private paintTimes: number[] = [];
+  /** Paint timing: fixed ring of recent frame timestamps for realised FPS. */
+  private paintTimes = new Float64Array(TuiRenderer.PAINT_TIME_MAX);
+  private paintTimeHead = 0;
+  private paintTimeCount = 0;
   private paintFps = 0;
   private lastPaintMs = 0;
   private lastFpsWarnAt = 0;
@@ -217,6 +224,23 @@ export class TuiRenderer {
   /** Cached live-sig from last full scroll layout. */
   private lastLiveSig = "";
   private lastContentWidth = 0;
+  /** Cached selectionPlainText — invalidates when selection or plain doc changes. */
+  private selPlainCache: {
+    plain: string[];
+    aL: number;
+    aC: number;
+    bL: number;
+    bC: number;
+    text: string;
+  } | null = null;
+  /** Normalised selection rect for cellSelected/lineInSelection (drag hot path). */
+  private selNorm: {
+    aL: number;
+    aC: number;
+    bL: number;
+    bC: number;
+    key: string;
+  } | null = null;
 
   constructor(opts: RendererOptions = {}) {
     this.opts = opts;
@@ -248,21 +272,51 @@ export class TuiRenderer {
    * Estimate live tokens/sec from stream deltas so the status bar can show
    * `120k / 60t` while the model is generating.
    */
+  private clearTpsWindow(): void {
+    this.tpsHead = 0;
+    this.tpsCount = 0;
+    this.tpsWindowSum = 0;
+  }
+
+  /** Drop samples older than cutoff; O(expired), no array shift. */
+  private expireTps(cutoff: number): void {
+    const cap = TuiRenderer.TPS_MAX;
+    while (this.tpsCount > 0 && this.tpsTimes[this.tpsHead]! < cutoff) {
+      this.tpsWindowSum -= this.tpsTokens[this.tpsHead]!;
+      this.tpsHead = (this.tpsHead + 1) % cap;
+      this.tpsCount--;
+    }
+    if (this.tpsWindowSum < 0) this.tpsWindowSum = 0;
+  }
+
+  private pushTpsSample(t: number, tokens: number): void {
+    const cap = TuiRenderer.TPS_MAX;
+    this.expireTps(t - 2000);
+    if (this.tpsCount === cap) {
+      this.tpsWindowSum -= this.tpsTokens[this.tpsHead]!;
+      this.tpsHead = (this.tpsHead + 1) % cap;
+      this.tpsCount--;
+    }
+    const idx = (this.tpsHead + this.tpsCount) % cap;
+    this.tpsTimes[idx] = t;
+    this.tpsTokens[idx] = tokens;
+    this.tpsWindowSum += tokens;
+    this.tpsCount++;
+  }
+
   private noteThroughput(event: HarnessEvent): void {
     const now = Date.now();
 
     if (event.type === "phase") {
       if (event.phase === "streaming" || event.phase === "thinking") {
-        this.tpsWindow = [];
-        this.tpsWindowSum = 0;
+        this.clearTpsWindow();
         this.tpsSampleStartedAt = now;
         this.tpsCurrent = 0;
         this.peakTps = 0;
       } else if (event.phase === "idle" || event.phase === "error") {
         this.tpsSampleStartedAt = 0;
         this.tpsCurrent = 0;
-        this.tpsWindow = [];
-        this.tpsWindowSum = 0;
+        this.clearTpsWindow();
       }
       return;
     }
@@ -273,22 +327,14 @@ export class TuiRenderer {
       // ~4 chars per token (common English estimate for live rate)
       const tokens = chars / 4;
       if (!this.tpsSampleStartedAt) this.tpsSampleStartedAt = now;
-      this.tpsWindow.push({ t: now, tokens });
-      this.tpsWindowSum += tokens;
-      const cutoff = now - 2000;
-      while (this.tpsWindow.length && this.tpsWindow[0]!.t < cutoff) {
-        const dropped = this.tpsWindow.shift()!;
-        this.tpsWindowSum -= dropped.tokens;
-      }
-      // Cap sample count so pathological micro-deltas can't bloat the window
-      while (this.tpsWindow.length > 400) {
-        const dropped = this.tpsWindow.shift()!;
-        this.tpsWindowSum -= dropped.tokens;
-      }
-      if (this.tpsWindowSum < 0) this.tpsWindowSum = 0;
-      const first = this.tpsWindow[0];
-      const last = this.tpsWindow[this.tpsWindow.length - 1];
-      const spanMs = Math.max(200, (last?.t ?? now) - (first?.t ?? now));
+      this.pushTpsSample(now, tokens);
+      const firstT = this.tpsCount > 0 ? this.tpsTimes[this.tpsHead]! : now;
+      const lastIdx =
+        this.tpsCount > 0
+          ? (this.tpsHead + this.tpsCount - 1) % TuiRenderer.TPS_MAX
+          : 0;
+      const lastT = this.tpsCount > 0 ? this.tpsTimes[lastIdx]! : now;
+      const spanMs = Math.max(200, lastT - firstT);
       this.tpsCurrent = (this.tpsWindowSum / spanMs) * 1000;
       if (this.tpsCurrent > this.peakTps) this.peakTps = this.tpsCurrent;
       this.maybeWarnTpsDrop(now);
@@ -307,8 +353,11 @@ export class TuiRenderer {
     if (this.tpsCurrent <= 0) return 0;
     const state = this.state;
     if (state && state.phase !== "idle" && state.phase !== "error") {
-      const last = this.tpsWindow[this.tpsWindow.length - 1];
-      if (last && Date.now() - last.t > 3000) return 0;
+      if (this.tpsCount > 0) {
+        const lastIdx =
+          (this.tpsHead + this.tpsCount - 1) % TuiRenderer.TPS_MAX;
+        if (Date.now() - this.tpsTimes[lastIdx]! > 3000) return 0;
+      }
       return this.tpsCurrent;
     }
     return 0;
@@ -326,12 +375,23 @@ export class TuiRenderer {
   private notePaintTiming(paintMs: number, docRows: number): void {
     const now = Date.now();
     this.lastPaintMs = paintMs;
-    this.paintTimes.push(now);
+    const cap = TuiRenderer.PAINT_TIME_MAX;
     const cutoff = now - 1000;
-    while (this.paintTimes.length && this.paintTimes[0]! < cutoff) {
-      this.paintTimes.shift();
+    while (
+      this.paintTimeCount > 0 &&
+      this.paintTimes[this.paintTimeHead]! < cutoff
+    ) {
+      this.paintTimeHead = (this.paintTimeHead + 1) % cap;
+      this.paintTimeCount--;
     }
-    this.paintFps = this.paintTimes.length;
+    if (this.paintTimeCount === cap) {
+      this.paintTimeHead = (this.paintTimeHead + 1) % cap;
+      this.paintTimeCount--;
+    }
+    const idx = (this.paintTimeHead + this.paintTimeCount) % cap;
+    this.paintTimes[idx] = now;
+    this.paintTimeCount++;
+    this.paintFps = this.paintTimeCount;
 
     const busy =
       this.state &&
@@ -882,6 +942,8 @@ export class TuiRenderer {
         const hit = this.lastDocRows[line]?.hit;
         if (hit?.action === "toggle-collapse") {
           this.selection = null;
+          this.selNorm = null;
+          this.selPlainCache = null;
           this.opts.onTogglePart?.(hit.messageId, hit.partId);
           this.paint();
           return;
@@ -904,6 +966,7 @@ export class TuiRenderer {
       ...sel,
       active: false,
     };
+    this.selNorm = null;
     if (text.trim()) {
       copyText(text, this.stdout);
       this.copyFlash = "copied";
@@ -917,6 +980,10 @@ export class TuiRenderer {
     this.paint();
   }
 
+  /**
+   * Extract plain text for a document selection. Cached across paints while
+   * the selection rect and lastDocPlain snapshot are unchanged (drag path).
+   */
   private selectionPlainText(sel: {
     anchorLine: number;
     anchorCol: number;
@@ -925,25 +992,63 @@ export class TuiRenderer {
   }): string {
     const lines = this.lastDocPlain;
     if (lines.length === 0) return "";
+    const norm = this.normalizedSelection(sel);
+    let aL = Math.max(0, Math.min(norm.aL, lines.length - 1));
+    let bL = Math.max(0, Math.min(norm.bL, lines.length - 1));
+    const aC = norm.aC;
+    const bC = norm.bC;
+
+    const cache = this.selPlainCache;
+    if (
+      cache &&
+      cache.plain === lines &&
+      cache.aL === aL &&
+      cache.aC === aC &&
+      cache.bL === bL &&
+      cache.bC === bC
+    ) {
+      return cache.text;
+    }
+
+    let text: string;
+    if (aL === bL) {
+      text = (lines[aL] ?? "").slice(aC, bC);
+    } else {
+      const out: string[] = [];
+      out.push((lines[aL] ?? "").slice(aC));
+      for (let i = aL + 1; i < bL; i++) out.push(lines[i] ?? "");
+      out.push((lines[bL] ?? "").slice(0, bC));
+      text = out.join("\n");
+    }
+    this.selPlainCache = { plain: lines, aL, aC, bL, bC, text };
+    return text;
+  }
+
+  /** Normalised (top-left → bottom-right) selection, cached for drag paints. */
+  private normalizedSelection(sel: {
+    anchorLine: number;
+    anchorCol: number;
+    focusLine: number;
+    focusCol: number;
+  }): { aL: number; aC: number; bL: number; bC: number } {
+    const key = `${sel.anchorLine}:${sel.anchorCol}:${sel.focusLine}:${sel.focusCol}`;
+    if (this.selNorm && this.selNorm.key === key) {
+      return this.selNorm;
+    }
     let aL = sel.anchorLine;
     let aC = sel.anchorCol;
     let bL = sel.focusLine;
     let bC = sel.focusCol;
     if (aL > bL || (aL === bL && aC > bC)) {
-      [aL, bL] = [bL, aL];
-      [aC, bC] = [bC, aC];
+      const tL = aL;
+      const tC = aC;
+      aL = bL;
+      aC = bC;
+      bL = tL;
+      bC = tC;
     }
-    aL = Math.max(0, Math.min(aL, lines.length - 1));
-    bL = Math.max(0, Math.min(bL, lines.length - 1));
-    if (aL === bL) {
-      const line = lines[aL] ?? "";
-      return line.slice(aC, bC);
-    }
-    const out: string[] = [];
-    out.push((lines[aL] ?? "").slice(aC));
-    for (let i = aL + 1; i < bL; i++) out.push(lines[i] ?? "");
-    out.push((lines[bL] ?? "").slice(0, bC));
-    return out.join("\n");
+    this.selNorm = { aL, aC, bL, bC, key };
+    return this.selNorm;
   }
 
   private scrollTranscript(delta: number): void {
@@ -1721,22 +1826,14 @@ export class TuiRenderer {
   private lineInSelection(docLine: number): boolean {
     const sel = this.selection;
     if (!sel) return false;
-    const lo = Math.min(sel.anchorLine, sel.focusLine);
-    const hi = Math.max(sel.anchorLine, sel.focusLine);
-    return docLine >= lo && docLine <= hi;
+    const n = this.normalizedSelection(sel);
+    return docLine >= n.aL && docLine <= n.bL;
   }
 
   private cellSelected(docLine: number, col: number): boolean {
     const sel = this.selection;
     if (!sel) return false;
-    let aL = sel.anchorLine;
-    let aC = sel.anchorCol;
-    let bL = sel.focusLine;
-    let bC = sel.focusCol;
-    if (aL > bL || (aL === bL && aC > bC)) {
-      [aL, bL] = [bL, aL];
-      [aC, bC] = [bC, aC];
-    }
+    const { aL, aC, bL, bC } = this.normalizedSelection(sel);
     if (docLine < aL || docLine > bL) return false;
     if (aL === bL) return col >= aC && col < bC;
     if (docLine === aL) return col >= aC;

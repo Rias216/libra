@@ -135,7 +135,11 @@ export {
   type FontProfile,
 } from "./tui/font.js";
 export { FrameBuffer } from "./tui/buffer.js";
-export { renderMarkdown } from "./tui/markdown.js";
+export {
+  renderMarkdown,
+  markdownCacheStats,
+  clearMarkdownCache,
+} from "./tui/markdown.js";
 export { renderPart, renderRoleHeader } from "./tui/components/parts.js";
 export { computeScrollbar, scrollPercent } from "./tui/scrollbar.js";
 

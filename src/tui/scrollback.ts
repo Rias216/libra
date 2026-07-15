@@ -20,6 +20,7 @@ import {
   clearStreamLayouts,
   gcStreamLayouts,
 } from "./stream-layout.js";
+import { clearMarkdownCache } from "./markdown.js";
 
 export interface ScrollModel {
   rows: Row[];
@@ -179,40 +180,83 @@ export function buildScrollDocument(
   return { rows, plain, hits: [], liveSig };
 }
 
-/** Cheap fingerprint of the live tail so the renderer can skip full rebuilds. */
+/**
+ * Cheap fingerprint of the live tail so the renderer can skip full rebuilds.
+ * Rolling FNV hash — no growing string keys on multi-part assistant messages.
+ */
 function makeLiveSig(
   state: HarnessState,
   split: number,
   docLen: number,
 ): string {
-  let sig = `${state.phase}|${state.activityLabel ?? ""}|${docLen}|${split}`;
+  let h = 2166136261 >>> 0;
+  h = mixStr(h, state.phase);
+  h = mixStr(h, state.activityLabel ?? "");
+  h = mixNum(h, docLen);
+  h = mixNum(h, split);
+  let lastId = "";
   for (let mi = split; mi < state.messages.length; mi++) {
     const m = state.messages[mi]!;
-    sig += `|${m.id}`;
+    lastId = m.id;
+    h = mixStr(h, m.id);
     for (const p of m.parts) {
+      h = mixStr(h, p.id);
       if (p.type === "text" || p.type === "reasoning") {
-        sig += `,${p.id}:${p.content.length}:${p.streaming ? 1 : 0}`;
+        h = mixNum(h, p.content.length);
+        h = mixNum(h, p.streaming ? 1 : 0);
+        // Sample content so mid-stream length-stable edits still invalidate
+        if (p.content.length > 0) {
+          h = mixNum(h, p.content.charCodeAt(p.content.length - 1));
+        }
       } else if (p.type === "tool") {
-        sig += `,${p.id}:${p.status}:${p.result?.length ?? 0}`;
+        h = mixStr(h, p.status);
+        h = mixNum(h, p.result?.length ?? 0);
       } else {
-        sig += `,${p.id}:${p.type}`;
+        h = mixStr(h, p.type);
       }
     }
   }
-  return sig;
+  // Bounded key: phase + sizes + hash (no O(parts) string thrash)
+  return `${state.phase}|${docLen}|${split}|${lastId}|${(h >>> 0).toString(36)}`;
 }
 
+/**
+ * Prefix cache key — hash finished messages instead of joining every
+ * messageStableKey (that alone allocated multi-KB strings on long transcripts).
+ */
 function makePrefixKey(
   state: HarnessState,
   theme: Theme,
   contentWidth: number,
   split: number,
 ): string {
-  let k = `${theme.name}|${contentWidth}|${state.compact ? 1 : 0}|${state.showToolDetails ? 1 : 0}|${state.showThinking ? 1 : 0}|${split}`;
+  let h = 2166136261 >>> 0;
+  h = mixStr(h, theme.name);
+  h = mixNum(h, contentWidth);
+  h = mixNum(h, state.compact ? 1 : 0);
+  h = mixNum(h, state.showToolDetails ? 1 : 0);
+  h = mixNum(h, state.showThinking ? 1 : 0);
+  h = mixNum(h, split);
+  let lastId = "";
   for (let i = 0; i < split; i++) {
-    k += "|" + messageStableKey(state.messages[i]!);
+    const m = state.messages[i]!;
+    lastId = m.id;
+    h = mixStr(h, messageStableKey(m));
   }
-  return k;
+  return `${theme.name}|${contentWidth}|${state.compact ? 1 : 0}|${state.showToolDetails ? 1 : 0}|${state.showThinking ? 1 : 0}|${split}|${lastId}|${(h >>> 0).toString(36)}`;
+}
+
+function mixStr(h: number, s: string): number {
+  let x = h >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    x = Math.imul(x ^ s.charCodeAt(i), 16777619) >>> 0;
+  }
+  // length salt so "ab"/"a"+"b" style collisions are less likely across concat
+  return Math.imul(x ^ s.length, 16777619) >>> 0;
+}
+
+function mixNum(h: number, n: number): number {
+  return Math.imul((h >>> 0) ^ (n >>> 0), 16777619) >>> 0;
 }
 
 /** First index that must be re-laid out every frame (streaming/running). */
@@ -291,9 +335,19 @@ function appendMessage(
 
   for (const part of msg.parts) {
     liveIds.add(part.id);
-    rows.push(
-      ...renderPartCached(part, theme, { ...opts, messageId: msg.id }),
-    );
+    const partRows = renderPartCached(part, theme, {
+      width: opts.width,
+      showToolDetails: opts.showToolDetails,
+      showThinking: opts.showThinking,
+      tick: opts.tick,
+      themeName: opts.themeName,
+      messageId: msg.id,
+    });
+    // Push one-by-one — avoid spread allocating an intermediate arg array
+    // for multi-thousand-line reasoning/tool bodies.
+    for (let i = 0; i < partRows.length; i++) {
+      rows.push(partRows[i]!);
+    }
   }
 }
 
@@ -384,6 +438,7 @@ export function clearScrollCache(): void {
   prefixCache = null;
   clearStreamLayouts();
   clearStreamBodyCache();
+  clearMarkdownCache();
 }
 
 function emptyStateRows(theme: Theme, width: number): Row[] {

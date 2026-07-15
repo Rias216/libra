@@ -19,6 +19,8 @@ import {
   hasBrokenToolCallArgs,
   isLengthFinish,
   lengthContinuationNudge,
+  brokenToolArgsNudge,
+  salvageBrokenToolCallArgs,
   MAX_LENGTH_CONTINUATIONS,
   type ChatMessage,
   type ChatResult,
@@ -417,6 +419,18 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
       // OpenCode: tool_calls present ⇒ continue even if finish_reason=stop
       const openTools = result.tool_calls.filter((t) => t.function?.name);
       const lengthCut = isLengthFinish(result.finish_reason);
+      // Large write payloads often truncate mid-JSON — salvage partial content
+      // (balance braces / close strings) before treating as hard-broken.
+      let salvagedCount = 0;
+      if (openTools.length > 0 && hasBrokenToolCallArgs(openTools)) {
+        salvagedCount = salvageBrokenToolCallArgs(openTools);
+        if (salvagedCount > 0) {
+          dbg(ns, `step.${step}.salvaged_tool_args`, {
+            salvaged: salvagedCount,
+            tools: openTools.map((t) => t.function.name),
+          });
+        }
+      }
       const brokenTools =
         openTools.length > 0 && hasBrokenToolCallArgs(openTools);
 
@@ -427,6 +441,7 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         reasoningLen: result.reasoning?.length ?? 0,
         lengthCut,
         brokenTools,
+        salvagedCount,
       });
 
       // Truncated tool args (often finish_reason=length mid JSON): do not
@@ -451,10 +466,7 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         }
         messages.push({
           role: "user",
-          content:
-            "Your previous tool call was truncated (incomplete JSON arguments). " +
-            "Retry the tool call(s) with complete, valid JSON. " +
-            "Do not invent results — call the tool again.",
+          content: brokenToolArgsNudge(openTools.map((t) => t.function.name)),
         });
         finalText = result.content?.trim() || finalText;
         dbg(ns, `step.${step}.length_broken_tools`, {

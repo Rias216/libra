@@ -1546,6 +1546,12 @@ async function openFusionPeerPicker(
         label: "(auto) strongest other model",
         description: "Picked at run time from connected providers",
       },
+      {
+        value: mainKey,
+        label: `${mainKey}  (dual-sample same as main)`,
+        description:
+          "Two independent reasoning passes on the same model (e.g. 2× hy3)",
+      },
       ...models
         .filter(
           (m) => modelKey({ provider: m.provider, model: m.id }) !== mainKey,
@@ -1571,7 +1577,11 @@ async function openFusionPeerPicker(
       });
       toast(
         store,
-        value === "__auto__" ? "peer → auto" : `peer → ${value}`,
+        value === "__auto__"
+          ? "peer → auto"
+          : value === mainKey
+            ? `peer → dual-sample ${value}`
+            : `peer → ${value}`,
       );
       if (value !== "__auto__") {
         const ref = parseModelKey(value);

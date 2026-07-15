@@ -68,10 +68,17 @@ export interface FusionPrepResult {
 /** One quick retry on 429 / upstream rate limit */
 const FUSION_RETRY_MS = 2500;
 
-const REASONING_PASS_SYSTEM = `You produce a reasoning-only plan for a multi-model harness.
+/**
+ * Phase-1 system prompt. Critical: do NOT say "plan for a multi-model harness" —
+ * models interpret that as "build an AI harness", ignoring the user request.
+ */
+const REASONING_PASS_SYSTEM = `You are a planning specialist producing a reasoning-only plan for the USER'S request below.
+
 RULES:
+- Answer the USER request only. Do not invent a different project (especially not an "AI harness", agent framework, or multi-model orchestrator unless they explicitly asked for that).
 - REASONING ONLY — no tool calls, no fake file edits, no "I will now run…"
-- Cover goal, steps, risks, files to touch, and concrete execution detail
+- Cover: goal (as the user stated it), approach, risks, and concrete next steps
+- If the task involves code: note likely files/layout. If it is design/chat/advice: plan that deliverable instead — do not force a TypeScript package scaffold.
 - Do not artificially shorten your reasoning; the API effort level controls depth`;
 /**
  * Resolve the single peer reasoner (NOT the main executor).
@@ -144,14 +151,14 @@ export async function prepareFusionForMain(
   const settings = loadAgentSettings();
   const fusion = settings.reasoning.fusion;
   const mainKey = modelKey({ provider: mainProvider, model: mainModel });
-  const secondaryKeys =
+  let secondaryKeys =
     opts.secondaryKeys ??
     (await resolveSecondaryReasoners(fusion, mainKey));
 
   if (secondaryKeys.length === 0) {
-    throw new Error(
-      "Fusion needs at least one secondary reasoner model (different from the main model). Connect another provider or pick models in /reasoning → Ultra + Fusion.",
-    );
+    // Last resort: dual-sample main (2 independent reasoning passes)
+    secondaryKeys = [mainKey];
+    dbg("fusion", "phase1.dual_sample_fallback", { main: mainKey });
   }
 
   store.setPhase("thinking", "Ultra + Fusion · both models reasoning…");
@@ -191,16 +198,19 @@ export async function prepareFusionForMain(
     );
   }
 
+  const displayReasoning = formatFusionReasoningDisplay(
+    mainReasoning,
+    secondaries,
+    mainKey,
+  );
+  // Compact system addon: full dual traces ship once via seedReasoning
+  // (assistant wire reasoning). Avoids ~2× context on heavy hy3 plans.
   const systemAddon = buildMainCompareAddon(
     userPrompt,
     mainReasoning,
     secondaries,
     fusion,
-  );
-  const displayReasoning = formatFusionReasoningDisplay(
-    mainReasoning,
-    secondaries,
-    mainKey,
+    { compact: true, displayAlreadySeeded: true },
   );
   const summary = `Ultra + Fusion · ${mainKey} + peer → compare & execute (${phase1Ms}ms phase1)`;
 
@@ -249,12 +259,75 @@ export function formatFusionReasoningDisplay(
   ].join("\n");
 }
 
-function buildMainCompareAddon(
+export interface BuildCompareAddonOptions {
+  /**
+   * When true (default for seedReasoning path), do not re-embed full phase-1
+   * bodies in the system prompt — they already appear in the assistant
+   * reasoning block. Cuts dual-hy3 context roughly in half on heavy tasks.
+   */
+  compact?: boolean;
+  /** Hint text that dual traces were seeded into the thinking block. */
+  displayAlreadySeeded?: boolean;
+}
+
+export function buildMainCompareAddon(
   userPrompt: string,
   mainReasoning: FusionCandidate,
   secondaries: FusionCandidate[],
   fusion: FusionConfig,
+  opts?: BuildCompareAddonOptions,
 ): string {
+  const compact = opts?.compact === true;
+  const reviewHint =
+    fusion.fuseInstructions?.trim() ||
+    "Compare first-pass vs peer traces. Prefer stronger arguments, drop contradictions, keep only what serves the USER request. Then act.";
+
+  const mainStatus = mainReasoning.error
+    ? `FAILED: ${mainReasoning.error}`
+    : `${mainReasoning.text?.trim().length ?? 0} chars, ${mainReasoning.ms}ms`;
+  const peerStatus = secondaries
+    .map((c, i) => {
+      const st = c.error
+        ? `FAILED: ${c.error}`
+        : `${c.text?.trim().length ?? 0} chars, ${c.ms}ms`;
+      return `#${i + 1} ${c.modelKey}: ${st}`;
+    })
+    .join("; ");
+
+  const header = `
+## Fusion phase 2 — execute the USER request
+
+### User request (source of truth — follow this)
+${userPrompt}
+
+Phase 1 already produced dual reasoning plans (no tools).
+${
+  opts?.displayAlreadySeeded
+    ? "Full dual traces are in your prior thinking block (sections **Main** and **Peer**)."
+    : "Full traces are included below."
+}
+
+### Job
+1. Compare first-pass + peer traces against the user request above
+2. ${reviewHint}
+3. Discard any plan that invents a different product (e.g. building an "AI harness", agent framework, or unrelated scaffold) unless the user explicitly asked for that
+4. Execute the user's request with tools when needed — do not only restate plans
+5. Spawn subagents only for independent parallel work that serves the user request
+
+### Coding hygiene (only if the user request involves writing code)
+- Prefer medium-sized writes over one giant truncated file
+- Skip version probes; run tests/build only when relevant to the request
+- Stop when the user's goal is met
+
+### Phase-1 roster
+- Main ${mainReasoning.modelKey}: ${mainStatus}
+- Peers: ${peerStatus || "(none)"}
+`.trim();
+
+  if (compact) {
+    return header;
+  }
+
   // Full traces — no internal truncation; API effort is the only depth control
   const mainBody = mainReasoning.error
     ? `(failed: ${mainReasoning.error})`
@@ -269,31 +342,13 @@ function buildMainCompareAddon(
     })
     .join("\n\n");
 
-  const reviewHint =
-    fusion.fuseInstructions?.trim() ||
-    "Compare your own first-pass reasoning with every secondary trace. Prefer stronger arguments, catch errors, and keep only what is correct, valuable, and actionable. Merge into one plan, then execute. Use spawn_agent/wait_agent for independent parallel workstreams.";
-
-  return `
-## Multi-model fusion — phase 2 (you are the MAIN executor)
-
-Phase 1 already ran: you and the secondary model(s) each produced a REASONING-ONLY plan (no tools).
-Now compare both reasonings, merge the best ideas, and EXECUTE with tools. Prefer tools over speculation.
-Multi-agent tools (spawn_agent, wait_agent, send_input, close_agent, list_agents) are available for parallel specialized work.
-
-### Job
-1. Compare first-pass + secondary traces
-2. ${reviewHint}
-3. Act with tools now — do not only restate plans. Spawn subagents when work is independent and parallelizable.
-
-### User request
-${userPrompt}
+  return `${header}
 
 ### Your first-pass reasoning — ${mainReasoning.modelKey}
 ${mainBody}
 
 ### Secondary reasoning traces
-${peerTraces}
-`.trim();
+${peerTraces}`;
 }
 
 /**

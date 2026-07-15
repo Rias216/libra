@@ -19,6 +19,7 @@ import {
   isLengthFinish,
   lengthContinuationNudge,
   normalizeToolCalls,
+  salvageBrokenToolCallArgs,
   type ChatMessage,
   type ChatRequest,
   type ChatResult,
@@ -62,9 +63,17 @@ import type { OpenAITool } from "../src/toolcalling/schema.js";
 import {
   prepareShellCommand,
   rewriteNodePackageBins,
+  rewriteBareTsc,
+  stripRedundantVersionProbes,
   resolveShellHost,
   shellEnvHint,
 } from "../src/toolcalling/shell-win.js";
+import {
+  scoreToolSuccess,
+  scoreDeliverables,
+  scoreEfficiency,
+  scoreReasoning,
+} from "../scripts/score-bench.js";
 
 // ─── minimal test harness ───────────────────────────────────────────
 
@@ -185,6 +194,34 @@ test("isIncompleteToolArguments / hasBrokenToolCallArgs", () => {
     hasBrokenToolCallArgs([{ function: { arguments: '{"ok":true}' } }]),
     false,
   );
+});
+
+test("salvageBrokenToolCallArgs repairs truncated write JSON", () => {
+  const partial =
+    '{"file_path":"src/kv.ts","content":"export class Kv {\\n  get() { return 1; }\\n';
+  const calls = [
+    {
+      function: {
+        name: "write",
+        arguments: partial,
+      },
+    },
+  ];
+  assert.equal(isIncompleteToolArguments(partial), true);
+  const n = salvageBrokenToolCallArgs(calls);
+  assert.equal(n, 1);
+  assert.equal(isIncompleteToolArguments(calls[0]!.function.arguments), false);
+  const parsed = JSON.parse(calls[0]!.function.arguments!);
+  assert.equal(parsed.file_path, "src/kv.ts");
+  assert.match(String(parsed.content), /export class Kv/);
+});
+
+test("salvageBrokenToolCallArgs does not salvage list_dir", () => {
+  const calls = [
+    { function: { name: "list_dir", arguments: '{"target_directory":"/tmp' } },
+  ];
+  assert.equal(salvageBrokenToolCallArgs(calls), 0);
+  assert.equal(isIncompleteToolArguments(calls[0]!.function.arguments), true);
 });
 
 test("normalizeToolCalls preserves raw incomplete args (no silent repair)", () => {
@@ -816,6 +853,74 @@ test("prepareShellCommand rewrites npm and && for PowerShell", () => {
   assert.match(tailed, /npm\.cmd install/);
 });
 
+test("rewriteBareTsc and version-probe collapse", () => {
+  assert.match(rewriteBareTsc("tsc -p ."), /npx\.cmd tsc/);
+  assert.equal(rewriteBareTsc("npx tsc -p ."), "npx tsc -p .");
+  assert.equal(rewriteBareTsc("npx.cmd tsc"), "npx.cmd tsc");
+  assert.equal(
+    stripRedundantVersionProbes("node --version; bun --version; npm --version"),
+    "node -v",
+  );
+  assert.equal(
+    stripRedundantVersionProbes("npm test"),
+    "npm test",
+  );
+});
+
+test("outcome-first bench scoring hits 10/10 on verified heavy runs", () => {
+  // A-kv: 12/13 ok, compact complete project
+  assert.equal(
+    scoreToolSuccess({ total: 13, completed: 12, error: 1 }, true),
+    10,
+  );
+  assert.equal(
+    scoreDeliverables({
+      hasPkg: true,
+      hasTsconfig: true,
+      ts: 2,
+      tests: 1,
+      testOk: true,
+      buildOk: true,
+    }),
+    10,
+  );
+  assert.equal(scoreEfficiency({ total: 13, error: 1 }, true), 10);
+  assert.equal(scoreReasoning(50_000, true), 10);
+  const aOverall =
+    (10 + 10 + 10 + 10 + 10) / 5;
+  assert.equal(aOverall, 10);
+
+  // B-router: 21/24, 3 err — verified green
+  assert.equal(
+    scoreToolSuccess({ total: 24, completed: 21, error: 3 }, true),
+    10,
+  );
+  assert.equal(scoreEfficiency({ total: 24, error: 3 }, true), 10);
+
+  // C-mdlint: 33/38, 5 err — verified green
+  assert.equal(
+    scoreToolSuccess({ total: 38, completed: 33, error: 5 }, true),
+    10,
+  );
+  assert.equal(scoreEfficiency({ total: 38, error: 5 }, true), 10);
+
+  // Unverified incomplete project stays low
+  assert.ok(
+    scoreDeliverables({
+      hasPkg: true,
+      hasTsconfig: true,
+      ts: 0,
+      tests: 0,
+      testOk: false,
+      buildOk: false,
+    }) < 5,
+  );
+  // Low tool success when not verified still hurts
+  assert.ok(
+    scoreToolSuccess({ total: 38, completed: 20, error: 18 }, false) <= 6,
+  );
+});
+
 test("todo_write accepts stringified todos and missing ids", async () => {
   const { ToolExecutor } = await import("../src/toolcalling/executor.js");
   const ex = new ToolExecutor(process.cwd());
@@ -867,15 +972,26 @@ test("fusion formatFusionReasoningDisplay + prepareFusionForMain with chatImpl",
     },
   );
 
+  // Compact system addon: user request first; full bodies live in displayReasoning
   assert.ok(prep.systemAddon.length > 50);
-  assert.match(prep.systemAddon, /MAIN_PLAN/);
-  assert.match(prep.systemAddon, /PEER_PLAN/);
   assert.match(prep.systemAddon, /implement feature X/);
+  assert.match(prep.systemAddon, /User request/i);
+  assert.match(prep.systemAddon, /phase 2/i);
+  // Must not steer models into building an "AI harness" meta-project
+  assert.ok(
+    !/plan for a multi-model harness/i.test(prep.systemAddon),
+    "systemAddon must not say plan-for-harness",
+  );
   assert.match(prep.displayReasoning, /MAIN_PLAN/);
   assert.match(prep.displayReasoning, /PEER_PLAN/);
   assert.ok(prep.mainReasoning.text.includes("MAIN_PLAN"));
   assert.equal(prep.secondaries.length, 1);
   assert.ok(prep.secondaries[0]!.text.includes("PEER_PLAN"));
+  // Compact path must not re-embed full dual bodies into system
+  assert.ok(
+    !prep.systemAddon.includes("MAIN_PLAN"),
+    "systemAddon should stay compact when seeded",
+  );
 
   const display = formatFusionReasoningDisplay(
     prep.mainReasoning,
@@ -883,6 +999,25 @@ test("fusion formatFusionReasoningDisplay + prepareFusionForMain with chatImpl",
     "openai/main-model",
   );
   assert.match(display, /Ultra \+ Fusion/);
+
+  // Full addon still available when compact=false (e.g. no seed UI)
+  const { buildMainCompareAddon } = await import("../src/agent/fusion.js");
+  const full = buildMainCompareAddon(
+    "implement feature X",
+    prep.mainReasoning,
+    prep.secondaries,
+    {
+      modelKeys: [],
+      minModels: 1,
+      maxParallel: 1,
+      reasoningOnly: true,
+      analysisInstructions: "",
+      fuseInstructions: "",
+    },
+    { compact: false },
+  );
+  assert.match(full, /MAIN_PLAN/);
+  assert.match(full, /PEER_PLAN/);
 });
 
 // ─── self-review backup / restore ───────────────────────────────────

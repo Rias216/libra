@@ -82,11 +82,55 @@ export function stripUnixHeadTailPipes(command: string): string {
 /** npm / npx / yarn / pnpm → .cmd variants on Windows hosts. */
 export function rewriteNodePackageBins(command: string): string {
   // Word-boundary replacements; leave already-qualified *.cmd alone.
-  return command
+  let c = command
     .replace(/(^|[\s|&;])npm(?!\.cmd)(?=\s|$)/gi, "$1npm.cmd")
     .replace(/(^|[\s|&;])npx(?!\.cmd)(?=\s|$)/gi, "$1npx.cmd")
     .replace(/(^|[\s|&;])yarn(?!\.cmd)(?=\s|$)/gi, "$1yarn.cmd")
     .replace(/(^|[\s|&;])pnpm(?!\.cmd)(?=\s|$)/gi, "$1pnpm.cmd");
+  c = rewriteBareTsc(c);
+  // Strip wasteful version-probe chains models use before coding.
+  c = stripRedundantVersionProbes(c);
+  return c;
+}
+
+/**
+ * Bare `tsc` is rarely on PATH (lives in node_modules/.bin). Prefer npx.cmd.
+ * Skip when already invoked via npx/bunx/yarn/pnpm or a path.
+ */
+export function rewriteBareTsc(command: string): string {
+  return command.replace(
+    /(^|[\s|&;])tsc(?=\s|$)/gi,
+    (full, pre: string, offset: number, whole: string) => {
+      const head = whole.slice(0, offset + pre.length).toLowerCase();
+      if (
+        /npx(?:\.cmd)?\s+$/.test(head) ||
+        /bunx\s+$/.test(head) ||
+        /(?:yarn|pnpm)(?:\.cmd)?\s+(?:exec\s+)?$/.test(head) ||
+        /node_modules[/\\].bin[/\\]$/.test(head) ||
+        /[/\\]$/.test(head)
+      ) {
+        return full;
+      }
+      return `${pre}npx.cmd tsc`;
+    },
+  );
+}
+
+/**
+ * Models often burn 3–6 steps on `node --version; bun --version; npm --version`.
+ * Collapse pure version probes to a single cheap node -v (enough to proceed).
+ */
+export function stripRedundantVersionProbes(command: string): string {
+  const trimmed = command.trim();
+  // Only rewrite when the whole command is version checks (no real work).
+  const onlyVersions =
+    /^(?:(?:node|bun|npm(?:\.cmd)?|npx(?:\.cmd)?|tsc|python|python3)\s+(?:--version|-v)\s*(?:;|&&|\|\||\n|$)\s*)+$/i.test(
+      trimmed,
+    );
+  if (onlyVersions) {
+    return "node -v";
+  }
+  return command;
 }
 
 /**

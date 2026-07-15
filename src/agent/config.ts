@@ -173,9 +173,9 @@ export const DEFAULT_FUSION: FusionConfig = {
   maxParallel: FUSION_MAX_SECONDARIES,
   reasoningOnly: true, // phase-1 reasoners only
   analysisInstructions:
-    "Reason step-by-step. Cover risks, alternatives, and a concrete executable plan. No tool use in this pass.",
+    "Reason step-by-step about the USER request only. Cover risks, alternatives, and a concrete plan for what they asked. Do not invent a different project. No tool use in this pass.",
   fuseInstructions:
-    "Compare your first-pass reasoning with the peer trace. Keep only what is correct, valuable, and actionable. Merge into one plan, then execute with tools. For independent parallel workstreams use spawn_agent/wait_agent.",
+    "Compare traces against the user request. Keep what helps fulfill it; drop digressions. Execute that plan with tools. Use spawn_agent/wait_agent only for independent parallel work the user needs.",
 };
 
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {

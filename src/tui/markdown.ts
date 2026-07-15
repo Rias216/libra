@@ -3,6 +3,9 @@
  * Handles bold, italic, code, headers, lists, and fenced code blocks.
  * Bare multi-line code is auto-wrapped into fences so the TUI stays compact.
  * Not a full CommonMark parser — tuned for agent transcripts.
+ *
+ * Results are cached by (theme, width, content hash) so large finished
+ * messages are not re-parsed on every paint when the part cache cold-misses.
  */
 
 import type { Style } from "./ansi.js";
@@ -20,11 +23,79 @@ export interface RenderLine {
   plain: string;
 }
 
+const MD_CACHE_MAX = 64;
+const mdCache = new Map<string, RenderLine[]>();
+let mdHits = 0;
+let mdMisses = 0;
+
+export interface MarkdownCacheStats {
+  hits: number;
+  misses: number;
+  size: number;
+  /** 0–1; 1 when no samples yet (avoid NaN in probes) */
+  hitRate: number;
+}
+
+/** Hit/miss counters for LIBRA_PERF / benches — verify large msgs aren't re-parsed. */
+export function markdownCacheStats(): MarkdownCacheStats {
+  const total = mdHits + mdMisses;
+  return {
+    hits: mdHits,
+    misses: mdMisses,
+    size: mdCache.size,
+    hitRate: total === 0 ? 1 : mdHits / total,
+  };
+}
+
+export function clearMarkdownCache(): void {
+  mdCache.clear();
+  mdHits = 0;
+  mdMisses = 0;
+}
+
+function mdCacheKey(source: string, themeName: string, maxWidth: number): string {
+  // Bounded key: never embed full source (would thrash GC on large msgs)
+  return `${themeName}|${maxWidth}|${source.length}|${hashContent(source)}`;
+}
+
+function hashContent(s: string): string {
+  let h = 2166136261 >>> 0;
+  const step = s.length > 4000 ? Math.ceil(s.length / 2000) : 1;
+  for (let i = 0; i < s.length; i += step) {
+    h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+  }
+  h = Math.imul(h ^ s.length, 16777619) >>> 0;
+  if (s.length > 0) {
+    h = Math.imul(h ^ s.charCodeAt(s.length - 1), 16777619) >>> 0;
+  }
+  return (h >>> 0).toString(36);
+}
+
+function mdCacheSet(key: string, value: RenderLine[]): void {
+  if (mdCache.size >= MD_CACHE_MAX) {
+    let n = 0;
+    const drop = Math.floor(MD_CACHE_MAX / 4);
+    for (const k of mdCache.keys()) {
+      mdCache.delete(k);
+      if (++n >= drop) break;
+    }
+  }
+  mdCache.set(key, value);
+}
+
 export function renderMarkdown(
   source: string,
   theme: Theme,
   maxWidth: number,
 ): RenderLine[] {
+  const key = mdCacheKey(source, theme.name, maxWidth);
+  const cached = mdCache.get(key);
+  if (cached) {
+    mdHits++;
+    return cached;
+  }
+  mdMisses++;
+
   // Auto-fence bare code so it never dumps as a wall of plain text
   const lines = ensureCodeFences(source).replace(/\r\n/g, "\n").split("\n");
   const out: RenderLine[] = [];
@@ -155,6 +226,7 @@ export function renderMarkdown(
     out.push(...wrapSegments(parseInline(raw, theme), maxWidth));
   }
 
+  mdCacheSet(key, out);
   return out;
 }
 

@@ -3,17 +3,29 @@
  * Drives AgentLoop + store; dumps reasoning, tools, text, and debug log.
  *
  * Usage:
- *   LIBRA_DEBUG=trace bun scripts/debug-live-run.ts --cwd <dir> --prompt <text>
- *   LIBRA_DEBUG=trace bun scripts/debug-live-run.ts --cwd <dir> --prompt-file <path>
+ *   LIBRA_DEBUG=info bun scripts/debug-live-run.ts --cwd <dir> --prompt <text>
+ *   bun scripts/debug-live-run.ts --cwd <dir> --prompt-file <path>
+ *   bun scripts/debug-live-run.ts --fusion --model tencent/hy3:free --peer openrouter/tencent/hy3:free ...
+ *
+ * Ultra + Fusion (dual hy3):
+ *   --fusion  (or config agent.reasoning.custom=ultra-fusion)
+ *   main + peer each reason (no tools), then main compares + executes
  */
 
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { HarnessStore } from "../src/core/store.js";
-import { AgentLoop } from "../src/agent/loop.js";
+import { AgentLoop, buildSystemPrompt } from "../src/agent/loop.js";
 import { initDebug, getDebugLogPath, dbg } from "../src/agent/debug.js";
 import { resolveToken } from "../src/auth/api-key.js";
 import { loadConfig } from "../src/config/store.js";
+import {
+  loadAgentSettings,
+  saveAgentSettings,
+  type CustomReasoningMode,
+} from "../src/agent/config.js";
+import { prepareFusionForMain } from "../src/agent/fusion.js";
+import { modelKey } from "../src/auth/models.js";
 import type { ProviderId } from "../src/auth/types.js";
 import type { Part } from "../src/core/types.js";
 
@@ -58,6 +70,83 @@ async function main(): Promise<void> {
   if (!token) {
     console.error(`No auth token for provider=${provider}. Login first.`);
     process.exit(2);
+  }
+
+  // Resolve harness mode: --fusion / --mode ultra-fusion | ultra | none
+  // Defaults to config when flags omitted.
+  const modeArg = (arg("--mode") ?? "").trim().toLowerCase();
+  const wantFusion =
+    hasFlag("--fusion") ||
+    modeArg === "ultra-fusion" ||
+    (modeArg === "" && loadAgentSettings().reasoning.custom === "ultra-fusion");
+  const wantUltra =
+    !wantFusion &&
+    (modeArg === "ultra" ||
+      (modeArg === "" && loadAgentSettings().reasoning.custom === "ultra"));
+
+  const mainKey = modelKey({ provider, model });
+  // Peer for fusion: --peer, else fusion.modelKeys[0], else dual-sample main (2× hy3)
+  const peerArg = arg("--peer")?.trim();
+  if (wantFusion) {
+    const peerKey = peerArg || loadAgentSettings().reasoning.fusion.modelKeys[0] || mainKey;
+    const cur = loadAgentSettings();
+    saveAgentSettings({
+      reasoning: {
+        ...cur.reasoning,
+        custom: "ultra-fusion" as CustomReasoningMode,
+        // Prefer high/max for coding benches when still on default/low
+        effort:
+          cur.reasoning.effort === "default" ||
+          cur.reasoning.effort === "off" ||
+          cur.reasoning.effort === "none" ||
+          cur.reasoning.effort === "low" ||
+          cur.reasoning.effort === "minimal"
+            ? "high"
+            : cur.reasoning.effort,
+        fusion: {
+          ...cur.reasoning.fusion,
+          modelKeys: [peerKey],
+          minModels: 1,
+          maxParallel: 1,
+          reasoningOnly: true,
+        },
+      },
+      subagents: {
+        ...cur.subagents,
+        enabled: true,
+        autoSpawn: true,
+        preferredModelKey: mainKey,
+      },
+    });
+    console.error(
+      `[debug-live-run] mode=ultra-fusion main=${mainKey} peer=${peerKey}` +
+        (peerKey === mainKey ? " (dual-sample)" : ""),
+    );
+  } else if (wantUltra) {
+    const cur = loadAgentSettings();
+    saveAgentSettings({
+      reasoning: {
+        ...cur.reasoning,
+        custom: "ultra" as CustomReasoningMode,
+        effort:
+          cur.reasoning.effort === "default" ||
+          cur.reasoning.effort === "off" ||
+          cur.reasoning.effort === "none" ||
+          cur.reasoning.effort === "low" ||
+          cur.reasoning.effort === "minimal"
+            ? "high"
+            : cur.reasoning.effort,
+      },
+      subagents: {
+        ...cur.subagents,
+        enabled: true,
+        autoSpawn: true,
+        preferredModelKey: mainKey,
+      },
+    });
+    console.error(`[debug-live-run] mode=ultra main=${mainKey}`);
+  } else {
+    console.error(`[debug-live-run] mode=${loadAgentSettings().reasoning.custom} main=${mainKey}`);
   }
 
   const store = new HarnessStore({
@@ -115,7 +204,13 @@ async function main(): Promise<void> {
     `[debug-live-run] provider=${provider} model=${model} cwd=${cwd}`,
   );
   console.error(`[debug-live-run] promptLen=${prompt.length}`);
-  dbg("debug-run", "start", { provider, model, cwd, promptLen: prompt.length });
+  dbg("debug-run", "start", {
+    provider,
+    model,
+    cwd,
+    promptLen: prompt.length,
+    fusion: wantFusion,
+  });
 
   const ac = new AbortController();
   const timeoutMs = Number(arg("--timeout-ms") ?? 600_000);
@@ -126,24 +221,119 @@ async function main(): Promise<void> {
   }, timeoutMs);
 
   const maxSteps = Number(arg("--max-steps") ?? 40);
-  const subagents = hasFlag("--subagents"); // default OFF for clean benches
+  // Fusion / ultra default ON subagents; plain benches keep them off unless flagged
+  const subagents = hasFlag("--subagents") || wantFusion || wantUltra;
   const promptProfile =
     (arg("--profile") as "full" | "slim" | undefined) ?? "full";
 
+  let fusionMeta: Record<string, unknown> | null = null;
+
   try {
-    await live.handle(prompt, {
-      provider,
-      model,
-      cwd,
-      tools: true,
-      autoApprove: true,
-      abortSignal: ac.signal,
-      label: arg("--label") ?? "debug-live",
-      maxSteps: Number.isFinite(maxSteps) && maxSteps > 0 ? maxSteps : 40,
-      // Benches use external parallelism — Libra multi-agent off unless requested
-      subagents,
-      promptProfile,
-    });
+    if (wantFusion) {
+      const settings = loadAgentSettings();
+      const peerKey =
+        peerArg ||
+        settings.reasoning.fusion.modelKeys[0] ||
+        mainKey;
+      console.error(`[debug-live-run] fusion phase-1: main + peer reasoning…`);
+      const prep = await prepareFusionForMain(
+        store,
+        prompt,
+        provider,
+        model,
+        {
+          signal: ac.signal,
+          // Explicit peer (supports dual hy3 when peer === main)
+          secondaryKeys: [peerKey],
+        },
+      );
+      fusionMeta = {
+        summary: prep.summary,
+        phase1Ms: prep.phase1Ms,
+        main: {
+          key: prep.mainReasoning.modelKey,
+          ms: prep.mainReasoning.ms,
+          ttftMs: prep.mainReasoning.ttftMs,
+          chars: prep.mainReasoning.text.length,
+          error: prep.mainReasoning.error,
+        },
+        peer: prep.secondaries[0]
+          ? {
+              key: prep.secondaries[0].modelKey,
+              ms: prep.secondaries[0].ms,
+              ttftMs: prep.secondaries[0].ttftMs,
+              chars: prep.secondaries[0].text.length,
+              error: prep.secondaries[0].error,
+            }
+          : null,
+        displayReasoningChars: prep.displayReasoning.length,
+        systemAddonChars: prep.systemAddon.length,
+      };
+      writeFileSync(
+        join(outDir, "fusion-phase1.json"),
+        JSON.stringify(
+          {
+            ...fusionMeta,
+            mainPreview: prep.mainReasoning.text.slice(0, 2000),
+            peerPreview: prep.secondaries[0]?.text.slice(0, 2000) ?? "",
+            displayReasoning: prep.displayReasoning.slice(0, 8000),
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      console.error(
+        `[debug-live-run] fusion phase-1 done ${prep.phase1Ms}ms ` +
+          `mainChars=${prep.mainReasoning.text.length} peerChars=${prep.secondaries[0]?.text.length ?? 0}`,
+      );
+      if (prep.mainReasoning.error) {
+        console.error(`[debug-live-run] main phase-1 error: ${prep.mainReasoning.error}`);
+      }
+      if (prep.secondaries[0]?.error) {
+        console.error(`[debug-live-run] peer phase-1 error: ${prep.secondaries[0].error}`);
+      }
+
+      const system =
+        buildSystemPrompt({
+          extra: settings.reasoning.customInstructions,
+          model,
+          provider,
+          cwd,
+          profile: promptProfile,
+        }) +
+        "\n\n" +
+        prep.systemAddon;
+
+      await live.handle(prompt, {
+        provider,
+        model,
+        cwd,
+        tools: true,
+        autoApprove: true,
+        abortSignal: ac.signal,
+        label: arg("--label") ?? "debug-live-fusion",
+        maxSteps: Number.isFinite(maxSteps) && maxSteps > 0 ? maxSteps : 40,
+        subagents,
+        promptProfile,
+        systemPrompt: system,
+        seedReasoning: prep.displayReasoning,
+        lightReasoning: true,
+      });
+    } else {
+      await live.handle(prompt, {
+        provider,
+        model,
+        cwd,
+        tools: true,
+        autoApprove: true,
+        abortSignal: ac.signal,
+        label: arg("--label") ?? "debug-live",
+        maxSteps: Number.isFinite(maxSteps) && maxSteps > 0 ? maxSteps : 40,
+        subagents,
+        promptProfile,
+      });
+    }
   } catch (err) {
     console.error(
       "[debug-live-run] error:",
@@ -160,6 +350,7 @@ async function main(): Promise<void> {
     model,
     cwd,
     prompt,
+    fusion: fusionMeta,
     phase: store.state.phase,
     activityLabel: store.state.activityLabel,
     tokens: store.state.tokens,
@@ -179,6 +370,11 @@ async function main(): Promise<void> {
   lines.push(`provider/model: ${provider}/${model}`);
   lines.push(`cwd: ${cwd}`);
   lines.push(`duration_ms: ${ms}`);
+  lines.push(`mode: ${wantFusion ? "ultra-fusion" : wantUltra ? "ultra" : loadAgentSettings().reasoning.custom}`);
+  if (fusionMeta) {
+    lines.push(`fusion_phase1_ms: ${fusionMeta.phase1Ms}`);
+    lines.push(`fusion_summary: ${fusionMeta.summary}`);
+  }
   lines.push(`tokens: in=${store.state.tokens.input} out=${store.state.tokens.output}`);
   lines.push(`phase: ${store.state.phase}`);
   lines.push("");
@@ -236,6 +432,8 @@ async function main(): Promise<void> {
         outDir,
         provider,
         model,
+        mode: wantFusion ? "ultra-fusion" : wantUltra ? "ultra" : "plain",
+        fusion: fusionMeta,
         messageCount: store.state.messages.length,
         toolParts: countTools(store.state.messages.flatMap((m) => m.parts)),
         reasoningChars: sumReasoning(store.state.messages.flatMap((m) => m.parts)),
