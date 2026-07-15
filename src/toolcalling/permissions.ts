@@ -99,6 +99,7 @@ export const DEFAULT_PERMISSIONS: PermissionRules = {
     "yarn *": "allow",
     "node *": "allow",
     "tsx *": "allow",
+    "bun *": "allow",
     "python *": "allow",
     "pytest *": "allow",
     "cargo *": "allow",

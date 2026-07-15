@@ -264,7 +264,7 @@ function isStrongCodeLine(line: string): boolean {
     /=>|:=|::|->/.test(t) ||
     /^\s*<\/?[A-Za-z][^>]*>/.test(t) ||
     /^\$\s+\S/.test(t) ||
-    /^(npm|npx|yarn|pnpm|git|cargo|go|python|node|tsx)\s+\S/.test(t)
+    /^(npm|npx|yarn|pnpm|bun|git|cargo|go|python|node|tsx)\s+\S/.test(t)
   );
 }
 

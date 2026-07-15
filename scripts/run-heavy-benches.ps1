@@ -21,7 +21,7 @@ foreach ($b in $benches) {
 Set-Location '$Libra'
 `$env:LIBRA_DEBUG = 'info'
 `$env:LIBRA_DEBUG_FILE = '$dbg'
-npx tsx scripts/debug-live-run.ts --cwd '$cwd' --prompt-file '$prompt' --out '$out' --label '$($b.label)' --max-steps 48 --timeout-ms 720000 2>&1 | Tee-Object -FilePath '$log'
+bun scripts/debug-live-run.ts --cwd '$cwd' --prompt-file '$prompt' --out '$out' --label '$($b.label)' --max-steps 48 --timeout-ms 720000 2>&1 | Tee-Object -FilePath '$log'
 "@
   $scriptPath = Join-Path $out "_launch.ps1"
   Set-Content -Path $scriptPath -Value $script -Encoding UTF8

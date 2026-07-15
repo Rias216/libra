@@ -1,0 +1,8 @@
+# Bun runtime configuration for Libra (primary runtime)
+[install]
+# typescript is pinned exact in package.json (7.0.2 native)
+exact = false
+
+[run]
+# Windows default: Bun's shell for package.json scripts
+shell = "bun"

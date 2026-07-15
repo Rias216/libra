@@ -1,8 +1,8 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * Libra CLI — TUI harness entry.
  *
- *   npm run dev
+ *   bun run dev
  */
 
 import { HarnessStore } from "./core/store.js";
@@ -95,19 +95,8 @@ let fusionPrepAbort: AbortController | null = null;
 
 async function main(): Promise<void> {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
-    const { createRequire } = await import("node:module");
-    const require = createRequire(import.meta.url);
-    let version = "0.1.0";
-    try {
-      version = require("../package.json").version ?? version;
-    } catch {
-      try {
-        version = require("../../package.json").version ?? version;
-      } catch {
-        /* dist/cli.js → package.json is one up from dist */
-      }
-    }
-    console.log(`libra ${version}`);
+    const { getVersion } = await import("./version.js");
+    console.log(`libra ${getVersion()}`);
     return;
   }
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
@@ -126,8 +115,10 @@ Environment:
   LIBRA_FONT       Font profile
   LIBRA_DEBUG      Debug level (1 / info / trace)
 
+Runtime: Bun (TypeScript 7 toolchain). Node can still run dist/cli.js.
+
 Run from any project directory — the workspace is process.cwd().
-After install:  npm run link   (from the libra repo)
+After install:  bun run link   (from the libra repo)
 `);
     return;
   }

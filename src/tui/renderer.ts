@@ -450,9 +450,14 @@ export class TuiRenderer {
       /* empty index */
     }
 
-    if (this.stdin.isTTY) {
+    // Bun and Node both expose setRawMode on real TTYs; some hosts report
+    // isTTY without implementing raw mode — guard so start() never throws.
+    if (this.stdin.isTTY && typeof this.stdin.setRawMode === "function") {
       this.wasRaw = this.stdin.isRaw ?? false;
       this.stdin.setRawMode(true);
+      this.stdin.resume();
+      this.stdin.setEncoding("utf8");
+    } else if (this.stdin.isTTY) {
       this.stdin.resume();
       this.stdin.setEncoding("utf8");
     }
@@ -542,7 +547,7 @@ export class TuiRenderer {
         ansi.altScreenOff,
     );
 
-    if (this.stdin.isTTY) {
+    if (this.stdin.isTTY && typeof this.stdin.setRawMode === "function") {
       this.stdin.setRawMode(this.wasRaw);
     }
   }

@@ -29,24 +29,33 @@ Libra is the *presentation layer* of an agent harness: it paints streaming token
 
 ## Quick start
 
+Requires [Bun](https://bun.sh) ≥ 1.1 and TypeScript **7** (native compiler).
+
 ```bash
-npm install
-npm run dev
+bun install
+bun run dev
 ```
 
 Type any message and press **Enter** — a mock agent streams a full turn (reasoning → tools → markdown → diff) so you can evaluate the renderer without API keys.
+
+| Script | What it does |
+|--------|----------------|
+| `bun run dev` | Run CLI from TypeScript source |
+| `bun run typecheck` | Native TypeScript 7 check (`tsc --noEmit`) |
+| `bun run build` | Emit `dist/` (JS + `.d.ts`) for packaging |
+| `bun run test` | Harness + web tool tests |
+| `bun run compile` | Single native-ish binary via `bun build --compile` |
 
 ### Install as a global `libra` command (PowerShell / any folder)
 
 From the repo root (once):
 
 ```powershell
-npm install
-npm run link
+bun install
+bun run link
 ```
 
-That builds the CLI and puts `libra` on your PATH via npm’s global bin
-(`npm config get prefix` — already on PATH for most Node installs).
+That builds the CLI and puts `libra` on your PATH via Bun’s global link.
 
 Then from **any** project directory:
 
@@ -61,13 +70,13 @@ Update after pulling code:
 
 ```powershell
 cd C:\Users\rias\Desktop\libra
-npm run link
+bun run link
 ```
 
 Remove the global command:
 
 ```powershell
-npm run unlink
+bun run unlink
 ```
 
 ## Architecture

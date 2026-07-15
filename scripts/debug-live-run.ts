@@ -3,8 +3,8 @@
  * Drives AgentLoop + store; dumps reasoning, tools, text, and debug log.
  *
  * Usage:
- *   LIBRA_DEBUG=trace tsx scripts/debug-live-run.ts --cwd <dir> --prompt <text>
- *   LIBRA_DEBUG=trace tsx scripts/debug-live-run.ts --cwd <dir> --prompt-file <path>
+ *   LIBRA_DEBUG=trace bun scripts/debug-live-run.ts --cwd <dir> --prompt <text>
+ *   LIBRA_DEBUG=trace bun scripts/debug-live-run.ts --cwd <dir> --prompt-file <path>
  */
 
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";

@@ -14,29 +14,33 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepare": "npm run build",
-    "start": "node dist/cli.js",
-    "dev": "tsx src/cli.ts",
+    "prepare": "tsc",
+    "start": "bun dist/cli.js",
+    "dev": "bun src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/harness.test.ts && tsx test/web-tools.test.ts",
-    "test:web": "tsx test/web-tools.test.ts",
-    "test:harness": "tsx test/harness.test.ts",
-    "demo": "tsx src/cli.ts",
-    "link": "npm run build && npm link",
-    "unlink": "npm unlink -g libra"
+    "test": "bun test/harness.test.ts && bun test/web-tools.test.ts",
+    "test:web": "bun test/web-tools.test.ts",
+    "test:harness": "bun test/harness.test.ts",
+    "demo": "bun src/cli.ts",
+    "compile": "bun build src/cli.ts --compile --outfile dist/libra",
+    "link": "bun run build && bun link",
+    "unlink": "bun unlink",
+    "bench:live": "bun scripts/debug-live-run.ts",
+    "bench:score": "bun scripts/score-bench.ts"
   },
-
   "keywords": [
     "tui",
     "ai",
     "harness",
     "terminal",
     "agent",
-    "cli"
+    "cli",
+    "bun"
   ],
   "author": "",
   "license": "MIT",
   "engines": {
+    "bun": ">=1.1.0",
     "node": ">=20"
   },
   "dependencies": {
@@ -47,7 +51,6 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.8.0"
+    "typescript": "7.0.2"
   }
 }

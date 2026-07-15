@@ -94,7 +94,7 @@ export class MockAgent {
         toolName: "read_file",
         args: { target_file: "package.json", limit: 40 },
         result:
-          '{\n  "name": "libra",\n  "version": "0.1.0",\n  "type": "module",\n  "scripts": {\n    "dev": "tsx src/cli.ts"\n  }\n}',
+          '{\n  "name": "libra",\n  "version": "0.1.0",\n  "type": "module",\n  "scripts": {\n    "dev": "bun src/cli.ts"\n  }\n}',
         delay: 350,
       });
       if (this.abort) return;

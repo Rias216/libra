@@ -1,6 +1,6 @@
 /**
  * Score a finished debug-live-run / bench-run directory.
- * Usage: tsx scripts/score-bench.ts <outDir> [--cwd <workspace>]
+ * Usage: bun scripts/score-bench.ts <outDir> [--cwd <workspace>]
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";

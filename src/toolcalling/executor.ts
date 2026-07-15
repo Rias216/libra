@@ -1030,8 +1030,8 @@ export function shellFailureHint(combinedOutput: string): string | null {
   }
   if (/Cannot find module|ERR_MODULE_NOT_FOUND/i.test(o)) {
     return (
-      "Missing dependency or wrong entry. Run npm.cmd install, check package.json " +
-      "type/module, and prefer node --import tsx for TS tests."
+      "Missing dependency or wrong entry. Run bun install (or npm.cmd install), check package.json " +
+      "type/module, and prefer bun for TypeScript tests/scripts."
     );
   }
   if (/\bEADDRINUSE\b|address already in use/i.test(o)) {
