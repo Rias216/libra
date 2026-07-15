@@ -20,6 +20,8 @@ import { homedir } from "node:os";
 export type DebugLevel = "off" | "info" | "trace";
 
 let level: DebugLevel = "off";
+/** When true, `initDebug(force)` pinned the level — do not re-open from env. */
+let levelPinned = false;
 let logPath: string | null = null;
 let seq = 0;
 const t0 = Date.now();
@@ -32,7 +34,16 @@ function detectLevel(): DebugLevel {
 }
 
 export function initDebug(force?: DebugLevel): void {
-  level = force ?? detectLevel();
+  // Explicit force (including "off") pins the level so isDebug() will not
+  // re-enable from LIBRA_DEBUG env mid-process (needed by tests + callers
+  // that temporarily silence logging).
+  if (force !== undefined) {
+    level = force;
+    levelPinned = true;
+  } else {
+    level = detectLevel();
+    levelPinned = false;
+  }
   if (level === "off") {
     logPath = null;
     return;
@@ -72,8 +83,8 @@ export function initDebug(force?: DebugLevel): void {
 }
 
 export function isDebug(): boolean {
-  if (level === "off" && process.env.LIBRA_DEBUG) {
-    // lazy init if env set after import
+  if (level === "off" && !levelPinned && process.env.LIBRA_DEBUG) {
+    // lazy init if env set after import (but never override a pinned off)
     initDebug();
   }
   return level !== "off";

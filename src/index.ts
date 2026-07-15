@@ -45,6 +45,32 @@ export {
   toolNames,
   type ToolDef,
 } from "./toolcalling/tools.js";
+export { ToolExecutor } from "./toolcalling/executor.js";
+export { ToolRunner } from "./toolcalling/runner.js";
+export {
+  PermissionChecker,
+  DEFAULT_PERMISSIONS,
+  HEADLESS_PERMISSIONS,
+  type PermissionAction,
+  type PermissionRules,
+  type PermissionAskFn,
+} from "./toolcalling/permissions.js";
+export {
+  validateToolArgs,
+  formatValidationError,
+} from "./toolcalling/validate.js";
+export {
+  ToolRegistry,
+  createDefaultRegistry,
+  type ToolsetId,
+} from "./toolcalling/registry.js";
+export { scheduleToolWaves, runInWaves } from "./toolcalling/concurrency.js";
+export {
+  normalizeToolArgs,
+  parseToolArgs,
+  toolFingerprint,
+} from "./toolcalling/normalize.js";
+export { OPENAI_TOOLS } from "./toolcalling/schema.js";
 
 // ── complete ──────────────────────────────────────────
 export {

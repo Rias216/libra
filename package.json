@@ -27,10 +27,12 @@
     "bench:openrouter": "tsx scripts/benchmark-openrouter.ts",
     "bench:harness": "tsx scripts/benchmark-harness.ts",
     "bench:grok": "tsx scripts/benchmark-grok.ts",
+    "bench:hy3": "tsx scripts/benchmark-grok.ts --provider=openrouter --model=tencent/hy3:free",
     "bench:fusion": "tsx scripts/benchmark-fusion.ts",
     "bench:fusion:hy3": "tsx scripts/benchmark-fusion-hy3.ts",
     "bench:fusion-local": "tsx scripts/benchmark-fusion-local.ts",
-    "smoke:agent": "tsx scripts/smoke-agent.ts"
+    "smoke:agent": "tsx scripts/smoke-agent.ts",
+    "bench:tools:hy3": "tsx scripts/benchmark-tools-hy3.ts"
   },
 
   "keywords": [

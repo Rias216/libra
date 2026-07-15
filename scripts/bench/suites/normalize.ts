@@ -34,6 +34,25 @@ export function suiteNormalize(): Suite {
     assertEq(a.target_file, "src/package.json");
   });
 
+  s.test("read_file target_files batch normalize + fingerprint", () => {
+    const a = normalizeToolArgs("read_file", {
+      target_files: ["b.txt", "a.txt"],
+    });
+    // sorted for stable fingerprint regardless of call order
+    assertEq(JSON.stringify(a.target_files), JSON.stringify(["a.txt", "b.txt"]));
+    const fp1 = toolFingerprint("read_file", {
+      target_files: ["b.txt", "a.txt"],
+    });
+    const fp2 = toolFingerprint("read_file", {
+      target_files: ["a.txt", "b.txt"],
+    });
+    assertEq(fp1, fp2);
+    // single-element batch collapses to target_file
+    const one = normalizeToolArgs("read_file", { target_files: ["only.ts"] });
+    assertEq(one.target_file, "only.ts");
+    assert(one.target_files == null);
+  });
+
   s.test("grep default path", () => {
     const a = normalizeToolArgs("grep", { pattern: "foo" });
     assertEq(a.path, ".");
@@ -86,6 +105,15 @@ export function suiteNormalize(): Suite {
     const a = toolFingerprint("write", { file_path: "a.txt", content: "x" });
     const b = toolFingerprint("write_file", { path: "a.txt", content: "x" });
     assertEq(a, b);
+  });
+
+  s.test("run_terminal_command timeout → timeout_ms", () => {
+    const n = normalizeToolArgs("run_terminal_command", {
+      command: "echo",
+      timeout: 45,
+    });
+    assertEq(n.timeout_ms, 45_000);
+    assertEq(n.timeout, undefined);
   });
 
   return s;

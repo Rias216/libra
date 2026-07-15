@@ -43,5 +43,27 @@ export function suiteDebug(): Suite {
     if (process.env.LIBRA_DEBUG) initDebug();
   });
 
+  s.test("pinned off survives LIBRA_DEBUG env", () => {
+    // Regression: isDebug() must not re-open from env after explicit off.
+    // This is the real shipped pin path exercised under bench:harness with
+    // LIBRA_DEBUG=trace (the common live-bench environment).
+    const had = process.env.LIBRA_DEBUG;
+    process.env.LIBRA_DEBUG = "trace";
+    try {
+      initDebug("off");
+      assertEq(isDebug(), false, "pinned off must stick while LIBRA_DEBUG=trace");
+      // unpinned env re-init still works
+      initDebug(); // no force → detect from env
+      assert(isDebug(), "unpinned initDebug() should enable from env");
+      initDebug("off");
+      assertEq(isDebug(), false, "re-pin off after env init");
+    } finally {
+      if (had === undefined) delete process.env.LIBRA_DEBUG;
+      else process.env.LIBRA_DEBUG = had;
+      if (process.env.LIBRA_DEBUG) initDebug();
+      else initDebug("off");
+    }
+  });
+
   return s;
 }

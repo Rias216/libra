@@ -64,21 +64,20 @@ function segsToRows(lines: RenderLine[]): Row[] {
 }
 
 function renderText(part: TextPart, theme: Theme, width: number): Row[] {
-  // Streaming: plain wrap only — full markdown on the finished part is much
-  // cheaper and avoids re-parsing the whole answer every token.
+  // Streaming: plain wrap only — full markdown (with auto code fences) once finished.
   const rows = part.streaming
     ? wrapPlainRows(part.content, theme.fg, width)
     : segsToRows(renderMarkdown(part.content, theme, width));
   if (part.streaming) {
     if (rows.length === 0) {
       rows.push({
-        segments: [{ text: "|", style: { fg: theme.accentAssistant } }],
+        segments: [{ text: "│", style: { fg: theme.accentAssistant } }],
       });
     } else {
       const last = rows[rows.length - 1]!;
       last.segments = [
         ...last.segments,
-        { text: "|", style: { fg: theme.accentAssistant } },
+        { text: "│", style: { fg: theme.accentAssistant } },
       ];
     }
   }
@@ -254,39 +253,71 @@ function renderTool(
     });
   }
 
-  // Result / error
+  // Result / error — always as a compact code block (not a wall of raw text)
   if (part.error) {
-    for (const line of wrapPlain(part.error, opts.width - 4).slice(0, 8)) {
-      rows.push({
-        segments: [
-          { text: "  x ", style: { fg: theme.toolError } },
-          { text: line, style: { fg: theme.toolError } },
-        ],
-      });
-    }
+    rows.push(...renderCodeBlock(part.error, theme, opts.width, {
+      label: "error",
+      maxLines: 10,
+      error: true,
+    }));
   } else if (part.result && (part.status === "completed" || opts.showToolDetails)) {
-    const preview = wrapPlain(part.result, opts.width - 4).slice(0, 12);
-    for (const line of preview) {
-      rows.push({
-        segments: [
-          { text: "  | ", style: { fg: theme.border } },
-          { text: line, style: { fg: theme.fgMuted } },
-        ],
-      });
-    }
-    const total = wrapPlain(part.result, opts.width - 4).length;
-    if (total > 12) {
-      rows.push({
-        segments: [
-          {
-            text: `  | ... ${total - 12} more lines`,
-            style: { fg: theme.fgFaint },
-          },
-        ],
-      });
-    }
+    rows.push(
+      ...renderCodeBlock(part.result, theme, opts.width, {
+        label: "result",
+        maxLines: 14,
+      }),
+    );
   }
 
+  return rows;
+}
+
+/** Compact fenced-style block for tool output / errors. */
+function renderCodeBlock(
+  body: string,
+  theme: Theme,
+  width: number,
+  opts: { label: string; maxLines: number; error?: boolean },
+): Row[] {
+  const rows: Row[] = [];
+  const innerW = Math.max(1, width - 4);
+  const lines = wrapPlain(body, innerW);
+  const shown = lines.slice(0, opts.maxLines);
+  const fg = opts.error ? theme.toolError : theme.fgMuted;
+  const headFg = opts.error ? theme.toolError : theme.fgFaint;
+
+  rows.push({
+    segments: [
+      { text: "  ┌── ", style: { fg: headFg } },
+      { text: opts.label + " ", style: { fg: headFg } },
+    ],
+  });
+  for (const line of shown) {
+    rows.push({
+      segments: [
+        { text: "  │ ", style: { fg: theme.border } },
+        {
+          text: line,
+          style: opts.error
+            ? { fg }
+            : { fg: theme.tool, bg: theme.bgSubtle },
+        },
+      ],
+    });
+  }
+  if (lines.length > opts.maxLines) {
+    rows.push({
+      segments: [
+        {
+          text: `  │ … ${lines.length - opts.maxLines} more lines`,
+          style: { fg: theme.fgFaint },
+        },
+      ],
+    });
+  }
+  rows.push({
+    segments: [{ text: "  └────────", style: { fg: headFg } }],
+  });
   return rows;
 }
 

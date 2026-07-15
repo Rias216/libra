@@ -1,9 +1,10 @@
 /**
- * Live benchmarks for xAI Grok 4.5 against the Libra harness.
+ * Live harness benchmarks (latency / tools / agent / multistep / memory / fusion).
  *
  *   LIBRA_DEBUG=1 npx tsx scripts/benchmark-grok.ts
  *   npm run bench:grok
  *   npx tsx scripts/benchmark-grok.ts --model=grok-4.5
+ *   npx tsx scripts/benchmark-grok.ts --provider=openrouter --model=tencent/hy3:free
  *   npx tsx scripts/benchmark-grok.ts --skip=fusion
  *
  * Suites (live):
@@ -11,7 +12,7 @@
  *   tools     — forced tool_choice + ToolExecutor
  *   agent     — full AgentLoop multi-round (list_dir → answer)
  *   multistep — agent must list + read package.json
- *   fusion    — Ultra+Fusion with grok main + hy3 peer (if OpenRouter available)
+ *   fusion    — Ultra+Fusion (peer hy3 when OpenRouter available, else dual main)
  *   memory    — session token harvest after agent turn
  */
 
@@ -19,6 +20,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { resolveToken } from "../src/auth/api-key.js";
+import type { ProviderId } from "../src/auth/types.js";
 import { saveConfig } from "../src/config/store.js";
 import { saveAgentSettings } from "../src/agent/config.js";
 import { HarnessStore } from "../src/core/store.js";
@@ -39,12 +41,24 @@ import {
   type BenchReport,
 } from "./bench/runner.js";
 
-const MODEL = (() => {
-  const a = process.argv.find((x) => x.startsWith("--model="));
-  return a?.split("=")[1] || process.env.LIBRA_GROK_MODEL || "grok-4.5";
+const PROVIDER = (() => {
+  const a = process.argv.find((x) => x.startsWith("--provider="));
+  return (a?.split("=")[1] || process.env.LIBRA_BENCH_PROVIDER || "xai") as ProviderId;
 })();
 
-const PROVIDER = "xai" as const;
+const MODEL = (() => {
+  const a = process.argv.find((x) => x.startsWith("--model="));
+  if (a?.split("=")[1]) return a.split("=")[1]!;
+  if (PROVIDER === "openrouter") {
+    return process.env.LIBRA_HY3_MODEL || "tencent/hy3:free";
+  }
+  return process.env.LIBRA_GROK_MODEL || "grok-4.5";
+})();
+
+const MAIN_KEY = `${PROVIDER}/${MODEL}`;
+const isHy3 =
+  PROVIDER === "openrouter" && /hy3/i.test(MODEL);
+
 const skip = new Set(
   (process.argv.find((a) => a.startsWith("--skip="))?.split("=")[1] ?? "")
     .split(",")
@@ -60,12 +74,18 @@ function hasOpenRouter(): boolean {
   return Boolean(resolveToken("openrouter") || process.env.OPENROUTER_API_KEY);
 }
 
+function hasProvider(p: ProviderId): boolean {
+  if (p === "xai") return hasXai();
+  if (p === "openrouter") return hasOpenRouter();
+  return Boolean(resolveToken(p) || process.env[`${p.toUpperCase()}_API_KEY`]);
+}
+
 async function main(): Promise<void> {
   initDebug(process.env.LIBRA_DEBUG ? undefined : "info");
 
-  if (!hasXai()) {
+  if (!hasProvider(PROVIDER)) {
     console.error(
-      "No xAI credentials. Run /login xai or set XAI_API_KEY, then retry.",
+      `No credentials for ${PROVIDER}. Run /login ${PROVIDER} or set API key env, then retry.`,
     );
     process.exit(1);
   }
@@ -73,11 +93,12 @@ async function main(): Promise<void> {
   saveConfig({
     provider: PROVIDER,
     model: MODEL,
-    modelKey: `${PROVIDER}/${MODEL}`,
+    modelKey: MAIN_KEY,
   });
 
-  console.log("═══ Libra Live Benchmark · Grok ═══\n");
-  console.log(`Model: ${PROVIDER}/${MODEL}`);
+  const title = isHy3 ? "hy3" : PROVIDER === "xai" ? "Grok" : PROVIDER;
+  console.log(`═══ Libra Live Benchmark · ${title} ═══\n`);
+  console.log(`Model: ${MAIN_KEY}`);
   if (isDebug()) console.log(`Debug: ${getDebugLogPath()}`);
 
   const suites: Suite[] = [];
@@ -95,12 +116,17 @@ async function main(): Promise<void> {
   try {
     const dir = join(homedir(), ".libra", "debug");
     mkdirSync(dir, { recursive: true });
-    const path = join(dir, "bench-grok-latest.json");
+    const reportName = isHy3
+      ? "bench-hy3-live-latest.json"
+      : PROVIDER === "xai"
+        ? "bench-grok-latest.json"
+        : `bench-${PROVIDER}-live-latest.json`;
+    const path = join(dir, reportName);
     writeFileSync(
       path,
       JSON.stringify(
         {
-          model: `${PROVIDER}/${MODEL}`,
+          model: MAIN_KEY,
           ...report,
         },
         null,
@@ -136,14 +162,16 @@ function suiteLatency(): Suite {
         },
       ],
       stream: true,
-      max_tokens: 32,
+      // hy3:free often burns tokens on reasoning first — leave headroom
+      max_tokens: isHy3 ? 96 : 32,
       temperature: 0,
       applyNativeReasoning: false,
-      label: "grok.latency",
+      label: isHy3 ? "hy3.latency" : "grok.latency",
     });
-    assert(r.content.trim().length > 0 || (r.reasoning?.length ?? 0) > 0, "empty response");
+    // Answer channel must be non-empty after ensureAnswerChannel
+    assert(r.content.trim().length > 0, `empty content (reasoningLen=${r.reasoning?.length ?? 0})`);
     assertGte(r.durationMs ?? 0, 1);
-    const body = (r.content || r.reasoning || "").toLowerCase();
+    const body = r.content.toLowerCase();
     // soft check — model should mention pong
     const okish = body.includes("pong") || body.length > 0;
     assert(okish, `unexpected body: ${body.slice(0, 80)}`);
@@ -162,16 +190,16 @@ function suiteLatency(): Suite {
       model: MODEL,
       messages: [{ role: "user", content: "Say hi in 2 words max." }],
       stream: true,
-      max_tokens: 24,
+      max_tokens: isHy3 ? 128 : 24,
       temperature: 0,
       applyNativeReasoning: false,
-      label: "grok.latency2",
+      label: isHy3 ? "hy3.latency2" : "grok.latency2",
     });
-    assert((r.content || r.reasoning || "").length > 0, "empty");
+    assert(r.content.trim().length > 0, "empty content after promote");
     return {
       ttftMs: r.ttftMs,
       durationMs: r.durationMs,
-      preview: (r.content || "").slice(0, 40),
+      preview: r.content.slice(0, 40),
     };
   });
 
@@ -461,18 +489,20 @@ function suiteMemoryLive(): Suite {
 function suiteFusion(): Suite {
   const s = new Suite("fusion");
 
-  s.test("Ultra+Fusion grok main + peer reason → execute", async () => {
-    // Prefer OpenRouter free peer; else dual-sample grok
-    const peerKey = hasOpenRouter()
-      ? "openrouter/tencent/hy3:free"
-      : `xai/${MODEL}`;
+  s.test("Ultra+Fusion main + peer reason → execute", async () => {
+    // Peer: when main is already hy3, dual-sample same model; else prefer free hy3 peer
+    const peerKey = isHy3
+      ? MAIN_KEY
+      : hasOpenRouter()
+        ? "openrouter/tencent/hy3:free"
+        : MAIN_KEY;
 
     saveAgentSettings({
       reasoning: {
         custom: "ultra-fusion",
         effort: "low",
         perModelEffort: {
-          [`xai/${MODEL}`]: "low",
+          [MAIN_KEY]: "low",
           [peerKey]: "low",
         },
         fusion: {
@@ -487,7 +517,7 @@ function suiteFusion(): Suite {
     const store = new HarnessStore({
       provider: PROVIDER,
       model: MODEL,
-      title: "grok-fusion",
+      title: isHy3 ? "hy3-fusion" : "grok-fusion",
     });
     store.subscribe(() => {});
 
@@ -519,7 +549,7 @@ function suiteFusion(): Suite {
         buildSystemPrompt() + "\n\n" + prep.systemAddon,
       seedReasoning: prep.displayReasoning,
       lightReasoning: true,
-      label: "grok.fusion.execute",
+      label: isHy3 ? "hy3.fusion.execute" : "grok.fusion.execute",
     });
     const executeMs = Date.now() - t0;
 
@@ -558,7 +588,7 @@ function suiteFusion(): Suite {
 }
 
 function summarizeGrok(report: BenchReport): void {
-  console.log("\n── Grok performance snapshot ──");
+  console.log(`\n── ${MAIN_KEY} performance snapshot ──`);
   for (const s of report.suites) {
     for (const c of s.cases) {
       if (c.status !== "pass" || !c.detail) continue;

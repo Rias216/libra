@@ -204,8 +204,8 @@ function handleCommand(
               "- `/theme` `/font` `/whoami` `/logout`\n\n" +
               "### Reasoning\n\n" +
               "Effort levels are **per model** (from the provider catalog). Esc goes **back** in nested pickers.\n\n" +
-              "- **ultra** — max effort + auto subagents\n" +
-              "- **ultra-fusion** — both reason; main compares both traces & executes",
+              "- **ultra** — max effort + Codex multi-agent (spawn/wait, proactive)\n" +
+              "- **ultra-fusion** — peer reasons; main compares, then multi-agent execute",
           },
         ],
       });

@@ -257,18 +257,19 @@ function buildMainCompareAddon(
 
   const reviewHint =
     fusion.fuseInstructions?.trim() ||
-    "Compare your own first-pass reasoning with every secondary trace. Prefer stronger arguments, catch errors, and keep only what is correct, valuable, and actionable. Merge into one plan, then execute.";
+    "Compare your own first-pass reasoning with every secondary trace. Prefer stronger arguments, catch errors, and keep only what is correct, valuable, and actionable. Merge into one plan, then execute. Use spawn_agent/wait_agent for independent parallel workstreams.";
 
   return `
 ## Multi-model fusion — phase 2 (you are the MAIN executor)
 
 Phase 1 already ran: you and the secondary model(s) each produced a REASONING-ONLY plan (no tools).
 Now compare both reasonings, merge the best ideas, and EXECUTE with tools. Prefer tools over speculation.
+Multi-agent tools (spawn_agent, wait_agent, send_input, close_agent, list_agents) are available for parallel specialized work.
 
 ### Job
 1. Compare first-pass + secondary traces
 2. ${reviewHint}
-3. Act with tools now — do not only restate plans
+3. Act with tools now — do not only restate plans. Spawn subagents when work is independent and parallelizable.
 
 ### User request
 ${userPrompt}

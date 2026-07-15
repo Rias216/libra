@@ -17,6 +17,52 @@ export interface ChatMessage {
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
+  /**
+   * In-turn reasoning / CoT to replay on the next model call (tool loop).
+   * OpenRouter-style field; mirrored to reasoning_content for DeepSeek-like APIs.
+   * Matches codex (reasoning persists across tool rounds) + opencode interleaved replay.
+   */
+  reasoning?: string;
+  /** OpenAI-compatible alias used by DeepSeek / some gateways */
+  reasoning_content?: string;
+}
+
+/**
+ * Attach mid-turn reasoning so tool-loop follow-ups keep CoT context.
+ * Codex: reasoning persists across in-turn tool rounds.
+ * OpenCode: interleaved providers re-send reasoning_content / reasoning on assistant msgs.
+ * Empty / whitespace reasoning is omitted (no empty fields).
+ */
+export function attachInTurnReasoning(
+  msg: ChatMessage,
+  reasoning: string | null | undefined,
+): ChatMessage {
+  const r = (reasoning ?? "").trim();
+  if (!r) return msg;
+  return {
+    ...msg,
+    reasoning: r,
+    reasoning_content: r,
+  };
+}
+
+/**
+ * Build the assistant message for a tool-call round of the agent loop.
+ * Content may be empty/null when the model only planned + called tools.
+ */
+export function buildAssistantToolRoundMessage(opts: {
+  content?: string | null;
+  tool_calls: ToolCall[];
+  reasoning?: string | null;
+}): ChatMessage {
+  return attachInTurnReasoning(
+    {
+      role: "assistant",
+      content: opts.content?.trim() ? opts.content : null,
+      tool_calls: opts.tool_calls,
+    },
+    opts.reasoning,
+  );
 }
 
 export interface ToolCall {
@@ -109,14 +155,273 @@ export function mergeReasoningText(
   content: string | null | undefined,
   reasoning: string | null | undefined,
 ): string {
-  const c = (content ?? "").trim();
-  const r = (reasoning ?? "").trim();
+  const partitioned = partitionModelOutput(content, reasoning);
+  const c = partitioned.content.trim();
+  const r = partitioned.reasoning.trim();
   if (r && c) {
     // Prefer longer substantive text; include both when distinct
     if (c.includes(r) || r.includes(c)) return r.length >= c.length ? r : c;
     return `${r}\n\n${c}`;
   }
   return r || c || "";
+}
+
+/** Known thinking / CoT wrappers models sometimes dump into content. */
+const THINK_TAG_PAIRS: Array<{ open: RegExp; close: RegExp; closeLen: number }> =
+  [
+    { open: /<think>/i, close: /<\/think>/i, closeLen: 8 },
+    { open: /<thinking>/i, close: /<\/thinking>/i, closeLen: 12 },
+    { open: /<reasoning>/i, close: /<\/reasoning>/i, closeLen: 12 },
+    { open: /<reason>/i, close: /<\/reason>/i, closeLen: 9 },
+    // DeepSeek-style fullwidth markers
+    { open: /◁think▷/, close: /◁\/think▷/, closeLen: 8 },
+  ];
+
+/**
+ * Peel fenced think/reasoning tags out of model content so they never
+ * render as the user-visible answer.
+ */
+export function peelThinkTags(raw: string): {
+  content: string;
+  reasoning: string;
+} {
+  if (!raw) return { content: "", reasoning: "" };
+  let content = raw;
+  const reasoningParts: string[] = [];
+
+  // Multi-pass: tags may nest or repeat
+  let guard = 0;
+  while (guard++ < 16) {
+    let matched = false;
+    for (const pair of THINK_TAG_PAIRS) {
+      const openMatch = content.match(pair.open);
+      if (!openMatch || openMatch.index == null) continue;
+      const openAt = openMatch.index;
+      const afterOpen = openAt + openMatch[0].length;
+      const rest = content.slice(afterOpen);
+      const closeMatch = rest.match(pair.close);
+      if (!closeMatch || closeMatch.index == null) {
+        // Unclosed think block: treat remainder as reasoning
+        const leaked = rest.trim();
+        if (leaked) reasoningParts.push(leaked);
+        content = content.slice(0, openAt);
+        matched = true;
+        break;
+      }
+      const inner = rest.slice(0, closeMatch.index).trim();
+      if (inner) reasoningParts.push(inner);
+      const afterClose = afterOpen + closeMatch.index + closeMatch[0].length;
+      content = content.slice(0, openAt) + content.slice(afterClose);
+      matched = true;
+      break;
+    }
+    if (!matched) break;
+  }
+
+  return {
+    content: content.replace(/^\s*\n+/, "").replace(/\n+\s*$/, "").trimEnd(),
+    reasoning: reasoningParts.join("\n\n").trim(),
+  };
+}
+
+function joinReasoningChunks(...parts: string[]): string {
+  return parts
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/**
+ * Keep reasoning out of the final answer channel.
+ * - Strips think tags from content into reasoning
+ * - Drops content that is an exact (or near-exact) copy of reasoning
+ */
+export function partitionModelOutput(
+  content: string | null | undefined,
+  reasoning: string | null | undefined,
+): { content: string; reasoning: string } {
+  const peeled = peelThinkTags(content ?? "");
+  let c = peeled.content;
+  let r = joinReasoningChunks(reasoning ?? "", peeled.reasoning);
+
+  const ct = c.trim();
+  const rt = r.trim();
+
+  // Exact duplicate: model echoed CoT into content
+  if (ct && rt && ct === rt) {
+    return { content: "", reasoning: rt };
+  }
+
+  // Content is a long prefix/suffix of reasoning (common leak pattern)
+  if (ct.length > 80 && rt.length > ct.length && rt.includes(ct)) {
+    return { content: "", reasoning: rt };
+  }
+
+  return { content: c, reasoning: r };
+}
+
+/**
+ * Free / reasoning-first models (e.g. hy3:free) often spend the whole
+ * completion budget on the reasoning channel and never emit `content`.
+ * Promote reasoning → content only when the model never produced any
+ * content channel text (raw empty). Do NOT re-promote after
+ * partitionModelOutput stripped a CoT echo (content===reasoning), or
+ * we put the CoT back into the answer.
+ *
+ * Pass `rawContentEmpty: true` only when the pre-partition content
+ * buffer was empty. Default false keeps partitioned empty content.
+ */
+/**
+ * When promoting a pure-reasoning completion, prefer a short likely answer
+ * (last quoted phrase / last non-meta line) over dumping the whole CoT.
+ */
+export function extractLikelyAnswer(reasoning: string): string {
+  const r = reasoning.trim();
+  if (!r) return "";
+  // Single short token / phrase — already the answer
+  if (r.length <= 40 && !/\n/.test(r)) return r;
+
+  // Prefer last short quoted phrase (common CoT: output "Hi there")
+  const quotes = [...r.matchAll(/["“]([^"”\n]{1,48})["”]/g)].map((m) => m[1]!.trim());
+  if (quotes.length) {
+    const last = quotes[quotes.length - 1]!;
+    if (last && !/^(the user|i should|so i|let me|reply with)/i.test(last)) {
+      return last;
+    }
+  }
+
+  const lines = r
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (line.length > 80) continue;
+    if (/^(the user|i should|so i|let me|okay|ok[,.]|first|then|because)/i.test(line)) {
+      continue;
+    }
+    // strip leading list markers
+    const cleaned = line.replace(/^[-*•]\s+/, "").replace(/^[`"']|[`"']$/g, "");
+    if (cleaned.length > 0 && cleaned.length <= 60) return cleaned;
+  }
+
+  // Fall back to full reasoning (better than empty answer channel)
+  return r;
+}
+
+export function ensureAnswerChannel(
+  content: string | null | undefined,
+  reasoning: string | null | undefined,
+  opts?: { rawContentEmpty?: boolean },
+): { content: string; reasoning: string } {
+  const c = (content ?? "").trimEnd();
+  const r = (reasoning ?? "").trim();
+  if (c.trim()) return { content: c, reasoning: r };
+  if (!r) return { content: "", reasoning: "" };
+  if (!opts?.rawContentEmpty) return { content: "", reasoning: r };
+  return { content: extractLikelyAnswer(r), reasoning: r };
+}
+
+/**
+ * Streaming content filter: extract think-tag bodies into the reasoning
+ * channel so partial tags across chunk boundaries do not escape.
+ */
+export class ContentReasoningSplitter {
+  private buf = "";
+  private mode: "text" | "think" = "text";
+  private activeClose: RegExp | null = null;
+  private activeCloseLen = 0;
+
+  push(delta: string): { text: string; reasoning: string } {
+    if (!delta) return { text: "", reasoning: "" };
+    this.buf += delta;
+    let text = "";
+    let reasoning = "";
+
+    // Bound work per push (pathological streams)
+    let steps = 0;
+    while (this.buf.length > 0 && steps++ < 10_000) {
+      if (this.mode === "text") {
+        const found = findEarliestOpenTag(this.buf);
+        if (!found) {
+          // Hold back a short tail so split tags ("<thi" + "nk>") still match
+          const hold = 12;
+          if (this.buf.length > hold) {
+            text += this.buf.slice(0, this.buf.length - hold);
+            this.buf = this.buf.slice(this.buf.length - hold);
+          }
+          break;
+        }
+        if (found.index > 0) {
+          text += this.buf.slice(0, found.index);
+        }
+        this.buf = this.buf.slice(found.index + found.openLen);
+        this.mode = "think";
+        this.activeClose = found.close;
+        this.activeCloseLen = found.closeLen;
+      } else {
+        const closeRe = this.activeClose!;
+        const m = this.buf.match(closeRe);
+        if (!m || m.index == null) {
+          // Emit safe prefix; keep tail that might be start of close tag
+          const hold = Math.max(this.activeCloseLen, 12);
+          if (this.buf.length > hold) {
+            reasoning += this.buf.slice(0, this.buf.length - hold);
+            this.buf = this.buf.slice(this.buf.length - hold);
+          }
+          break;
+        }
+        reasoning += this.buf.slice(0, m.index);
+        this.buf = this.buf.slice(m.index + m[0].length);
+        this.mode = "text";
+        this.activeClose = null;
+        this.activeCloseLen = 0;
+      }
+    }
+
+    return { text, reasoning };
+  }
+
+  /** Flush remaining buffer at stream end. */
+  flush(): { text: string; reasoning: string } {
+    const left = this.buf;
+    this.buf = "";
+    if (!left) return { text: "", reasoning: "" };
+    if (this.mode === "think") {
+      this.mode = "text";
+      this.activeClose = null;
+      this.activeCloseLen = 0;
+      return { text: "", reasoning: left };
+    }
+    return { text: left, reasoning: "" };
+  }
+}
+
+function findEarliestOpenTag(s: string): {
+  index: number;
+  openLen: number;
+  close: RegExp;
+  closeLen: number;
+} | null {
+  let best: {
+    index: number;
+    openLen: number;
+    close: RegExp;
+    closeLen: number;
+  } | null = null;
+  for (const pair of THINK_TAG_PAIRS) {
+    const m = s.match(pair.open);
+    if (!m || m.index == null) continue;
+    if (!best || m.index < best.index) {
+      best = {
+        index: m.index,
+        openLen: m[0].length,
+        close: pair.close,
+        closeLen: pair.closeLen,
+      };
+    }
+  }
+  return best;
 }
 
 /** Extract reasoning text from OpenRouter-style message fields. */
@@ -322,8 +627,14 @@ async function chatOpenAI(
     };
   };
   const msg = json.choices?.[0]?.message;
-  const content = typeof msg?.content === "string" ? msg.content : "";
-  const reasoning = extractReasoningFromMessage(msg);
+  const rawContent = typeof msg?.content === "string" ? msg.content : "";
+  const rawReasoning = extractReasoningFromMessage(msg);
+  const partitioned = partitionModelOutput(rawContent, rawReasoning);
+  const { content, reasoning } = ensureAnswerChannel(
+    partitioned.content,
+    partitioned.reasoning,
+    { rawContentEmpty: !rawContent.trim() },
+  );
   if (content && handlers?.onText) handlers.onText(content);
   if (reasoning && handlers?.onReasoning) handlers.onReasoning(reasoning);
 
@@ -379,6 +690,8 @@ async function consumeOpenAIStream(
   let ttftMs: number | undefined;
   let firstKind: "text" | "reasoning" | "tool" | undefined;
   let chunkCount = 0;
+  /** Strip think-tags from content deltas so CoT never hits the text channel */
+  const contentSplit = new ContentReasoningSplitter();
 
   const markFirst = (kind: "text" | "reasoning" | "tool") => {
     if (ttftMs != null) return;
@@ -388,6 +701,24 @@ async function consumeOpenAIStream(
     dbg("llm", "ttft", { ttftMs, kind });
   };
 
+  const emitText = (d: string) => {
+    if (!d) return;
+    markFirst("text");
+    content += d;
+    handlers?.onText?.(d);
+  };
+  const emitReasoning = (d: string) => {
+    if (!d) return;
+    markFirst("reasoning");
+    reasoning += d;
+    handlers?.onReasoning?.(d);
+  };
+  const emitContentDelta = (raw: string) => {
+    const split = contentSplit.push(raw);
+    emitText(split.text);
+    emitReasoning(split.reasoning);
+  };
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -395,9 +726,9 @@ async function consumeOpenAIStream(
     const lines = buf.split("\n");
     buf = lines.pop() ?? "";
     for (const line of lines) {
-      const s = line.trim();
-      if (!s.startsWith("data:")) continue;
-      const data = s.slice(5).trim();
+      const sLine = line.trim();
+      if (!sLine.startsWith("data:")) continue;
+      const data = sLine.slice(5).trim();
       if (data === "[DONE]") continue;
       let json: {
         choices?: Array<{
@@ -417,6 +748,8 @@ async function consumeOpenAIStream(
           message?: {
             content?: string | null;
             reasoning?: string;
+            reasoning_content?: string;
+            reasoning_details?: Array<{ type?: string; text?: string }>;
             tool_calls?: ToolCall[];
           };
           finish_reason?: string | null;
@@ -451,20 +784,19 @@ async function consumeOpenAIStream(
       const delta = choice.delta;
       if (delta) {
         if (delta.content) {
-          markFirst("text");
-          content += delta.content;
-          handlers?.onText?.(delta.content);
+          emitContentDelta(delta.content);
         }
         const r =
           delta.reasoning ??
           delta.reasoning_content ??
           (Array.isArray(delta.reasoning_details)
-            ? delta.reasoning_details.map((d) => d.text ?? "").join("")
+            ? delta.reasoning_details
+                .map((d) => d.text ?? "")
+                .filter(Boolean)
+                .join("")
             : "");
         if (r) {
-          markFirst("reasoning");
-          reasoning += r;
-          handlers?.onReasoning?.(r);
+          emitReasoning(r);
         }
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
@@ -497,15 +829,11 @@ async function consumeOpenAIStream(
       if (choice.message) {
         const m = choice.message;
         if (m.content && !content) {
-          markFirst("text");
-          content = m.content;
-          handlers?.onText?.(m.content);
+          emitContentDelta(m.content);
         }
         const mr = extractReasoningFromMessage(m);
         if (mr && !reasoning) {
-          markFirst("reasoning");
-          reasoning = mr;
-          handlers?.onReasoning?.(mr);
+          emitReasoning(mr);
         }
         if (m.tool_calls?.length && toolCalls.length === 0) {
           for (let i = 0; i < m.tool_calls.length; i++) {
@@ -524,6 +852,25 @@ async function consumeOpenAIStream(
       }
     }
   }
+
+  // Flush held content (possible partial open-tag tail)
+  const tail = contentSplit.flush();
+  emitText(tail.text);
+  emitReasoning(tail.reasoning);
+
+  // Final partition: drop content that is a pure reasoning echo
+  const rawContentEmpty = !content.trim();
+  const partitioned = partitionModelOutput(content, reasoning);
+  content = partitioned.content;
+  reasoning = partitioned.reasoning;
+  // Reasoning-only completions (hy3:free) → fill answer only if no content
+  // was ever streamed (not when partition stripped a CoT echo).
+  const ensured = ensureAnswerChannel(content, reasoning, { rawContentEmpty });
+  if (rawContentEmpty && ensured.content.trim() && handlers?.onText) {
+    handlers.onText(ensured.content);
+  }
+  content = ensured.content;
+  reasoning = ensured.reasoning;
 
   // Ensure tool IDs always present for the next round
   for (let i = 0; i < toolCalls.length; i++) {

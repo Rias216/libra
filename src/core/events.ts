@@ -132,6 +132,8 @@ export function reduce(state: HarnessState, event: HarnessEvent): HarnessState {
     case "reasoning.delta": {
       // Hot path: mutate the target part in place (no full message array clone).
       // Stream deltas are the dominant event volume during agent runs.
+      // Strict type match: never append reasoning into a text part (or vice versa).
+      const expectType = event.type === "text.delta" ? "text" : "reasoning";
       const msgs = state.messages;
       for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i]!;
@@ -140,7 +142,7 @@ export function reduce(state: HarnessState, event: HarnessEvent): HarnessState {
         for (let j = 0; j < parts.length; j++) {
           const p = parts[j]!;
           if (p.id !== event.partId) continue;
-          if (p.type !== "text" && p.type !== "reasoning") return state;
+          if (p.type !== expectType) return state;
           p.content += event.delta;
           p.streaming = true;
           return state;

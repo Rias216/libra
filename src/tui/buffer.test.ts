@@ -6,7 +6,7 @@
 import { FrameBuffer } from "./buffer.js";
 import { reduce } from "../core/events.js";
 import { createEmptyState, newId } from "../core/types.js";
-import { renderMarkdown } from "./markdown.js";
+import { ensureCodeFences, renderMarkdown } from "./markdown.js";
 import { resolveTheme } from "./theme.js";
 import { buildScrollRows } from "./scrollback.js";
 import { computeScrollbar, scrollPercent } from "./scrollbar.js";
@@ -66,6 +66,39 @@ function assert(cond: unknown, msg: string): void {
     parts: [{ id: "p1", type: "text", content: "hello" }],
   });
   assert(buildScrollRows(state, theme, 60, 0).length > 0, "scroll rows");
+}
+
+// Bare code auto-fenced so it renders as a compact block
+{
+  const bare = [
+    "Here is the fix:",
+    "const x = 1;",
+    "function add(a, b) {",
+    "  return a + b;",
+    "}",
+    "Done.",
+  ].join("\n");
+  const fenced = ensureCodeFences(bare);
+  assert(fenced.includes("```"), "bare code should gain fences: " + fenced);
+  assert(fenced.includes("const x = 1;"), "code preserved");
+  assert(
+    fenced.indexOf("```") < fenced.indexOf("const x"),
+    "fence opens before code",
+  );
+  // Existing fences untouched
+  const already = "```js\nconst y = 2;\n```";
+  assert(ensureCodeFences(already) === already, "existing fences preserved");
+  // Indented code block
+  const indented = "Intro\n\n    def foo():\n        return 1\n\nOutro";
+  const ind = ensureCodeFences(indented);
+  assert(ind.includes("```"), "indented code fenced: " + ind);
+  const theme = resolveTheme("libra-night");
+  const painted = renderMarkdown(bare, theme, 60);
+  const plain = painted.map((l) => l.plain).join("\n");
+  assert(
+    plain.includes("┌") || plain.includes("│"),
+    "code block paints box gutters: " + plain.slice(0, 200),
+  );
 }
 
 // Scrollbar

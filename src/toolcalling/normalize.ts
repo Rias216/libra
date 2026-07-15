@@ -59,9 +59,19 @@ export function normalizeToolArgs(
       break;
     }
     case "read_file": {
-      if (out.path != null && out.target_file == null) {
+      if (out.path != null && out.target_file == null && out.target_files == null) {
         out.target_file = out.path;
         delete out.path;
+      }
+      // paths: ["a","b"] → target_files
+      if (Array.isArray(out.paths) && out.target_files == null) {
+        out.target_files = out.paths;
+        delete out.paths;
+      }
+      // files alias
+      if (Array.isArray(out.files) && out.target_files == null) {
+        out.target_files = out.files;
+        delete out.files;
       }
       break;
     }
@@ -81,11 +91,21 @@ export function normalizeToolArgs(
       }
       break;
     }
-    case "run_shell": {
+    case "run_shell":
+    case "run_terminal_command": {
+      // Catalog / models often pass timeout or timeout_s instead of timeout_ms
       if (out.timeout_s != null && out.timeout_ms == null) {
         const s = Number(out.timeout_s);
         if (Number.isFinite(s)) out.timeout_ms = Math.round(s * 1000);
         delete out.timeout_s;
+      }
+      if (out.timeout != null && out.timeout_ms == null) {
+        const t = Number(out.timeout);
+        if (Number.isFinite(t)) {
+          // Heuristic: values ≤ 600 look like seconds; larger are ms
+          out.timeout_ms = t > 0 && t <= 600 ? Math.round(t * 1000) : Math.round(t);
+        }
+        delete out.timeout;
       }
       break;
     }
@@ -107,6 +127,25 @@ export function normalizeToolArgs(
     case "read_file": {
       if (typeof out.target_file === "string") {
         out.target_file = out.target_file.replace(/\\/g, "/");
+      }
+      // Normalize batch paths: slash, drop empties, sort for stable fingerprint
+      if (Array.isArray(out.target_files)) {
+        const files = (out.target_files as unknown[])
+          .map((p) => String(p ?? "").replace(/\\/g, "/").trim())
+          .filter(Boolean);
+        // If only one entry, collapse to single-file form
+        if (files.length === 1 && out.target_file == null) {
+          out.target_file = files[0];
+          delete out.target_files;
+        } else if (files.length > 1) {
+          out.target_files = [...files].sort();
+          // Batch ignores single-file range args (ambiguous across files)
+          delete out.offset;
+          delete out.limit;
+          delete out.target_file;
+        } else {
+          delete out.target_files;
+        }
       }
       break;
     }
@@ -156,26 +195,34 @@ export function toolFingerprint(
   return `${canonicalToolName(name)}:${stableJson(n)}`;
 }
 
-/** Parse tool arguments JSON with repair. */
+/** Parse tool arguments JSON with repair (trailing commas, mild fixes). */
 export function parseToolArgs(raw: string | undefined): Record<string, unknown> {
   if (!raw || !raw.trim()) return {};
-  try {
-    const v = JSON.parse(raw);
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      return v as Record<string, unknown>;
-    }
-    return { _value: v };
-  } catch {
-    // Try mild repair: trailing commas
+  const attempts = [
+    raw,
+    // Trailing commas
+    raw.replace(/,\s*([}\]])/g, "$1"),
+    // Single-quoted keys/strings (common model slip) — only when no double quotes
+    !raw.includes('"')
+      ? raw.replace(/'/g, '"')
+      : null,
+    // Truncated trailing junk after final }
+    (() => {
+      const i = raw.lastIndexOf("}");
+      return i > 0 ? raw.slice(0, i + 1).replace(/,\s*([}\]])/g, "$1") : null;
+    })(),
+  ];
+  for (const attempt of attempts) {
+    if (!attempt) continue;
     try {
-      const repaired = raw.replace(/,\s*([}\]])/g, "$1");
-      const v = JSON.parse(repaired);
+      const v = JSON.parse(attempt);
       if (v && typeof v === "object" && !Array.isArray(v)) {
         return v as Record<string, unknown>;
       }
+      return { _value: v };
     } catch {
-      /* */
+      /* try next */
     }
-    return { _raw: raw };
   }
+  return { _raw: raw };
 }

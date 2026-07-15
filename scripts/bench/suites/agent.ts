@@ -7,6 +7,7 @@ import {
   AgentLoop,
   toolFingerprint,
   normalizeToolArgs,
+  _testHistoryToMessages,
 } from "../../../src/agent/loop.js";
 import { HarnessStore } from "../../../src/core/store.js";
 import { newId } from "../../../src/core/types.js";
@@ -19,7 +20,12 @@ export function suiteAgent(): Suite {
     const p = buildSystemPrompt();
     assertIncludes(p, "Libra");
     assertIncludes(p, "tools");
-    assertIncludes(p, "re-run");
+    // OpenCode-style sections
+    assertIncludes(p, "Tool usage policy");
+    assertIncludes(p, "PARALLEL");
+    assertIncludes(p, "target_files");
+    assertIncludes(p, "read_file DIRECTLY");
+    assertIncludes(p, "specialized tools");
   });
 
   s.test("dedupe fingerprints for list_dir variants", () => {
@@ -69,6 +75,39 @@ export function suiteAgent(): Suite {
     assertEq(store.state.messages.filter((m) => m.role === "assistant").length, 1);
     const tools = store.state.messages[1]!.parts.filter((p) => p.type === "tool");
     assertEq(tools.length, 1);
+  });
+
+  s.test("historyToMessages attaches reasoning from store parts", () => {
+    const store = new HarnessStore({ model: "m", provider: "openrouter" });
+    store.appendUser("plan then list");
+    const a = store.startAssistant();
+    store.appendPart(a.id, {
+      id: newId("p"),
+      type: "reasoning",
+      content: "I should list the directory first",
+    });
+    store.appendPart(a.id, {
+      id: newId("p"),
+      type: "tool",
+      toolName: "list_dir",
+      args: { target_directory: "." },
+      status: "completed",
+      result: "src\npackage.json",
+    });
+    store.appendPart(a.id, {
+      id: newId("p"),
+      type: "text",
+      content: "Here are the files.",
+    });
+    // open next turn so history includes completed assistant
+    store.appendUser("next");
+    const wire = _testHistoryToMessages(store);
+    const asst = wire.find((m) => m.role === "assistant");
+    assert(asst != null, "assistant wire message");
+    assertEq(asst!.reasoning, "I should list the directory first");
+    assertEq(asst!.reasoning_content, "I should list the directory first");
+    assertIncludes(String(asst!.content ?? ""), "list_dir");
+    assertIncludes(String(asst!.content ?? ""), "Here are the files");
   });
 
   return s;

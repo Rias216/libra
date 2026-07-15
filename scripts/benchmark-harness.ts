@@ -26,9 +26,13 @@ import { suiteReasoning } from "./bench/suites/reasoning.js";
 import { suiteDebug } from "./bench/suites/debug.js";
 import { suiteNormalize } from "./bench/suites/normalize.js";
 import { suiteFusionLocal } from "./bench/suites/fusion-local.js";
+import { suiteToolHarden } from "./bench/suites/tool-harden.js";
+import { suiteSubagent } from "./bench/suites/subagent.js";
 
 const ALL: Suite[] = [
   suiteTools(),
+  suiteToolHarden(),
+  suiteSubagent(),
   suiteNormalize(),
   suiteMemory(),
   suiteStore(),

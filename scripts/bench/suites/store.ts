@@ -54,6 +54,22 @@ export function suiteStore(): Suite {
     assert(part.type === "reasoning" && part.content === "think");
   });
 
+  s.test("text.delta does not mutate reasoning parts (no escape)", () => {
+    const store = new HarnessStore({});
+    const a = store.startAssistant();
+    const pid = newId("p");
+    store.appendPart(a.id, {
+      id: pid,
+      type: "reasoning",
+      content: "plan",
+      streaming: true,
+    });
+    // Mis-routed text delta must be ignored
+    store.textDelta(a.id, pid, " LEAKED");
+    const part = store.state.messages[0]!.parts[0]!;
+    assert(part.type === "reasoning" && part.content === "plan", JSON.stringify(part));
+  });
+
   s.test("tool status pipeline", () => {
     const store = new HarnessStore({});
     const a = store.startAssistant();

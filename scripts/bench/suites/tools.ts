@@ -45,7 +45,9 @@ export function suiteTools(): Suite {
       "grep",
       "glob",
       "run_terminal_command",
+      "process",
       "web_fetch",
+      "todo_write",
     ]) {
       assert(schema.has(name), `schema missing ${name}`);
       assert(builtin.has(name), `BUILTIN_TOOLS missing ${name}`);
@@ -101,6 +103,29 @@ export function suiteTools(): Suite {
     assert(!r.output.includes("1|"), "should skip line 1");
   });
 
+  s.test("read_file batch target_files one call", async () => {
+    // Shortcut: multi-file read in a single tool invocation (no N rounds)
+    const r = await exec.run("read_file", {
+      target_files: ["sub/nested.ts", "hello.txt"],
+    });
+    assert(r.ok, r.output);
+    assertIncludes(r.output, "===== hello.txt =====");
+    assertIncludes(r.output, "===== sub/nested.ts =====");
+    assertIncludes(r.output, "hello world");
+    assertIncludes(r.output, "export const x");
+    assertEq((r.data as { count?: number })?.count, 2);
+  });
+
+  s.test("read_file batch partial failure still ok", async () => {
+    const r = await exec.run("read_file", {
+      target_files: ["hello.txt", "missing-nope.txt"],
+    });
+    assert(r.ok, r.output);
+    assertIncludes(r.output, "hello world");
+    assertIncludes(r.output, "missing-nope.txt");
+    assertIncludes(r.output.toLowerCase(), "error");
+  });
+
   s.test("write creates parents", async () => {
     const r = await exec.run("write", {
       file_path: "deep/a/b.txt",
@@ -110,16 +135,17 @@ export function suiteTools(): Suite {
     assertEq(readFileSync(join(cwd, "deep/a/b.txt"), "utf8"), "created");
   });
 
-  s.test("search_replace once", async () => {
+  s.test("search_replace once (unique old_string)", async () => {
+    writeFileSync(join(cwd, "replace_me.txt"), "aaa bbb ccc\n", "utf8");
     const r = await exec.run("search_replace", {
       file_path: "replace_me.txt",
-      old_string: "aaa",
-      new_string: "XXX",
+      old_string: "aaa bbb",
+      new_string: "XXX YYY",
       replace_all: false,
     });
     assert(r.ok, r.output);
     const body = readFileSync(join(cwd, "replace_me.txt"), "utf8");
-    assertEq(body, "XXX bbb aaa\n");
+    assertEq(body, "XXX YYY ccc\n");
   });
 
   s.test("search_replace all", async () => {
@@ -134,6 +160,20 @@ export function suiteTools(): Suite {
     assertEq(readFileSync(join(cwd, "replace_me.txt"), "utf8"), "Y bbb Y\n");
   });
 
+  s.test("search_replace ambiguous without replace_all → error", async () => {
+    writeFileSync(join(cwd, "replace_me.txt"), "aaa bbb aaa\n", "utf8");
+    const r = await exec.run("search_replace", {
+      file_path: "replace_me.txt",
+      old_string: "aaa",
+      new_string: "Z",
+      replace_all: false,
+    });
+    assert(!r.ok, "should fail on ambiguous match");
+    assertIncludes(r.output.toLowerCase(), "times");
+    // File unchanged
+    assertEq(readFileSync(join(cwd, "replace_me.txt"), "utf8"), "aaa bbb aaa\n");
+  });
+
   s.test("search_replace missing string → error", async () => {
     const r = await exec.run("search_replace", {
       file_path: "hello.txt",
@@ -141,6 +181,20 @@ export function suiteTools(): Suite {
       new_string: "x",
     });
     assert(!r.ok, "should fail");
+  });
+
+  s.test("read_file binary → error", async () => {
+    writeFileSync(join(cwd, "blob.bin"), Buffer.from([0, 1, 2, 3, 0, 255, 10]));
+    const r = await exec.run("read_file", { target_file: "blob.bin" });
+    assert(!r.ok, "binary should fail");
+    assertIncludes(r.output.toLowerCase(), "binary");
+  });
+
+  s.test("read_file missing suggests similar path", async () => {
+    const r = await exec.run("read_file", { target_file: "helo.txt" });
+    assert(!r.ok, "should fail");
+    // suggestion is best-effort
+    assertIncludes(r.output.toLowerCase(), "not found");
   });
 
   s.test("grep finds pattern", async () => {
@@ -179,6 +233,30 @@ export function suiteTools(): Suite {
     assert(r.ok, r.output);
     assertIncludes(r.output, "bench-ok");
     assertIncludes(r.output, "exit");
+  });
+
+  s.test("run_terminal_command failure surfaces stderr (not bare error)", async () => {
+    const r = await exec.run("run_terminal_command", {
+      command:
+        process.platform === "win32"
+          ? "cmd /c exit 7"
+          : "sh -c 'echo fail-msg 1>&2; exit 7'",
+      timeout_ms: 10_000,
+    });
+    assert(!r.ok, "should fail");
+    assertIncludes(r.output, "exit");
+    // Must not collapse to the useless bare string "error"
+    assert(r.output.trim() !== "error", r.output);
+    assert(r.output.length > 5, r.output);
+  });
+
+  s.test("run_terminal_command accepts timeout alias", async () => {
+    const r = await exec.run("run_terminal_command", {
+      command: "echo alias-ok",
+      timeout: 15_000,
+    });
+    assert(r.ok, r.output);
+    assertIncludes(r.output, "alias-ok");
   });
 
   s.test("path escape blocked", async () => {

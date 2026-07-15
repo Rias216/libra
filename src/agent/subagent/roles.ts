@@ -1,0 +1,192 @@
+/**
+ * Built-in agent roles — Codex ships default / explorer / worker;
+ * Libra maps those plus project roles (review, test, security).
+ */
+
+import type { SubagentRole } from "../config.js";
+import type { ToolsetId } from "../../toolcalling/registry.js";
+import type { PermissionRules } from "../../toolcalling/permissions.js";
+
+export type RoleSandbox = "read-only" | "workspace-write";
+
+export interface ResolvedRole {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  modelKey?: string;
+  reasoningEffort?: string;
+  sandbox: RoleSandbox;
+  /** Toolsets exposed to this role */
+  toolsets: ToolsetId[];
+  permissions: PermissionRules;
+}
+
+/** Codex-compatible built-ins (always available when multi-agent is on). */
+export const CODEX_BUILTIN_ROLES: Array<
+  SubagentRole & {
+    description: string;
+    sandbox: RoleSandbox;
+  }
+> = [
+  {
+    id: "default",
+    name: "Default",
+    description:
+      "General-purpose subagent for mixed research and implementation.",
+    instructions:
+      "You are a general-purpose coding subagent. Complete the assigned task thoroughly. Prefer specialized file tools over shell. Return a concise summary of findings and changes for the parent agent.",
+    sandbox: "workspace-write",
+    enabled: true,
+  },
+  {
+    id: "explorer",
+    name: "Explorer",
+    description:
+      "Read-only codebase explorer for gathering evidence before changes.",
+    instructions:
+      "Stay in exploration mode. Trace real execution paths, cite files and symbols, and avoid proposing large rewrites unless asked. Prefer search and targeted reads over broad scans. Do not edit files or run destructive commands. Return a distilled evidence summary for the parent.",
+    sandbox: "read-only",
+    enabled: true,
+  },
+  {
+    id: "worker",
+    name: "Worker",
+    description:
+      "Execution-focused agent for implementation, fixes, and validation.",
+    instructions:
+      "Own the assigned implementation task. Make the smallest defensible change, keep unrelated files untouched, and validate when practical (tests/typecheck). Return a concise summary of what you changed and how to verify.",
+    sandbox: "workspace-write",
+    enabled: true,
+  },
+];
+
+/** Map Libra role ids ↔ Codex aliases. */
+const ALIASES: Record<string, string> = {
+  explore: "explorer",
+  implement: "worker",
+  explorer: "explorer",
+  worker: "worker",
+  default: "default",
+};
+
+export function canonicalRoleId(id: string): string {
+  const k = id.trim().toLowerCase().replace(/\s+/g, "_");
+  return ALIASES[k] ?? k;
+}
+
+export function resolveRole(
+  agentType: string | undefined,
+  configRoles: SubagentRole[],
+): ResolvedRole {
+  const id = canonicalRoleId(agentType || "default");
+
+  // Prefer user-configured role with matching id
+  const custom = configRoles.find(
+    (r) => r.enabled && canonicalRoleId(r.id) === id,
+  );
+  if (custom) {
+    return fromConfigRole(custom);
+  }
+
+  // Codex builtins
+  const builtin = CODEX_BUILTIN_ROLES.find((r) => r.id === id);
+  if (builtin) {
+    return fromConfigRole(builtin);
+  }
+
+  // Fallback: any config role by name
+  const byName = configRoles.find(
+    (r) =>
+      r.enabled &&
+      r.name.toLowerCase().replace(/\s+/g, "_") === id,
+  );
+  if (byName) return fromConfigRole(byName);
+
+  // Default general-purpose
+  return fromConfigRole(CODEX_BUILTIN_ROLES[0]!);
+}
+
+function fromConfigRole(
+  r: SubagentRole & { description?: string; sandbox?: RoleSandbox },
+): ResolvedRole {
+  const id = canonicalRoleId(r.id);
+  const sandbox: RoleSandbox =
+    r.sandbox ??
+    (id === "explorer" || id === "explore" || id === "review" || id === "security"
+      ? "read-only"
+      : "workspace-write");
+
+  const toolsets: ToolsetId[] =
+    sandbox === "read-only"
+      ? ["fs", "search", "web", "meta"]
+      : ["fs", "search", "shell", "web", "meta", "process"];
+
+  const permissions: PermissionRules =
+    sandbox === "read-only"
+      ? {
+          "*": "allow",
+          write: "deny",
+          write_file: "deny",
+          search_replace: "deny",
+          edit_file: "deny",
+          run_terminal_command: "deny",
+          run_shell: "deny",
+          process: "deny",
+        }
+      : {
+          "*": "allow",
+          run_terminal_command: {
+            "*": "allow",
+            "rm -rf *": "deny",
+            "git push --force *": "deny",
+          },
+        };
+
+  return {
+    id,
+    name: r.name,
+    description:
+      r.description ??
+      (r.instructions.slice(0, 120) || `Role ${r.name}`),
+    instructions: r.instructions,
+    modelKey: r.modelKey,
+    reasoningEffort: (r as { reasoningEffort?: string }).reasoningEffort,
+    sandbox,
+    toolsets,
+    permissions,
+  };
+}
+
+/** Roles advertised in spawn_agent schema enum / description. */
+export function listSpawnableRoles(configRoles: SubagentRole[]): ResolvedRole[] {
+  const out: ResolvedRole[] = [];
+  const seen = new Set<string>();
+
+  for (const b of CODEX_BUILTIN_ROLES) {
+    if (!b.enabled) continue;
+    // User override wins if same id
+    const override = configRoles.find(
+      (r) => r.enabled && canonicalRoleId(r.id) === b.id,
+    );
+    const resolved = fromConfigRole(override ?? b);
+    out.push(resolved);
+    seen.add(resolved.id);
+  }
+
+  for (const r of configRoles) {
+    if (!r.enabled) continue;
+    const id = canonicalRoleId(r.id);
+    if (seen.has(id)) continue;
+    out.push(fromConfigRole(r));
+    seen.add(id);
+  }
+
+  return out;
+}
+
+export function roleCatalogText(roles: ResolvedRole[]): string {
+  return roles
+    .map((r) => `- ${r.id}: ${r.description} [${r.sandbox}]`)
+    .join("\n");
+}

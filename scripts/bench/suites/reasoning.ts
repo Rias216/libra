@@ -59,6 +59,30 @@ export function suiteReasoning(): Suite {
     );
   });
 
+  s.test("buildReasoningApiFields openai + xai native shapes", () => {
+    clearReasoningCapsCache();
+    setReasoningCaps("openai", "gpt-5", {
+      supported: true,
+      efforts: ["low", "medium", "high"],
+      style: "openai_effort",
+      source: "api",
+    });
+    setReasoningCaps("xai", "grok-4", {
+      supported: true,
+      efforts: ["low", "medium", "high"],
+      style: "openai_effort",
+      source: "api",
+    });
+    const oai = buildReasoningApiFields("openai", "gpt-5", { forceMax: true });
+    assertEq(oai.reasoning_effort, "high");
+    const xai = buildReasoningApiFields("xai", "grok-4", { forceMax: true });
+    assertEq(xai.reasoning_effort, "high");
+    assertEq(
+      (xai.reasoning as { effort: string } | undefined)?.effort,
+      "high",
+    );
+  });
+
   s.test("unsupported model returns empty fields", () => {
     clearReasoningCapsCache();
     setReasoningCaps("openrouter", "plain-model", {

@@ -2,6 +2,14 @@
  * Fast local tool executor — no LLM, pure Node I/O.
  * Supports Libra-native tools and Fusion catalog aliases.
  *
+ * Hardening (OpenCode / Hermes inspired):
+ *  - path sandbox + similar-path suggestions on ENOENT
+ *  - binary / huge-file guards on read
+ *  - default read limit + "more lines" footer
+ *  - ambiguous search_replace fails without replace_all
+ *  - AbortSignal + background shell (process tool)
+ *  - structured error codes + recovery hints
+ *
  * resultStyle:
  *   "text"  — human-readable lines (default, interactive TUI)
  *   "json"  — catalog-shaped {ok, ...} JSON strings for headless evals
@@ -15,11 +23,16 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { normalizeToolArgs } from "./normalize.js";
+import { processAction, startBackground } from "./process.js";
 
 const MAX_RESULT = 24_000;
+/** OpenCode default — avoid blowing context */
+const DEFAULT_READ_LIMIT = 2000;
+const MAX_LINE_LENGTH = 2000;
+const MAX_FILE_BYTES = 5_000_000;
 const IGNORE = new Set([
   "node_modules",
   ".git",
@@ -62,6 +75,10 @@ export interface ToolExecutorOptions {
   resultStyle?: ToolResultStyle;
   /** When true, only allowlisted shell binaries may run */
   shellAllowlist?: boolean;
+  /** Abort in-flight shell / fetch */
+  signal?: AbortSignal;
+  /** Default max lines for read_file when limit omitted (default 2000) */
+  defaultReadLimit?: number;
 }
 
 export interface ToolExecResult {
@@ -70,6 +87,8 @@ export interface ToolExecResult {
   /** Structured payload when available (especially json style) */
   data?: Record<string, unknown>;
   durationMs: number;
+  /** Machine code when ok=false */
+  code?: string;
 }
 
 export class ToolExecutor {
@@ -88,12 +107,26 @@ export class ToolExecutor {
     return this.opts.resultStyle ?? "text";
   }
 
+  /** Update abort signal mid-session (agent cancel). */
+  setSignal(signal: AbortSignal | undefined): void {
+    this.opts.signal = signal;
+  }
+
   async run(
     name: string,
     args: Record<string, unknown>,
   ): Promise<ToolExecResult> {
     const t0 = Date.now();
     try {
+      if (this.opts.signal?.aborted) {
+        return {
+          ok: false,
+          output: "cancelled",
+          data: { ok: false, error: "cancelled", code: "cancelled" },
+          durationMs: Date.now() - t0,
+          code: "cancelled",
+        };
+      }
       const normalized = normalizeToolArgs(name, args);
       const data = await this.dispatch(name, normalized);
       const output =
@@ -105,23 +138,26 @@ export class ToolExecutor {
         output,
         data,
         durationMs: Date.now() - t0,
+        code: data.ok === false ? String(data.code ?? "error") : undefined,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const code = classifyError(msg);
+      const hint = hintForError(code, msg);
       const data: Record<string, unknown> = {
         ok: false,
         error: msg,
         code,
+        ...(hint ? { hint } : {}),
       };
+      const text = hint ? `${msg}\nHint: ${hint}` : msg;
       return {
         ok: false,
         output:
-          this.resultStyle === "json"
-            ? JSON.stringify(data)
-            : msg,
+          this.resultStyle === "json" ? JSON.stringify(data) : text,
         data,
         durationMs: Date.now() - t0,
+        code,
       };
     }
   }
@@ -130,8 +166,15 @@ export class ToolExecutor {
     name: string,
     data: Record<string, unknown>,
   ): string {
+    if (name === "run_terminal_command" || name === "run_shell") {
+      return formatShellOutput(data);
+    }
+    if (name === "process") {
+      return JSON.stringify(data, null, 0);
+    }
     if (data.ok === false) {
-      return String(data.error ?? "error");
+      const base = String(data.error ?? "error");
+      return data.hint ? `${base}\nHint: ${data.hint}` : base;
     }
     switch (name) {
       case "list_dir": {
@@ -143,8 +186,28 @@ export class ToolExecutor {
           .map((e) => (e.type === "dir" ? `${e.name}/` : e.name))
           .join("\n");
       }
-      case "read_file":
-        return String(data.content ?? "");
+      case "read_file": {
+        if (Array.isArray(data.files)) {
+          const files = data.files as Array<{
+            path: string;
+            ok?: boolean;
+            content?: string;
+            error?: string;
+          }>;
+          return files
+            .map((f) =>
+              f.ok === false
+                ? `===== ${f.path} ERROR =====\n${f.error ?? "error"}`
+                : `===== ${f.path} =====\n${f.content ?? ""}`,
+            )
+            .join("\n");
+        }
+        let body = String(data.content ?? "");
+        if (data.truncated || data.has_more) {
+          body += `\n\n(File has more lines. Use offset=${data.next_offset ?? "?"} to continue; total_lines=${data.total_lines ?? "?"})`;
+        }
+        return body;
+      }
       case "write":
       case "write_file":
         return `wrote ${data.bytes ?? "?"} bytes → ${data.path ?? ""}`;
@@ -163,11 +226,6 @@ export class ToolExecutor {
       case "glob": {
         const files = data.files as string[] | undefined;
         return files?.join("\n") || "(no matches)";
-      }
-      case "run_terminal_command":
-      case "run_shell": {
-        const body = [data.stdout, data.stderr].filter(Boolean).join("\n").trim();
-        return `exit ${data.exit_code ?? "?"}\n${body || "(no output)"}`;
       }
       case "calc":
         return String(data.value ?? "");
@@ -189,12 +247,24 @@ export class ToolExecutor {
     switch (name) {
       case "list_dir":
         return this.listDir(str(args.target_directory, "."));
-      case "read_file":
-        return this.readFile(
-          str(args.target_file),
-          num(args.offset),
-          num(args.limit),
-        );
+      case "read_file": {
+        const batch = args.target_files;
+        if (Array.isArray(batch) && batch.length > 0) {
+          return this.readFiles(
+            batch.map((p) => String(p ?? "")).filter(Boolean),
+          );
+        }
+        const single = str(args.target_file);
+        if (!single) {
+          throw Object.assign(
+            new Error(
+              "read_file requires target_file or non-empty target_files",
+            ),
+            { code: "invalid_args" },
+          );
+        }
+        return this.readFile(single, num(args.offset), num(args.limit));
+      }
       case "write":
       case "write_file":
         return this.write(str(args.file_path), str(args.content));
@@ -220,13 +290,23 @@ export class ToolExecutor {
         return this.shell(
           str(args.command),
           num(args.timeout_ms, 30_000) ?? 30_000,
+          Boolean(args.background),
+          args.description ? str(args.description) : undefined,
         );
+      case "process":
+        return processAction(str(args.action, "list"), {
+          session_id: args.session_id ? str(args.session_id) : undefined,
+          data: args.data != null ? str(args.data) : undefined,
+          timeout_ms: num(args.timeout_ms),
+          offset: num(args.offset),
+          limit: num(args.limit),
+        });
       case "web_fetch":
         return this.webFetch(str(args.url));
       case "calc":
         return this.calc(str(args.expression));
       case "todo_write":
-        return this.todoWrite(args.items);
+        return this.todoWrite(args.items ?? args.todos, Boolean(args.merge));
       case "finish":
         return {
           ok: true,
@@ -235,12 +315,13 @@ export class ToolExecutor {
           success: args.success !== false,
         };
       default:
-        throw new Error(`unknown tool: ${name}`);
+        throw Object.assign(new Error(`unknown tool: ${name}`), {
+          code: "unknown_tool",
+        });
     }
   }
 
   private resolveSafe(p: string): string {
-    // Strip leading ./ and workspace/ prefixes agents sometimes add
     let rel = p.replace(/\\/g, "/");
     if (rel.startsWith("./")) rel = rel.slice(2);
     if (rel === "workspace" || rel.startsWith("workspace/")) {
@@ -249,14 +330,24 @@ export class ToolExecutor {
     const abs = resolve(this.cwd, rel);
     const root = resolve(this.cwd);
     if (abs !== root && !abs.startsWith(root + sep)) {
-      throw new Error(`path escapes workspace: ${p}`);
+      throw Object.assign(new Error(`path escapes workspace: ${p}`), {
+        code: "path_escape",
+      });
     }
     return abs;
   }
 
   private listDir(dir: string): Record<string, unknown> {
     const abs = this.resolveSafe(dir);
-    if (!existsSync(abs)) throw new Error(`not found: ${dir}`);
+    if (!existsSync(abs)) {
+      const sug = suggestPaths(this.cwd, dir);
+      throw Object.assign(
+        new Error(
+          `not found: ${dir}${sug.length ? ` (did you mean: ${sug.join(", ")})` : ""}`,
+        ),
+        { code: "not_found" },
+      );
+    }
     const entries = readdirSync(abs, { withFileTypes: true });
     const list = entries
       .filter((e) => !IGNORE.has(e.name))
@@ -272,6 +363,27 @@ export class ToolExecutor {
     return { ok: true, entries: list };
   }
 
+  private readFiles(paths: string[]): Record<string, unknown> {
+    const files: Array<Record<string, unknown>> = [];
+    let anyOk = false;
+    for (const p of paths) {
+      try {
+        const one = this.readFile(p);
+        files.push({ path: p, ok: true, content: one.content });
+        anyOk = true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        files.push({ path: p, ok: false, error: msg });
+      }
+    }
+    return {
+      ok: anyOk,
+      files,
+      count: files.length,
+      error: anyOk ? undefined : "all reads failed",
+    };
+  }
+
   private readFile(
     path: string,
     offset?: number,
@@ -279,32 +391,84 @@ export class ToolExecutor {
   ): Record<string, unknown> {
     const abs = this.resolveSafe(path);
     if (!existsSync(abs)) {
-      const err = new Error(`ENOENT: path not found: ${path}`);
+      const sug = suggestPaths(this.cwd, path);
+      const err = new Error(
+        `ENOENT: path not found: ${path}${sug.length ? ` (did you mean: ${sug.join(", ")})` : ""}`,
+      );
       (err as Error & { code?: string }).code = "not_found";
       throw err;
     }
-    const raw = readFileSync(abs, "utf8");
-    // Catalog / json style: raw content (no line prefixes) for faithful fixtures
+
+    const st = statSync(abs);
+    if (st.isDirectory()) {
+      throw Object.assign(new Error(`is a directory: ${path}`), {
+        code: "is_directory",
+      });
+    }
+    if (st.size > MAX_FILE_BYTES) {
+      throw Object.assign(
+        new Error(
+          `file too large (${st.size} bytes > ${MAX_FILE_BYTES}): ${path}. Use offset/limit or grep.`,
+        ),
+        { code: "too_large" },
+      );
+    }
+
+    // Binary sniff (first 8k)
+    const probe = readFileSync(abs).subarray(0, 8192);
+    if (isBinaryBuffer(probe)) {
+      throw Object.assign(
+        new Error(
+          `Cannot read binary file: ${path}. Use a specialized tool for images/binaries.`,
+        ),
+        { code: "binary" },
+      );
+    }
+
+    const raw = probe.length === st.size
+      ? probe.toString("utf8")
+      : readFileSync(abs, "utf8");
+
+    // Catalog / json style: full raw content when no range (fixtures)
     if (this.resultStyle === "json" && offset == null && limit == null) {
       return { ok: true, content: raw };
     }
+
     const lines = raw.split(/\r?\n/);
+    const defaultLimit = this.opts.defaultReadLimit ?? DEFAULT_READ_LIMIT;
     const start = Math.max(0, (offset ?? 1) - 1);
-    const end = limit != null ? start + limit : lines.length;
-    const slice = lines.slice(start, end);
+    const maxLines = limit ?? defaultLimit;
+    const end = Math.min(lines.length, start + maxLines);
+    const slice = lines.slice(start, end).map((l) =>
+      l.length > MAX_LINE_LENGTH
+        ? l.slice(0, MAX_LINE_LENGTH) + "…"
+        : l,
+    );
+    const hasMore = end < lines.length;
+
     if (this.resultStyle === "json") {
       return {
         ok: true,
         content: slice.join("\n"),
         offset: start + 1,
         lines: slice.length,
+        total_lines: lines.length,
+        has_more: hasMore,
+        next_offset: hasMore ? end + 1 : undefined,
       };
     }
-    // Text style: line-numbered for TUI readability
+
     const numbered = slice
       .map((l, i) => `${String(start + i + 1).padStart(4)}|${l}`)
       .join("\n");
-    return { ok: true, content: numbered };
+    return {
+      ok: true,
+      content: numbered,
+      total_lines: lines.length,
+      has_more: hasMore,
+      truncated: hasMore,
+      next_offset: hasMore ? end + 1 : undefined,
+    };
   }
 
   private write(path: string, content: string): Record<string, unknown> {
@@ -321,17 +485,45 @@ export class ToolExecutor {
     replaceAll: boolean,
   ): Record<string, unknown> {
     const abs = this.resolveSafe(path);
-    if (!existsSync(abs)) throw new Error(`not found: ${path}`);
+    if (!existsSync(abs)) {
+      const sug = suggestPaths(this.cwd, path);
+      throw Object.assign(
+        new Error(
+          `not found: ${path}${sug.length ? ` (did you mean: ${sug.join(", ")})` : ""}`,
+        ),
+        { code: "not_found" },
+      );
+    }
     const raw = readFileSync(abs, "utf8");
-    if (!raw.includes(oldStr)) throw new Error("old_string not found");
-    const count = replaceAll
-      ? raw.split(oldStr).length - 1
-      : 1;
+    if (!raw.includes(oldStr)) {
+      // Soft hint: whitespace-only mismatch
+      const soft = findSoftMatchHint(raw, oldStr);
+      throw Object.assign(
+        new Error(
+          soft
+            ? `old_string not found. ${soft}`
+            : "old_string not found — read the file and copy the exact text (including whitespace).",
+        ),
+        { code: "not_found" },
+      );
+    }
+
+    const count = countOccurrences(raw, oldStr);
+    // OpenCode: fail when multiple matches without replace_all
+    if (count > 1 && !replaceAll) {
+      throw Object.assign(
+        new Error(
+          `old_string matched ${count} times; set replace_all=true or include more surrounding context to make it unique.`,
+        ),
+        { code: "ambiguous" },
+      );
+    }
+
     const next = replaceAll
       ? raw.split(oldStr).join(newStr)
       : raw.replace(oldStr, newStr);
     writeFileSync(abs, next, "utf8");
-    return { ok: true, replacements: count, path };
+    return { ok: true, replacements: replaceAll ? count : 1, path };
   }
 
   private grep(
@@ -348,7 +540,9 @@ export class ToolExecutor {
       if (matches.length > 80) break;
       let text: string;
       try {
-        text = readFileSync(f, "utf8");
+        const buf = readFileSync(f);
+        if (isBinaryBuffer(buf.subarray(0, 4096))) continue;
+        text = buf.toString("utf8");
       } catch {
         continue;
       }
@@ -377,7 +571,19 @@ export class ToolExecutor {
   private shell(
     command: string,
     timeoutMs: number,
+    background?: boolean,
+    description?: string,
   ): Promise<Record<string, unknown>> {
+    if (!command.trim()) {
+      return Promise.resolve({
+        ok: false,
+        error: "empty command",
+        code: "error",
+        stdout: "",
+        stderr: "empty command",
+        exit_code: 1,
+      });
+    }
     if (this.opts.shellAllowlist !== false && this.opts.shellAllowlist) {
       const bin = firstBinary(command);
       if (bin && !SHELL_ALLOW.has(bin.toLowerCase())) {
@@ -391,28 +597,81 @@ export class ToolExecutor {
         });
       }
     }
+
+    const shellOpt = resolveShellOption();
+
+    if (background) {
+      const session = startBackground(command, this.cwd, shellOpt);
+      return Promise.resolve({
+        ok: true,
+        background: true,
+        session_id: session.id,
+        pid: session.pid,
+        description: description ?? command.slice(0, 80),
+        hint: 'Use process(action="poll"|"log"|"wait"|"kill", session_id=...) to manage.',
+      });
+    }
+
     return new Promise((resolveP) => {
       const child = spawn(command, {
         cwd: this.cwd,
-        shell: true,
+        shell: shellOpt,
         windowsHide: true,
         env: {
           ...process.env,
-          // Discourage network-ish tools; cannot fully block
           NO_PROXY: "*",
         },
       });
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      const finish = (payload: Record<string, unknown>) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.opts.signal?.removeEventListener("abort", onAbort);
+        resolveP(payload);
+      };
+      const onAbort = () => {
+        try {
+          child.kill();
+        } catch {
+          /* */
+        }
+        finish({
+          ok: false,
+          error: "cancelled",
+          code: "cancelled",
+          stdout: truncate(stdout, MAX_RESULT / 2),
+          stderr: truncate(stderr, MAX_RESULT / 4),
+          exit_code: 130,
+          description,
+        });
+      };
+      if (this.opts.signal) {
+        if (this.opts.signal.aborted) {
+          onAbort();
+          return;
+        }
+        this.opts.signal.addEventListener("abort", onAbort, { once: true });
+      }
       const timer = setTimeout(() => {
-        child.kill();
-        resolveP({
+        try {
+          child.kill();
+        } catch {
+          /* */
+        }
+        finish({
           ok: false,
           error: `timeout after ${timeoutMs}ms`,
           code: "timeout",
-          stdout,
-          stderr: stderr + `\ntimeout after ${timeoutMs}ms`,
+          stdout: truncate(stdout, MAX_RESULT / 2),
+          stderr: truncate(
+            (stderr ? stderr + "\n" : "") + `timeout after ${timeoutMs}ms`,
+            MAX_RESULT / 4,
+          ),
           exit_code: 124,
+          description,
         });
       }, timeoutMs);
       child.stdout?.on("data", (d: Buffer) => {
@@ -422,24 +681,35 @@ export class ToolExecutor {
         stderr += d.toString("utf8");
       });
       child.on("error", (e) => {
-        clearTimeout(timer);
-        resolveP({
+        finish({
           ok: false,
           error: e.message,
           code: "spawn_error",
-          stdout,
-          stderr: stderr || e.message,
+          stdout: truncate(stdout, MAX_RESULT / 2),
+          stderr: truncate(stderr || e.message, MAX_RESULT / 4),
           exit_code: 1,
+          description,
         });
       });
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        const exit = code ?? 1;
-        resolveP({
-          ok: exit === 0,
-          stdout: truncate(stdout, MAX_RESULT / 2),
-          stderr: truncate(stderr, MAX_RESULT / 4),
+      child.on("close", (code, signal) => {
+        const exit = code ?? (signal ? 1 : 0);
+        const out = truncate(stdout, MAX_RESULT / 2);
+        const err = truncate(stderr, MAX_RESULT / 4);
+        const ok = exit === 0;
+        finish({
+          ok,
+          stdout: out,
+          stderr: err,
           exit_code: exit,
+          description,
+          error: ok
+            ? undefined
+            : (
+                err.trim() ||
+                out.trim() ||
+                (signal ? `killed by signal ${signal}` : `exit code ${exit}`)
+              ).slice(0, 800),
+          code: ok ? undefined : "exit",
         });
       });
     });
@@ -447,9 +717,20 @@ export class ToolExecutor {
 
   private async webFetch(url: string): Promise<Record<string, unknown>> {
     if (!/^https?:\/\//i.test(url)) throw new Error("url must be http(s)");
+    // Prefer AbortSignal.any when available (Node 20.3+); else timeout only
+    let signal: AbortSignal;
+    const timeout = AbortSignal.timeout(20_000);
+    if (this.opts.signal && typeof AbortSignal.any === "function") {
+      signal = AbortSignal.any([this.opts.signal, timeout]);
+    } else if (this.opts.signal?.aborted) {
+      throw Object.assign(new Error("cancelled"), { code: "cancelled" });
+    } else {
+      signal = timeout;
+    }
     const res = await fetch(url, {
-      signal: AbortSignal.timeout(20_000),
+      signal,
       headers: { "User-Agent": "libra-harness/0.1" },
+      redirect: "follow",
     });
     const text = await res.text();
     return {
@@ -464,11 +745,17 @@ export class ToolExecutor {
     return { ok: true, value };
   }
 
-  private todoWrite(items: unknown): Record<string, unknown> {
+  private todoWrite(
+    items: unknown,
+    merge?: boolean,
+  ): Record<string, unknown> {
+    if (items == null && merge) {
+      return { ok: true, items: this.todos };
+    }
     if (!Array.isArray(items)) {
       throw new Error("items must be an array");
     }
-    this.todos = items.map((it) => {
+    const mapped = items.map((it) => {
       const o = it as Record<string, unknown>;
       return {
         id: String(o.id ?? ""),
@@ -476,25 +763,162 @@ export class ToolExecutor {
         status: String(o.status ?? "pending"),
       };
     });
+    if (merge) {
+      const byId = new Map(this.todos.map((t) => [t.id, t]));
+      for (const t of mapped) {
+        if (!t.id) continue;
+        const prev = byId.get(t.id);
+        byId.set(t.id, prev ? { ...prev, ...t } : t);
+      }
+      this.todos = [...byId.values()];
+    } else {
+      this.todos = mapped;
+    }
     return { ok: true, items: this.todos };
   }
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let i = 0;
+  while (true) {
+    const j = haystack.indexOf(needle, i);
+    if (j < 0) break;
+    count++;
+    i = j + needle.length;
+  }
+  return count;
+}
+
+/** Hint when exact match fails but collapsed-whitespace would match. */
+function findSoftMatchHint(raw: string, oldStr: string): string | null {
+  if (!oldStr.trim()) return null;
+  const collapse = (s: string) => s.replace(/\s+/g, " ").trim();
+  const target = collapse(oldStr);
+  if (!target) return null;
+  const lines = raw.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (collapse(lines[i]!).includes(target.slice(0, Math.min(40, target.length)))) {
+      return `Nearby line ${i + 1} looks similar after whitespace collapse — re-read and copy exact text.`;
+    }
+  }
+  return null;
+}
+
+function isBinaryBuffer(buf: Buffer): boolean {
+  if (!buf.length) return false;
+  // NUL byte is a strong signal
+  const n = Math.min(buf.length, 8192);
+  for (let i = 0; i < n; i++) {
+    if (buf[i] === 0) return true;
+  }
+  // High ratio of non-text control chars
+  let ctrl = 0;
+  for (let i = 0; i < n; i++) {
+    const c = buf[i]!;
+    if (c < 7 || (c > 14 && c < 32 && c !== 27)) ctrl++;
+  }
+  return ctrl / n > 0.3;
+}
+
+/** Suggest similar relative paths under cwd (Hermes-style). */
+function suggestPaths(cwd: string, wanted: string, max = 3): string[] {
+  const base = basename(wanted).toLowerCase();
+  if (!base || base === "." || base === "..") return [];
+  const found: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 6 || found.length >= 20) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (IGNORE.has(e.name) || e.name.startsWith(".")) continue;
+      const full = join(dir, e.name);
+      if (e.isDirectory()) walk(full, depth + 1);
+      else if (
+        e.name.toLowerCase().includes(base) ||
+        base.includes(e.name.toLowerCase().replace(/\.[^.]+$/, ""))
+      ) {
+        found.push(relative(cwd, full).replace(/\\/g, "/"));
+      }
+    }
+  };
+  try {
+    walk(cwd, 0);
+  } catch {
+    /* */
+  }
+  return found.slice(0, max);
 }
 
 function firstBinary(command: string): string | null {
   const t = command.trim();
   if (!t) return null;
-  // python -c "..." / node -e
   const m = t.match(/^["']?([A-Za-z0-9_.+-]+)/);
   return m?.[1] ?? null;
+}
+
+function formatShellOutput(data: Record<string, unknown>): string {
+  if (data.background) {
+    return `background session ${data.session_id} (pid ${data.pid ?? "?"})\n${data.hint ?? ""}`;
+  }
+  const exit = data.exit_code ?? "?";
+  const body = [data.stdout, data.stderr]
+    .map((x) => (typeof x === "string" ? x : ""))
+    .filter((s) => s.length > 0)
+    .join("\n")
+    .trim();
+  const header =
+    data.ok === false && data.error && !body.includes(String(data.error))
+      ? `exit ${exit}\n${data.error}`
+      : `exit ${exit}`;
+  return body ? `${header}\n${body}` : `${header}\n(no output)`;
+}
+
+function resolveShellOption(): string | true | boolean {
+  const override = process.env.LIBRA_SHELL?.trim();
+  if (override) return override;
+  if (process.platform === "win32") {
+    return "powershell.exe";
+  }
+  return true;
 }
 
 function classifyError(msg: string): string {
   if (/not found|ENOENT/i.test(msg)) return "not_found";
   if (/escapes workspace/i.test(msg)) return "path_escape";
   if (/old_string not found/i.test(msg)) return "not_found";
+  if (/matched \d+ times|ambiguous/i.test(msg)) return "ambiguous";
   if (/timeout/i.test(msg)) return "timeout";
   if (/unknown tool/i.test(msg)) return "unknown_tool";
+  if (/binary/i.test(msg)) return "binary";
+  if (/too large/i.test(msg)) return "too_large";
+  if (/cancelled/i.test(msg)) return "cancelled";
+  if (/not allowlisted|not_allowed/i.test(msg)) return "not_allowed";
   return "error";
+}
+
+function hintForError(code: string, _msg: string): string | undefined {
+  switch (code) {
+    case "not_found":
+      return "Check the path with list_dir/glob, or use a suggested path if provided.";
+    case "ambiguous":
+      return "Widen old_string context or set replace_all=true.";
+    case "path_escape":
+      return "Use paths relative to the workspace root only.";
+    case "binary":
+      return "Skip binary files; use shell/file tools designed for that type.";
+    case "too_large":
+      return "Read with offset/limit or search with grep.";
+    case "unknown_tool":
+      return "Use only tools listed in the schema.";
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -504,7 +928,6 @@ function classifyError(msg: string): string {
 export function evalMath(expression: string): number {
   const expr = expression.trim();
   if (!expr) throw new Error("empty expression");
-  // Digits, whitespace, + - * / % ( ) . and scientific e/E — no identifiers
   if (!/^[\d\s+\-*/%().eE]+$/.test(expr)) {
     throw new Error(`invalid expression: ${expression}`);
   }

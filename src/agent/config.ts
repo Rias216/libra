@@ -31,14 +31,40 @@ export type CustomReasoningMode = "none" | "ultra" | "ultra-fusion";
 export interface SubagentRole {
   id: string;
   name: string;
+  /** When to use this role (surfaced in spawn_agent schema) */
+  description?: string;
   instructions: string;
   modelKey?: string;
+  /** Optional effort override for this role */
+  reasoningEffort?: string;
+  /**
+   * Tool surface: read-only blocks write/shell (Codex sandbox_mode).
+   * Default inferred from role id (explorer/review/security → read-only).
+   */
+  sandbox?: "read-only" | "workspace-write";
   enabled: boolean;
 }
 
+/**
+ * Multi-agent settings (Codex multi_agent_v1 compatible).
+ * - maxConcurrent ≈ agents.max_threads (default 6 in Codex)
+ * - maxDepth ≈ agents.max_depth (default 1 — children cannot spawn)
+ */
 export interface SubagentConfig {
   enabled: boolean;
+  /** Concurrent open agent threads (Codex agents.max_threads) */
   maxConcurrent: number;
+  /**
+   * Spawn nesting depth. Root=0; maxDepth=1 means root can spawn
+   * children but children cannot spawn (Codex default).
+   */
+  maxDepth: number;
+  /** Per-child wall-clock timeout in seconds (Codex job_max_runtime) */
+  jobMaxRuntimeSeconds: number;
+  /**
+   * When true (Ultra / ultra-fusion), system prompt encourages proactive
+   * spawn without an explicit user request.
+   */
   autoSpawn: boolean;
   preferredModelKey?: string;
   roles: SubagentRole[];
@@ -91,36 +117,48 @@ export const DEFAULT_SUBAGENT_ROLES: SubagentRole[] = [
   {
     id: "explore",
     name: "Explore",
+    description:
+      "Read-only codebase explorer (Codex explorer). Gather evidence before changes.",
     instructions:
-      "You are a read-only explore agent. Search the codebase, summarize findings, do not edit files.",
+      "You are a read-only explore agent. Search the codebase, summarize findings with path:line refs, do not edit files.",
+    sandbox: "read-only",
     enabled: true,
   },
   {
     id: "implement",
     name: "Implement",
+    description:
+      "Execution-focused worker (Codex worker). Small diffs + optional tests.",
     instructions:
-      "You implement focused code changes. Prefer small diffs, run tests when possible.",
+      "You implement focused code changes. Prefer small diffs, run tests when possible. Summarize what changed for the parent.",
+    sandbox: "workspace-write",
     enabled: true,
   },
   {
     id: "review",
     name: "Review",
+    description: "Read-only PR/code review for correctness and risks.",
     instructions:
-      "You review code for bugs, security, and style. Produce a structured findings list.",
+      "You review code for bugs, security, and style. Produce a structured findings list with path:line. Do not edit.",
+    sandbox: "read-only",
     enabled: true,
   },
   {
     id: "test",
     name: "Test",
+    description: "Write and run tests for the assigned scope.",
     instructions:
-      "You write and run tests. Prefer failing tests first, then fix until green.",
+      "You write and run tests. Prefer failing tests first, then fix until green. Summarize coverage gaps.",
+    sandbox: "workspace-write",
     enabled: true,
   },
   {
     id: "security",
     name: "Security",
+    description: "Security audit: injection, secrets, auth, unsafe shell/file use.",
     instructions:
-      "You audit for injection, secrets, auth flaws, and unsafe shell/file use.",
+      "You audit for injection, secrets, auth flaws, and unsafe shell/file use. Report severity-ordered findings. Do not edit unless asked.",
+    sandbox: "read-only",
     enabled: false,
   },
 ];
@@ -137,7 +175,7 @@ export const DEFAULT_FUSION: FusionConfig = {
   analysisInstructions:
     "Reason step-by-step. Cover risks, alternatives, and a concrete executable plan. No tool use in this pass.",
   fuseInstructions:
-    "Compare your first-pass reasoning with the peer trace. Keep only what is correct, valuable, and actionable. Merge into one plan, then execute with tools.",
+    "Compare your first-pass reasoning with the peer trace. Keep only what is correct, valuable, and actionable. Merge into one plan, then execute with tools. For independent parallel workstreams use spawn_agent/wait_agent.",
 };
 
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
@@ -149,7 +187,9 @@ export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
   },
   subagents: {
     enabled: true,
-    maxConcurrent: 4,
+    maxConcurrent: 6, // Codex agents.max_threads default
+    maxDepth: 1, // Codex agents.max_depth default
+    jobMaxRuntimeSeconds: 600,
     autoSpawn: false,
     roles: DEFAULT_SUBAGENT_ROLES.map((r) => ({ ...r })),
   },
@@ -198,6 +238,14 @@ export function loadAgentSettings(): AgentSettings {
     subagents: {
       ...DEFAULT_AGENT_SETTINGS.subagents,
       ...a.subagents,
+      maxDepth:
+        a.subagents?.maxDepth ?? DEFAULT_AGENT_SETTINGS.subagents.maxDepth,
+      jobMaxRuntimeSeconds:
+        a.subagents?.jobMaxRuntimeSeconds ??
+        DEFAULT_AGENT_SETTINGS.subagents.jobMaxRuntimeSeconds,
+      maxConcurrent:
+        a.subagents?.maxConcurrent ??
+        DEFAULT_AGENT_SETTINGS.subagents.maxConcurrent,
       roles:
         a.subagents?.roles?.length
           ? a.subagents.roles
@@ -300,13 +348,13 @@ export const CUSTOM_REASONING_OPTIONS: {
     value: "ultra",
     label: "Ultra",
     description:
-      "Auto-spawns subagents + max effort on the strongest reasoning model",
+      "Max effort + Codex-style multi-agent (spawn/wait) with proactive delegation",
   },
   {
     value: "ultra-fusion",
     label: "Ultra + Fusion",
     description:
-      "Main + secondary both reason; main compares both and executes with tools",
+      "Peer reasons first; main compares, then executes with multi-agent tools",
   },
 ];
 
