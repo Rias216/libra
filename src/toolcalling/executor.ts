@@ -27,6 +27,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { normalizeToolArgs } from "./normalize.js";
 import { processAction, startBackground } from "./process.js";
+import { formatShellOutputForModel } from "./truncate.js";
 
 const MAX_RESULT = 24_000;
 /** OpenCode default — avoid blowing context */
@@ -613,6 +614,7 @@ export class ToolExecutor {
     }
 
     return new Promise((resolveP) => {
+      const t0 = Date.now();
       const child = spawn(command, {
         cwd: this.cwd,
         shell: shellOpt,
@@ -630,7 +632,7 @@ export class ToolExecutor {
         settled = true;
         clearTimeout(timer);
         this.opts.signal?.removeEventListener("abort", onAbort);
-        resolveP(payload);
+        resolveP({ ...payload, duration_ms: Date.now() - t0 });
       };
       const onAbort = () => {
         try {
@@ -665,6 +667,7 @@ export class ToolExecutor {
           ok: false,
           error: `timeout after ${timeoutMs}ms`,
           code: "timeout",
+          timed_out: true,
           stdout: truncate(stdout, MAX_RESULT / 2),
           stderr: truncate(
             (stderr ? stderr + "\n" : "") + `timeout after ${timeoutMs}ms`,
@@ -866,17 +869,36 @@ function formatShellOutput(data: Record<string, unknown>): string {
   if (data.background) {
     return `background session ${data.session_id} (pid ${data.pid ?? "?"})\n${data.hint ?? ""}`;
   }
-  const exit = data.exit_code ?? "?";
+  const exitRaw = data.exit_code;
+  const exitCode =
+    typeof exitRaw === "number"
+      ? exitRaw
+      : exitRaw != null && Number.isFinite(Number(exitRaw))
+        ? Number(exitRaw)
+        : null;
+  const durationMs =
+    typeof data.duration_ms === "number"
+      ? data.duration_ms
+      : typeof data.durationMs === "number"
+        ? data.durationMs
+        : 0;
   const body = [data.stdout, data.stderr]
     .map((x) => (typeof x === "string" ? x : ""))
     .filter((s) => s.length > 0)
     .join("\n")
     .trim();
-  const header =
+  const errExtra =
     data.ok === false && data.error && !body.includes(String(data.error))
-      ? `exit ${exit}\n${data.error}`
-      : `exit ${exit}`;
-  return body ? `${header}\n${body}` : `${header}\n(no output)`;
+      ? String(data.error)
+      : "";
+  const output = [errExtra, body || "(no output)"].filter(Boolean).join("\n");
+  // Codex-style framing for the model
+  return formatShellOutputForModel({
+    exitCode,
+    durationMs,
+    output,
+    timedOut: Boolean(data.timed_out ?? data.timeout),
+  });
 }
 
 function resolveShellOption(): string | true | boolean {

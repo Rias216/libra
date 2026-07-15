@@ -213,7 +213,7 @@ function parseCapsFromRaw(
       defaultEffort: defEff,
       maxThinkingTokens:
         provider === "anthropic" || reasoningObj.supports_max_tokens
-          ? 32000
+          ? 200_000
           : undefined,
       source: effortSource === "api-open" ? "api" : "api",
     };
@@ -277,7 +277,7 @@ function parseCapsFromRaw(
         supported: true,
         efforts: ["low", "medium", "high", "max"],
         style: "anthropic_thinking",
-        maxThinkingTokens: 32000,
+        maxThinkingTokens: 200_000,
         supportsMaxTokens: true,
         source: supportedParams.includes("thinking") ? "api" : "heuristic",
       };
@@ -293,7 +293,7 @@ function parseCapsFromRaw(
         supported: true,
         efforts: ["low", "medium", "high"],
         style: "gemini_thinking",
-        maxThinkingTokens: 24576,
+        maxThinkingTokens: 200_000,
         source: "heuristic",
       };
     }
@@ -355,7 +355,7 @@ function heuristicCaps(
       supported: true,
       efforts: ["low", "medium", "high", "max"],
       style: "anthropic_thinking",
-      maxThinkingTokens: 32000,
+      maxThinkingTokens: 200_000,
       supportsMaxTokens: true,
       source: "heuristic",
     };
@@ -365,7 +365,7 @@ function heuristicCaps(
       supported: true,
       efforts: ["low", "medium", "high"],
       style: "gemini_thinking",
-      maxThinkingTokens: 24576,
+      maxThinkingTokens: 200_000,
       source: "heuristic",
     };
   }
@@ -603,24 +603,27 @@ function fieldsForEffort(
 ): Record<string, unknown> {
   switch (caps.style) {
     case "openrouter_reasoning": {
-      // OpenRouter unified: reasoning: { effort } or reasoning: { max_tokens }
-      if (caps.supportsMaxTokens && !caps.efforts.includes(effort)) {
-        const budget = effortToAnthropicBudget(
-          effort,
-          caps.maxThinkingTokens ?? 32000,
-        );
-        if (budget <= 0) {
-          return caps.mandatory
-            ? {}
-            : { reasoning: { effort: "none", exclude: true } };
-        }
-        return { reasoning: { max_tokens: budget } };
-      }
+      // Prefer effort string always when the level is known — never invent a
+      // max_tokens ceiling that clips reasoning. Budget-only when the catalog
+      // has no effort enum for this model.
       if (effort === "none") {
         if (caps.mandatory) return {};
         return { reasoning: { effort: "none", exclude: true } };
       }
-      return { reasoning: { effort } };
+      if (caps.efforts.includes(effort) || !caps.supportsMaxTokens) {
+        return { reasoning: { effort } };
+      }
+      // Budget-only models: use max ceiling (not a tight internal cap)
+      const budget = effortToAnthropicBudget(
+        effort,
+        caps.maxThinkingTokens ?? 200_000,
+      );
+      if (budget <= 0) {
+        return caps.mandatory
+          ? {}
+          : { reasoning: { effort: "none", exclude: true } };
+      }
+      return { reasoning: { max_tokens: budget } };
     }
 
     case "openai_effort": {
@@ -637,7 +640,7 @@ function fieldsForEffort(
     case "anthropic_thinking": {
       const budget = effortToAnthropicBudget(
         effort,
-        caps.maxThinkingTokens ?? 32000,
+        caps.maxThinkingTokens ?? 200_000,
       );
       if (budget <= 0) return {};
       return {
@@ -648,7 +651,7 @@ function fieldsForEffort(
     case "gemini_thinking": {
       const budget = effortToGeminiBudget(
         effort,
-        caps.maxThinkingTokens ?? 24576,
+        caps.maxThinkingTokens ?? 200_000,
       );
       if (budget <= 0) {
         return {
@@ -669,22 +672,25 @@ function fieldsForEffort(
   }
 }
 
+/**
+ * Map effort enum → provider thinking budget (Anthropic/Gemini only).
+ * high / xhigh / max always use the full provider ceiling — no Libra clip.
+ */
 function effortToAnthropicBudget(effort: EffortLevel, max: number): number {
   switch (effort) {
     case "none":
     case "minimal":
       return 0;
     case "low":
-      return Math.min(2000, max);
+      return Math.min(32_000, max);
     case "medium":
-      return Math.min(8000, max);
+      return Math.min(64_000, max);
     case "high":
-      return Math.min(16000, max);
     case "xhigh":
     case "max":
       return max;
     default:
-      return Math.min(8000, max);
+      return max;
   }
 }
 
@@ -694,15 +700,15 @@ function effortToGeminiBudget(effort: EffortLevel, max: number): number {
     case "minimal":
       return 0;
     case "low":
-      return Math.min(1024, max);
+      return Math.min(32_000, max);
     case "medium":
-      return Math.min(8192, max);
+      return Math.min(64_000, max);
     case "high":
     case "xhigh":
     case "max":
       return max;
     default:
-      return Math.min(8192, max);
+      return max;
   }
 }
 
@@ -788,11 +794,11 @@ export function effortDescription(
       caps.style === "anthropic_thinking"
         ? effortToAnthropicBudget(
             e as EffortLevel,
-            caps.maxThinkingTokens ?? 32000,
+            caps.maxThinkingTokens ?? 200_000,
           )
         : effortToGeminiBudget(
             e as EffortLevel,
-            caps.maxThinkingTokens ?? 24576,
+            caps.maxThinkingTokens ?? 200_000,
           );
     return `Native thinking budget ≈ ${budget} tokens (${caps.style})`;
   }

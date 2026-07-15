@@ -119,19 +119,22 @@ export interface ChatRequest {
 }
 
 /**
- * Output token budget — best-of codex + opencode.
- * OpenCode: min(model.limit.output, 32_000). Codex: large ceilings so reasoning
- * models do not burn the whole budget on CoT and cut off the spoken answer.
- * Free-tier models still get a generous floor (reasoning + tools + answer).
+ * Libra does NOT set completion max_tokens by default.
+ * Reasoning / answer length is unlimited from our side — only the provider
+ * or an explicit ChatRequest.max_tokens may cap output.
+ *
+ * Anthropic Messages API still requires a max_tokens field; use this only there.
  */
-export const OUTPUT_TOKEN_MAX = 32_000;
-/** Floor when tools are enabled (tool args + answer + some CoT). */
-export const OUTPUT_TOKEN_TOOLS = 16_384;
-/** Floor for free / rate-limited models (still >> old 1536). */
-export const OUTPUT_TOKEN_FREE = 8_192;
-/** Floor for pure chat without tools. */
-export const OUTPUT_TOKEN_CHAT = 8_192;
-/** Max auto-continuations after finish_reason=length (codex/opencode style). */
+export const ANTHROPIC_REQUIRED_MAX_TOKENS = 200_000;
+/** @deprecated No longer applied — max_tokens omitted by default. */
+export const OUTPUT_TOKEN_MAX = ANTHROPIC_REQUIRED_MAX_TOKENS;
+/** @deprecated No longer applied. */
+export const OUTPUT_TOKEN_TOOLS = ANTHROPIC_REQUIRED_MAX_TOKENS;
+/** @deprecated No longer applied. */
+export const OUTPUT_TOKEN_FREE = ANTHROPIC_REQUIRED_MAX_TOKENS;
+/** @deprecated No longer applied. */
+export const OUTPUT_TOKEN_CHAT = ANTHROPIC_REQUIRED_MAX_TOKENS;
+/** Max auto-continuations after finish_reason=length (provider hit its own cap). */
 export const MAX_LENGTH_CONTINUATIONS = 2;
 
 export function isFreeModelId(model: string): boolean {
@@ -139,30 +142,17 @@ export function isFreeModelId(model: string): boolean {
 }
 
 /**
- * Resolve completion max_tokens for an agent-loop call.
- * Prefer explicit request override; otherwise pick generous defaults so
- * reasoning tokens do not starve the answer channel.
+ * Only returns a value when the caller explicitly requested one.
+ * Default is undefined → do not send max_tokens (unlimited from Libra).
  */
 export function resolveMaxOutputTokens(opts: {
-  model: string;
+  model?: string;
   tools?: boolean;
   explicit?: number;
-  /** When continuing after a length cut-off, bump budget. */
   lengthContinuation?: boolean;
-}): number {
-  if (opts.explicit != null && opts.explicit > 0) {
-    return Math.min(opts.explicit, OUTPUT_TOKEN_MAX);
-  }
-  const free = isFreeModelId(opts.model);
-  let n = free
-    ? OUTPUT_TOKEN_FREE
-    : opts.tools
-      ? OUTPUT_TOKEN_TOOLS
-      : OUTPUT_TOKEN_CHAT;
-  if (opts.lengthContinuation) {
-    n = Math.min(OUTPUT_TOKEN_MAX, Math.max(n * 2, OUTPUT_TOKEN_TOOLS));
-  }
-  return n;
+}): number | undefined {
+  if (opts.explicit != null && opts.explicit > 0) return opts.explicit;
+  return undefined;
 }
 
 /** True when the provider hit the output token cap mid-response. */
@@ -742,13 +732,11 @@ async function chatOpenAI(
     body.tools = req.tools;
     body.tool_choice = req.tool_choice ?? "auto";
   }
-  // Generous output budget (opencode 32k cap / codex large ceilings).
-  // Old 2k–4k defaults starved reasoning models and cut off spoken answers.
-  body.max_tokens = resolveMaxOutputTokens({
-    model: req.model,
-    tools: Boolean(req.tools?.length),
-    explicit: req.max_tokens,
-  });
+  // Never impose a max_tokens ceiling — omit unless the caller set one explicitly.
+  // Reasoning depth is controlled only via native effort API fields.
+  if (req.max_tokens != null && req.max_tokens > 0) {
+    body.max_tokens = req.max_tokens;
+  }
 
   // Native reasoning control (per-model capabilities) — not prompt text.
   if (req.applyNativeReasoning !== false) {
@@ -1144,6 +1132,13 @@ async function chatGemini(
   req: ChatRequest,
   handlers?: StreamHandlers,
 ): Promise<ChatResult> {
+  // Fail closed: Gemini adapter does not implement function calling yet.
+  // Silent tool drop was a hard agent-loop bug (tools appeared to "work" but never ran).
+  if (req.tools?.length && req.tool_choice !== "none") {
+    throw new Error(
+      "Gemini tool calling is not implemented in this client — pick an OpenAI-compatible provider (OpenRouter/xAI/OpenAI) for agent tools",
+    );
+  }
   const id = req.model.replace(/^models\//, "");
   const url = `${base}/models/${id}:generateContent?key=${encodeURIComponent(token)}`;
   const system = req.messages.find((m) => m.role === "system")?.content ?? "";
@@ -1194,6 +1189,12 @@ async function chatAnthropic(
   req: ChatRequest,
   handlers?: StreamHandlers,
 ): Promise<ChatResult> {
+  // Fail closed: Anthropic adapter does not implement tools/tool_use yet.
+  if (req.tools?.length && req.tool_choice !== "none") {
+    throw new Error(
+      "Anthropic tool calling is not implemented in this client — pick an OpenAI-compatible provider (OpenRouter/xAI/OpenAI) for agent tools",
+    );
+  }
   const system =
     req.messages
       .filter((m) => m.role === "system")
@@ -1217,7 +1218,11 @@ async function chatAnthropic(
     },
     body: JSON.stringify({
       model: req.model,
-      max_tokens: req.max_tokens ?? 8192,
+      // Anthropic requires this field; use explicit value or a non-capping default.
+      max_tokens:
+        req.max_tokens != null && req.max_tokens > 0
+          ? req.max_tokens
+          : ANTHROPIC_REQUIRED_MAX_TOKENS,
       system,
       messages,
       ...(thinking ? { thinking } : {}),

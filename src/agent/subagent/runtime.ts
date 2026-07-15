@@ -251,7 +251,7 @@ export class SubagentRuntime {
           permissions: role.permissions,
           signal: ac.signal,
           label: `child.${role.id}.${id.slice(-6)}`,
-          lightReasoning: true,
+          // Use API-level effort only (same as parent); do not force low reasoning
         });
         thread.result = result.text;
         thread.rounds = result.rounds;
@@ -416,7 +416,7 @@ export class SubagentRuntime {
           permissions: role.permissions,
           signal: ac.signal,
           label: `child.resume.${id.slice(-6)}`,
-          lightReasoning: true,
+          // Use API-level effort only (same as parent); do not force low reasoning
         });
         t.result = result.text;
         t.rounds = (t.rounds ?? 0) + result.rounds;
@@ -504,11 +504,13 @@ export class SubagentRuntime {
 
   private buildChildSystem(role: ResolvedRole, forkContext: boolean): string {
     const parts = [
-      `You are Libra subagent "${role.name}" (${role.id}).`,
+      `You are a specialized coding subagent (role: ${role.name}, id: ${role.id}).`,
+      "You help with software engineering tasks using the tools available to you. Do not claim a product identity or brand name.",
       role.instructions,
       "",
       "Rules:",
       "- Complete only the assigned task.",
+      "- Be concise and direct. Prefer path:line references over long dumps.",
       "- Return a concise summary for the parent agent (findings, path:line refs, next steps).",
       "- Do not spawn further subagents — you have no multi-agent tools.",
       role.sandbox === "read-only"

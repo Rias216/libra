@@ -71,6 +71,23 @@ export {
   toolFingerprint,
 } from "./toolcalling/normalize.js";
 export { OPENAI_TOOLS } from "./toolcalling/schema.js";
+export {
+  resolveToolName,
+  isParallelSafeTool,
+  TOOL_ALIASES,
+} from "./toolcalling/tool.js";
+export {
+  ToolCallRuntime,
+  DOOM_LOOP_THRESHOLD,
+} from "./toolcalling/runtime.js";
+export {
+  buildDispatchCalls,
+  normalizeToolCallsForWire,
+} from "./toolcalling/router.js";
+export {
+  truncateToolOutput,
+  formatShellOutputForModel,
+} from "./toolcalling/truncate.js";
 
 // ── complete ──────────────────────────────────────────
 export {

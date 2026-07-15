@@ -21,20 +21,9 @@
     "demo": "tsx src/cli.ts",
     "link": "npm run build && npm link",
     "unlink": "npm unlink -g libra",
-    "test": "tsx src/tui/buffer.test.ts && tsx src/auth/auth.test.ts",
+    "test": "tsx src/tui/buffer.test.ts && tsx src/auth/auth.test.ts && tsx src/agent/turn.test.ts",
     "test:auth": "tsx src/auth/auth.test.ts",
-    "test:auth:live": "tsx src/auth/auth.test.ts --live",
-    "bench:openrouter": "tsx scripts/benchmark-openrouter.ts",
-    "bench:harness": "tsx scripts/benchmark-harness.ts",
-    "bench:grok": "tsx scripts/benchmark-grok.ts",
-    "bench:hy3": "tsx scripts/benchmark-grok.ts --provider=openrouter --model=tencent/hy3:free",
-    "bench:fusion": "tsx scripts/benchmark-fusion.ts",
-    "bench:fusion:hy3": "tsx scripts/benchmark-fusion-hy3.ts",
-    "bench:fusion-local": "tsx scripts/benchmark-fusion-local.ts",
-    "smoke:agent": "tsx scripts/smoke-agent.ts",
-    "smoke:reasoning": "tsx scripts/smoke-reasoning.ts",
-    "headless:debug": "tsx scripts/headless-debug.ts",
-    "bench:tools:hy3": "tsx scripts/benchmark-tools-hy3.ts"
+    "test:auth:live": "tsx src/auth/auth.test.ts --live"
   },
 
   "keywords": [

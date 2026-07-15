@@ -27,6 +27,7 @@ import {
   parseToolArgs,
   toolFingerprint,
 } from "./normalize.js";
+import { resolveToolName } from "./tool.js";
 
 export interface ToolRunnerOptions extends ToolExecutorOptions {
   permissions?: PermissionRules;
@@ -93,6 +94,7 @@ export class ToolRunner {
     rawArgs: Record<string, unknown> | string | undefined,
   ): Promise<RunCallResult> {
     const t0 = Date.now();
+    name = resolveToolName(name);
     const parsed =
       typeof rawArgs === "string" || rawArgs === undefined
         ? parseToolArgs(rawArgs)

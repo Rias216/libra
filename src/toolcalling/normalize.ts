@@ -21,13 +21,38 @@ export function stableJson(value: unknown): string {
  * fingerprinting so `write` and `write_file` share cache keys when args match.
  */
 export function canonicalToolName(name: string): string {
+  // Lazy import avoided — keep alias table here in sync with tool.ts TOOL_ALIASES
   switch (name) {
     case "write_file":
+    case "Write":
       return "write";
     case "edit_file":
+    case "edit":
+    case "Edit":
+    case "str_replace":
       return "search_replace";
     case "run_shell":
+    case "bash":
+    case "shell":
+    case "Shell":
+    case "local_shell":
       return "run_terminal_command";
+    case "read":
+    case "Read":
+      return "read_file";
+    case "ls":
+    case "list":
+      return "list_dir";
+    case "Grep":
+      return "grep";
+    case "Glob":
+      return "glob";
+    case "websearch":
+      return "web_search";
+    case "webfetch":
+      return "web_fetch";
+    case "todowrite":
+      return "todo_write";
     default:
       return name;
   }
@@ -50,7 +75,8 @@ export function normalizeToolArgs(
   const canon = canonicalToolName(name);
 
   // Catalog path aliases → native field names (and vice versa for catalog)
-  switch (name) {
+  // Use canon so OpenCode/Codex aliases (read, bash, …) normalize the same.
+  switch (canon) {
     case "list_dir": {
       if (out.path != null && out.target_directory == null) {
         out.target_directory = out.path;
@@ -75,7 +101,6 @@ export function normalizeToolArgs(
       }
       break;
     }
-    case "write_file":
     case "write": {
       if (out.path != null && out.file_path == null) {
         out.file_path = out.path;
@@ -83,7 +108,6 @@ export function normalizeToolArgs(
       }
       break;
     }
-    case "edit_file":
     case "search_replace": {
       if (out.path != null && out.file_path == null) {
         out.file_path = out.path;
@@ -91,7 +115,6 @@ export function normalizeToolArgs(
       }
       break;
     }
-    case "run_shell":
     case "run_terminal_command": {
       // Catalog / models often pass timeout or timeout_s instead of timeout_ms
       if (out.timeout_s != null && out.timeout_ms == null) {

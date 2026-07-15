@@ -1396,7 +1396,12 @@ async function handleUserSubmit(
       );
       toast(store, prep.summary);
       const system =
-        buildSystemPrompt(settings.reasoning.customInstructions) +
+        buildSystemPrompt({
+          extra: settings.reasoning.customInstructions,
+          model,
+          provider,
+          cwd: process.cwd(),
+        }) +
         "\n\n" +
         prep.systemAddon;
       await live.handle(text, {

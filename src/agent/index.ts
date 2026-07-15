@@ -5,3 +5,6 @@ export * from "./subagent/index.js";
 export * from "./loop.js";
 export * from "./prompt.js";
 export * from "./reasoning.js";
+export * from "./history.js";
+export * from "./turn.js";
+export * from "./compaction.js";

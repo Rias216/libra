@@ -1,6 +1,6 @@
 /**
  * Fusion / headless harness tool catalog (OpenAI-style).
- * Names and parameters match `fustion benchmarks/tools/catalog.md`.
+ * Alternate tool schema set used by the catalog toolset / fusion harness.
  */
 
 import type { OpenAITool } from "./schema.js";

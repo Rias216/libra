@@ -60,25 +60,14 @@ export interface FusionPrepResult {
   phase1Ms: number;
 }
 
-/** Cap phase-1 completion size — plans need room but not novels */
-const FUSION_REASON_MAX_TOKENS = 1536;
-/** Free models: hard cap — high max_tokens makes reasoning models burn 15–30s */
-const FUSION_REASON_MAX_TOKENS_FREE = 512;
-/**
- * Free models: disable separate reasoning tokens so max_tokens go to the plan.
- * hy3 "low" still burned 512 tokens on hidden reasoning (finish=length, empty content).
- */
-const FREE_MODEL_REASON_EFFORT = "none";
 /** One quick retry on 429 / upstream rate limit */
 const FUSION_RETRY_MS = 2500;
 
-const REASONING_PASS_SYSTEM = `You produce a SHORT reasoning-only plan for a multi-model harness.
+const REASONING_PASS_SYSTEM = `You produce a reasoning-only plan for a multi-model harness.
 RULES:
 - REASONING ONLY — no tool calls, no fake file edits, no "I will now run…"
-- Max ~12 bullet lines: goal, steps, risks, files to touch
-- Concrete and executable. No filler.`;
-
-const REASONING_PASS_SYSTEM_FREE = `Short plan only (bullets). No tools. No code. Max 8 lines: goal + steps + risks.`;
+- Cover goal, steps, risks, files to touch, and concrete execution detail
+- Do not artificially shorten your reasoning; the API effort level controls depth`;
 /**
  * Resolve the single peer reasoner (NOT the main executor).
  * Hard cap: 1 additional agent. Uses fusion.modelKeys[0] or auto-picks.
@@ -222,18 +211,11 @@ export function formatFusionReasoningDisplay(
     `Ultra + Fusion`,
     ``,
     `Main · ${mainKey} (${mainReasoning.ms}ms${mainReasoning.ttftMs != null ? ` ttft=${mainReasoning.ttftMs}ms` : ""})`,
-    clipTrace(mainBody, 1500),
+    mainBody,
     ``,
     `Peer · ${peerKey} (${peer?.ms ?? "?"}ms${peer?.ttftMs != null ? ` ttft=${peer.ttftMs}ms` : ""})`,
-    clipTrace(peerBody, 1500),
+    peerBody,
   ].join("\n");
-}
-
-/** Keep fusion context small so free models stay fast */
-function clipTrace(s: string, max = 1200): string {
-  const t = s.trim();
-  if (t.length <= max) return t;
-  return t.slice(0, max) + `\n…[truncated ${t.length - max} chars]`;
 }
 
 function buildMainCompareAddon(
@@ -242,15 +224,16 @@ function buildMainCompareAddon(
   secondaries: FusionCandidate[],
   fusion: FusionConfig,
 ): string {
+  // Full traces — no internal truncation; API effort is the only depth control
   const mainBody = mainReasoning.error
     ? `(failed: ${mainReasoning.error})`
-    : clipTrace(mainReasoning.text?.trim() || "(empty)");
+    : mainReasoning.text?.trim() || "(empty)";
 
   const peerTraces = secondaries
     .map((c, i) => {
       const body = c.error
-        ? `(failed: ${c.error.slice(0, 180)})`
-        : clipTrace(c.text?.trim() || "(empty trace)");
+        ? `(failed: ${c.error})`
+        : c.text?.trim() || "(empty trace)";
       return `### Secondary reasoning #${i + 1} — ${c.modelKey} (${c.ms}ms)\n${body}`;
     })
     .join("\n\n");
@@ -323,18 +306,12 @@ async function runOneReasoning(
     };
   }
 
-  const isFree = /:free$/i.test(ref.model) || /\/free$/i.test(ref.model);
-  const baseSystem = isFree ? REASONING_PASS_SYSTEM_FREE : REASONING_PASS_SYSTEM;
   const extra = fusion.analysisInstructions?.trim();
   const system =
-    baseSystem +
-    (extra && !isFree
-      ? `\n\nExtra instructions:\n${extra}`
-      : extra && isFree
-        ? `\n${extra.slice(0, 200)}`
-        : "");
+    REASONING_PASS_SYSTEM +
+    (extra ? `\n\nExtra instructions:\n${extra}` : "");
 
-  dbg("fusion", `${label}.start`, { key, model: ref.model, free: isFree });
+  dbg("fusion", `${label}.start`, { key, model: ref.model });
 
   let lastError = "";
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -349,7 +326,6 @@ async function runOneReasoning(
         system,
         user: userPrompt,
         label: attempt ? `${label}.retry` : label,
-        isFree,
       });
       const ms = Date.now() - started;
       dbg("fusion", `${label}.ok`, {
@@ -414,14 +390,9 @@ async function completeReasoningOnly(opts: {
   system: string;
   user: string;
   label: string;
-  isFree?: boolean;
 }): Promise<ReasoningOnlyResult> {
-  const isFree =
-    opts.isFree ??
-    (/:free$/i.test(opts.model) || /\/free$/i.test(opts.model));
-
-  // Free models: lower effort + hard max_tokens for speed.
-  // Paid reasoning models keep user's per-model effort via applyNativeReasoning.
+  // No internal reasoning caps — depth comes only from the model's API
+  // effort setting (buildReasoningApiFields / per-model effort).
   const result = await chatComplete(
     {
       provider: opts.provider,
@@ -433,13 +404,9 @@ async function completeReasoningOnly(opts: {
       tools: undefined,
       tool_choice: "none",
       temperature: 0.2,
-      max_tokens: isFree
-        ? FUSION_REASON_MAX_TOKENS_FREE
-        : FUSION_REASON_MAX_TOKENS,
+      // No max_tokens — unlimited; reasoning depth via API effort only
       stream: true,
-      applyNativeReasoning: !isFree,
-      // Free tier: force low effort — high/max burns tokens and latency
-      reasoning_effort: isFree ? FREE_MODEL_REASON_EFFORT : undefined,
+      applyNativeReasoning: true,
       label: opts.label,
     },
     {
