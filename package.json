@@ -18,7 +18,7 @@
     "start": "bun dist/cli.js",
     "dev": "bun src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test/harness.test.ts && bun test/grok-port.test.ts && bun test/web-tools.test.ts && bun test/stream-layout.test.ts",
+    "test": "bun test/harness.test.ts && bun test/grok-port.test.ts && bun test/web-tools.test.ts && bun test/stream-layout.test.ts && bun test test/tui-visual.test.ts",
     "test:web": "bun test/web-tools.test.ts",
     "test:harness": "bun test/harness.test.ts",
     "test:grok-port": "bun test/grok-port.test.ts",

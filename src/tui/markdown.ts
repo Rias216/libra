@@ -11,6 +11,7 @@
 import type { Style } from "./ansi.js";
 import { stringWidth } from "./ansi.js";
 import type { Theme } from "./theme.js";
+import { renderCodeBox } from "./codebox.js";
 
 export interface Segment {
   text: string;
@@ -101,43 +102,52 @@ export function renderMarkdown(
   const out: RenderLine[] = [];
   let inCode = false;
   let codeLang = "";
+  let codeBuf: string[] = [];
+
+  const flushCode = () => {
+    if (!inCode && codeBuf.length === 0) return;
+    const body = codeBuf.join("\n");
+    codeBuf = [];
+    const box = renderCodeBox(body, theme, maxWidth, {
+      lang: codeLang,
+      parseLineGutters: true,
+    });
+    for (const row of box) {
+      out.push({
+        segments: row.segments,
+        plain: row.segments.map((s) => s.text).join(""),
+      });
+    }
+    codeLang = "";
+    inCode = false;
+  };
 
   for (const raw of lines) {
     if (raw.startsWith("```")) {
       if (!inCode) {
         inCode = true;
-        codeLang = raw.slice(3).trim();
-        out.push(
-          makeLine(
-            [
-              {
-                text: codeLang ? `┌── ${codeLang} ` : "┌── code ",
-                style: { fg: theme.fgFaint },
-              },
-            ],
-            maxWidth,
-          ),
-        );
+        codeLang = raw.slice(3).trim().split(/\s+/)[0] ?? "";
+        codeBuf = [];
       } else {
-        inCode = false;
-        codeLang = "";
-        out.push(
-          makeLine(
-            [{ text: "└────────", style: { fg: theme.fgFaint } }],
-            maxWidth,
-          ),
-        );
+        flushCode();
       }
       continue;
     }
 
     if (inCode) {
-      // Fixed-width code body: no markdown, dim mono-ish style + gutter
+      codeBuf.push(raw);
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(raw)) {
       out.push(
-        ...wrapSegments(
+        makeLine(
           [
-            { text: "│ ", style: { fg: theme.border } },
-            { text: raw, style: { fg: theme.tool, bg: theme.bgSubtle } },
+            {
+              text: "─".repeat(Math.max(1, maxWidth)),
+              style: { fg: theme.border },
+            },
           ],
           maxWidth,
         ),
@@ -225,6 +235,9 @@ export function renderMarkdown(
 
     out.push(...wrapSegments(parseInline(raw, theme), maxWidth));
   }
+
+  // Unclosed fence — still render what we buffered
+  if (inCode) flushCode();
 
   mdCacheSet(key, out);
   return out;
@@ -404,8 +417,9 @@ function parseInline(
   base: Style = { fg: theme.fg },
 ): Segment[] {
   const segments: Segment[] = [];
-  // Patterns: `code`, **bold**, *italic*, remaining text
-  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  // Patterns: `code`, **bold**, ~~strike~~, *italic*, [text](url), bare urls
+  const re =
+    /(`[^`]+`|\*\*[^*]+\*\*|~~[^~]+~~|\*[^*]+\*|\[[^\]]+\]\([^)]+\)|https?:\/\/[^\s<>)"]+)/g;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
@@ -416,12 +430,28 @@ function parseInline(
     if (tok.startsWith("`")) {
       segments.push({
         text: " " + tok.slice(1, -1) + " ",
-        style: { fg: theme.tool, bg: theme.bgSubtle },
+        style: { fg: theme.synString, bg: theme.codeBg },
       });
     } else if (tok.startsWith("**")) {
       segments.push({
         text: tok.slice(2, -2),
         style: { ...base, bold: true },
+      });
+    } else if (tok.startsWith("~~")) {
+      segments.push({
+        text: tok.slice(2, -2),
+        style: { ...base, dim: true },
+      });
+    } else if (tok.startsWith("[")) {
+      const label = tok.match(/^\[([^\]]+)\]/)?.[1] ?? tok;
+      segments.push({
+        text: label,
+        style: { ...base, fg: theme.accentUser, underline: true },
+      });
+    } else if (tok.startsWith("http")) {
+      segments.push({
+        text: tok,
+        style: { ...base, fg: theme.accentUser, underline: true },
       });
     } else if (tok.startsWith("*")) {
       segments.push({

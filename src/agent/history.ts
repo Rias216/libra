@@ -57,9 +57,9 @@ export function messagesToWire(
       m.role === "assistant" &&
       mi === msgs.length - 1
     ) {
-      // Empty shell OR reasoning-only seed (Ultra+Fusion dual traces) —
-      // not yet a completed wire turn. Dual traces already ride in the
-      // system addon; do not re-send as a trailing assistant message.
+      // Empty shell OR reasoning-only seed (Ultra+Fusion dual UI Thoughts) —
+      // not yet a completed wire turn. Phase-1 dual plans must ride in the
+      // system addon (buildMainCompareAddon) — UI Thoughts alone are not wire.
       if (m.parts.length === 0) continue;
       const hasText = m.parts.some(
         (p) => p.type === "text" && p.content?.trim(),
@@ -170,11 +170,20 @@ function toolPartBody(p: ToolPart, max: number): string {
   return `[${p.status}]`;
 }
 
-/** Rough token estimate (chars/4) for soft compaction. */
+/** Rough token estimate (chars/4) for soft compaction — includes CoT fields. */
 export function approxTokensFromMessages(messages: ChatMessage[]): number {
   let n = 0;
   for (const m of messages) {
     if (typeof m.content === "string") n += m.content.length;
+    // In-turn reasoning / CoT is often large; omitting it under-triggers compact.
+    const any = m as ChatMessage & {
+      reasoning?: string;
+      reasoning_content?: string;
+    };
+    if (typeof any.reasoning === "string") n += any.reasoning.length;
+    if (typeof any.reasoning_content === "string") {
+      n += any.reasoning_content.length;
+    }
     if (m.tool_calls) {
       for (const tc of m.tool_calls) {
         n += tc.function.name.length + (tc.function.arguments?.length ?? 0);

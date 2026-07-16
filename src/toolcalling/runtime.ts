@@ -1,6 +1,7 @@
 /**
- * ToolCallRuntime — parallel-safe dispatch + cancel + doom-loop.
- * Codex tools/parallel.rs + OpenCode doom-loop threshold.
+ * ToolCallRuntime — parallel-safe dispatch + cancel + doom-loop v2.
+ * Codex tools/parallel.rs + OpenCode doom-loop threshold, hardened:
+ * count-based fingerprints, A↔B oscillation, escalation flags.
  */
 
 import { runInWaves } from "./concurrency.js";
@@ -11,8 +12,11 @@ import {
 } from "./truncate.js";
 import type { DispatchCall } from "./router.js";
 
-/** Same fingerprint this many times already in history → doom-loop. */
+/** Same fingerprint this many times this turn (anywhere) → doom-loop. */
 export const DOOM_LOOP_THRESHOLD = 3;
+
+/** A-B-A-B oscillation over this many recent fingerprints → doom. */
+export const DOOM_OSCILLATION_WINDOW = 4;
 
 export interface DispatchResult {
   callId: string;
@@ -27,6 +31,8 @@ export interface DispatchResult {
   invalid?: boolean;
   aborted?: boolean;
   doomLoop?: boolean;
+  /** Why doom fired (for tests / status). */
+  doomReason?: "repeat" | "oscillation";
 }
 
 export interface RuntimeHandlers {
@@ -41,7 +47,12 @@ export interface RuntimeHandlers {
 type WaveCall = DispatchCall & { id: string };
 
 export class ToolCallRuntime {
+  /** Ordered fingerprints this turn (including doom-blocked). */
   private recent: string[] = [];
+  /** Count of times each fingerprint was seen this turn. */
+  private counts = new Map<string, number>();
+  /** How many doom blocks fired this turn (for force-answer escalation). */
+  private doomHits = 0;
 
   constructor(
     private runner: ToolRunner,
@@ -52,10 +63,13 @@ export class ToolCallRuntime {
     return [...this.recent];
   }
 
+  get doomHitCount(): number {
+    return this.doomHits;
+  }
+
   seedFingerprints(fps: string[]): void {
-    this.recent.push(...fps);
-    if (this.recent.length > 32) {
-      this.recent = this.recent.slice(-32);
+    for (const fp of fps) {
+      this.recordFingerprint(fp);
     }
   }
 
@@ -79,7 +93,11 @@ export class ToolCallRuntime {
         return this.abortedResult(call);
       }
 
-      if (this.isDoomLoop(call.fingerprint)) {
+      const doom = this.checkDoom(call.fingerprint);
+      if (doom) {
+        this.doomHits++;
+        // Still record so oscillation / counts stay consistent
+        this.recordFingerprint(call.fingerprint);
         return {
           callId: call.callId,
           name: call.name,
@@ -87,11 +105,13 @@ export class ToolCallRuntime {
           fingerprint: call.fingerprint,
           ok: false,
           output:
-            `Doom-loop: tool "${call.name}" with the same arguments was already executed ${DOOM_LOOP_THRESHOLD} times this turn. ` +
+            `Doom-loop (${doom}): tool "${call.name}" with the same or alternating ` +
+            `arguments was already executed ${DOOM_LOOP_THRESHOLD}+ times this turn. ` +
             `Use the prior results and answer the user now. Do not re-call this tool with identical args.`,
           durationMs: 0,
           cached: false,
           doomLoop: true,
+          doomReason: doom,
         } satisfies DispatchResult;
       }
 
@@ -118,13 +138,11 @@ export class ToolCallRuntime {
           result = fromRunResult(call, exec, this.outputMax);
         }
 
-        if (!result.doomLoop) {
-          this.recent.push(call.fingerprint);
-          if (this.recent.length > 32) this.recent = this.recent.slice(-32);
-        }
+        this.recordFingerprint(call.fingerprint);
         return result;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        this.recordFingerprint(call.fingerprint);
         return {
           callId: call.callId,
           name: call.name,
@@ -139,10 +157,55 @@ export class ToolCallRuntime {
     });
   }
 
-  private isDoomLoop(fp: string): boolean {
-    if (this.recent.length < DOOM_LOOP_THRESHOLD) return false;
-    const tail = this.recent.slice(-DOOM_LOOP_THRESHOLD);
-    return tail.every((x) => x === fp);
+  /**
+   * Count-based repeat OR A-B-A-B oscillation.
+   * Check *before* recording the current fingerprint.
+   */
+  checkDoom(fp: string): "repeat" | "oscillation" | null {
+    const prev = this.counts.get(fp) ?? 0;
+    // Already seen threshold times → next call is doom
+    if (prev >= DOOM_LOOP_THRESHOLD) return "repeat";
+
+    // A-B-A-B: last window is alternating pair and current continues it
+    if (this.recent.length >= DOOM_OSCILLATION_WINDOW - 1) {
+      const tail = this.recent.slice(-(DOOM_OSCILLATION_WINDOW - 1));
+      // With current as next: [a,b,a,b]
+      const a = tail[0];
+      const b = tail[1];
+      if (
+        a &&
+        b &&
+        a !== b &&
+        tail.length === 3 &&
+        tail[0] === a &&
+        tail[1] === b &&
+        tail[2] === a &&
+        fp === b
+      ) {
+        return "oscillation";
+      }
+      // Also catch already-complete A-B-A-B in recent where current matches a again
+      if (this.recent.length >= DOOM_OSCILLATION_WINDOW) {
+        const w = this.recent.slice(-DOOM_OSCILLATION_WINDOW);
+        if (
+          w[0] !== w[1] &&
+          w[0] === w[2] &&
+          w[1] === w[3] &&
+          (fp === w[0] || fp === w[1])
+        ) {
+          return "oscillation";
+        }
+      }
+    }
+    return null;
+  }
+
+  private recordFingerprint(fp: string): void {
+    this.recent.push(fp);
+    this.counts.set(fp, (this.counts.get(fp) ?? 0) + 1);
+    if (this.recent.length > 64) {
+      this.recent = this.recent.slice(-64);
+    }
   }
 
   private abortedResult(call: DispatchCall): DispatchResult {

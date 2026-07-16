@@ -111,6 +111,12 @@ export interface SessionMeta {
   provider: string;
   cwd: string;
   createdAt: number;
+  /**
+   * Context window (input tokens) for the active model, when known from the
+   * catalog. Kept on the session so the footer updates immediately on /model
+   * even before the next token usage event.
+   */
+  contextWindow?: number;
 }
 
 export type AgentPhase =
@@ -194,12 +200,14 @@ export function createEmptyState(partial?: Partial<SessionMeta>): HarnessState {
       provider: partial?.provider ?? "local",
       cwd: partial?.cwd ?? process.cwd(),
       createdAt: partial?.createdAt ?? now,
+      contextWindow: partial?.contextWindow,
     },
     messages: [],
     phase: "idle",
     draft: "",
     tokens: { input: 0, output: 0 },
-    showToolDetails: true,
+    // Collapsed by default — click headers / Ctrl+E to manage
+    showToolDetails: false,
     showThinking: true,
     compact: false,
     agents: [],

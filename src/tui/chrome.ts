@@ -20,11 +20,13 @@ export function renderHeader(
   theme: Theme,
   width: number,
   compact: boolean,
+  assistantGlyph = "*",
 ): Row[] {
   const modelsRight = formatMainPeerModels(state);
+  const mark = `${assistantGlyph} libra`;
 
   if (compact) {
-    const left = `* libra`;
+    const left = mark;
     const gap = Math.max(1, width - stringWidth(left) - stringWidth(modelsRight));
     return [
       {
@@ -41,7 +43,7 @@ export function renderHeader(
   }
 
   const title = state.session.title;
-  const left = `* libra`;
+  const left = mark;
   const mid = `  ${title}`;
   const leftW = stringWidth(left);
   const rightW = stringWidth(modelsRight);
@@ -122,7 +124,10 @@ function formatModelLabel(provider: string, model: string): string {
   return truncate(`${provider}/${model}`, 36);
 }
 
-/** Fallback context window when the model catalog has no figure. */
+/**
+ * Fallback context window when the model catalog has no figure.
+ * Prefer session.contextWindow / catalog over this static value.
+ */
 export const DEFAULT_CONTEXT_WINDOW = Math.round(
   DEFAULT_COMPACT_TOKEN_BUDGET / 0.8,
 );
@@ -132,10 +137,13 @@ export function resolveContextUsage(state: HarnessState): {
   limit: number;
   ratio: number;
 } {
-  const limitRaw = getModelContextWindow(
-    state.session.provider,
-    state.session.model,
-  );
+  // Prefer session-pinned window (set on /model) so the footer tracks the
+  // active model even when the catalog cache was cold at first paint.
+  const pinned = state.session.contextWindow;
+  const limitRaw =
+    pinned != null && pinned > 1024
+      ? pinned
+      : getModelContextWindow(state.session.provider, state.session.model);
   const limit =
     limitRaw != null && limitRaw > 1024 ? limitRaw : DEFAULT_CONTEXT_WINDOW;
   // Prefer latest request prompt_tokens (true context fill); else session input
@@ -311,8 +319,8 @@ export function renderStatus(
     : extra?.completeOpen
       ? "up/down  tab  enter  esc"
       : focus === "prompt"
-        ? "wheel scroll  enter send  drag=copy"
-        : "wheel scroll  tab prompt";
+        ? "wheel scroll  enter send  ctrl+e fold  drag=copy"
+        : "wheel scroll  tab prompt  ctrl+e fold";
 
   const left = phaseText;
   const mid = `  |  ${focusHint}${scroll}`;
@@ -650,11 +658,16 @@ function lerpRgb(a: Rgb, b: Rgb, t: number): Rgb {
   };
 }
 
-export function renderDivider(theme: Theme, width: number): Row {
+export function renderDivider(
+  theme: Theme,
+  width: number,
+  hline = "-",
+): Row {
+  const ch = hline || "-";
   return {
     segments: [
       {
-        text: "-".repeat(Math.max(0, width)),
+        text: ch.repeat(Math.max(0, width)),
         style: { fg: theme.border },
       },
     ],

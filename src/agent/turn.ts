@@ -32,6 +32,7 @@ import { withRetry } from "../llm/retry.js";
 import { ToolRunner } from "../toolcalling/runner.js";
 import {
   ToolCallRuntime,
+  DOOM_LOOP_THRESHOLD,
   type DispatchResult,
 } from "../toolcalling/runtime.js";
 import {
@@ -67,24 +68,37 @@ import {
 import { forceUltraReasoningExtension } from "./ultra-reason.js";
 import { getModelContextWindow } from "../auth/models.js";
 import { newId } from "../core/types.js";
+import {
+  createThoughtLoopState,
+  detectThoughtLoop,
+  THOUGHT_LOOP_REMINDER,
+  DOOM_FORCE_ANSWER_REMINDER,
+  STUCK_PROGRESS_REMINDER,
+} from "./thought-loop.js";
 
-/** OpenCode-style step cap before max-steps nudge. */
-export const MAX_STEPS = 24;
+/** OpenCode-style step cap before max-steps nudge (raised for multi-file coding). */
+export const MAX_STEPS = 40;
 /** Default child/subagent step cap (still uses same core + MAX_STEPS_PROMPT). */
 export const DEFAULT_CHILD_MAX_STEPS = 8;
 /** Fallback soft budget when model context is unknown (also 80% target uses model). */
 export const COMPACT_TOKEN_BUDGET = DEFAULT_COMPACT_TOKEN_BUDGET;
 /** Slightly tighter budget for headless children (same compact fn). */
 export const COMPACT_TOKEN_BUDGET_CHILD = 40_000;
+/** Doom hits this turn before we force tool_choice none. */
+export const DOOM_FORCE_ANSWER_AFTER = 2;
+/** Stuck progress waves before force-answer. */
+export const STUCK_FORCE_ANSWER_AFTER = 2;
 
 /**
  * Injected on the final step (both parent and child) when tools would
  * otherwise still be enabled — OpenCode max-steps spirit.
- * Exported so tests can assert both paths use the same constant.
+ * User-role system-reminder (not fake assistant speech).
  */
 export const MAX_STEPS_PROMPT =
+  "<system-reminder>\n" +
   "You have used the maximum number of steps for this turn. " +
-  "Do not call any more tools. Give the user your best final answer now based on what you already know.";
+  "Do not call any more tools. Give the user your best final answer now based on what you already know.\n" +
+  "</system-reminder>";
 
 export interface TurnOptions {
   provider: ProviderId;
@@ -251,6 +265,16 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
   let cancelled = false;
   /** Auto-continues after finish_reason=length / broken mid-stream tool args */
   let lengthContinues = 0;
+  /** After doom/stuck — next sample(s) with tools forced off. */
+  let forceToolsOff = false;
+  let doomWaves = 0;
+  let stuckWaves = 0;
+  const thoughtLoop = createThoughtLoopState();
+  /** Recent failed tool fingerprints for stuck detection. */
+  const recentFailFps: string[] = [];
+  const recentErrorSnips: string[] = [];
+  /** Last known prompt tokens from API usage (honest compact). */
+  let lastApiPromptTokens = 0;
 
   const contextWindow = getModelContextWindow(provider, model);
   const compactBudget =
@@ -294,7 +318,11 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
       keepRecent,
     });
 
-    if (!shouldAutoCompact(messages, compactBudget)) return;
+    // Prefer last API prompt_tokens when present (more honest than chars/4 alone)
+    const overBudget =
+      shouldAutoCompact(messages, compactBudget) ||
+      (lastApiPromptTokens > 0 && lastApiPromptTokens >= compactBudget);
+    if (!overBudget) return;
     if (didSessionRollover) {
       // Already rolled once this turn — keep soft-compacting only
       softCompactMessages(messages, {
@@ -348,18 +376,21 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
       ensureToolCallPairing(messages);
 
       const isLast = step >= maxSteps;
-      // Tools off only on last step OR when tools disabled for the whole turn
+      // Tools off on last step, force-answer, or when tools disabled for the whole turn
       const toolsEnabled =
-        toolsEnabledInitially && Boolean(toolSchemas?.length) && !isLast;
+        toolsEnabledInitially &&
+        Boolean(toolSchemas?.length) &&
+        !isLast &&
+        !forceToolsOff;
 
       // Before sample: surface subagent completions that finished since last notice
       maybeInjectSubagentNotices(messages, hooks.drainSubagentNotices);
 
-      // Same max-steps nudge for parent AND child
+      // Same max-steps nudge for parent AND child — user system-reminder
       const sampleMessages = isLast
         ? [
             ...messages,
-            { role: "assistant" as const, content: MAX_STEPS_PROMPT },
+            { role: "user" as const, content: MAX_STEPS_PROMPT },
           ]
         : messages;
 
@@ -375,15 +406,18 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         "streaming",
         isLast
           ? `finalizing · step ${step}`
-          : lengthContinues > 0
-            ? `continuing · step ${step}`
-            : `streaming · step ${step}`,
+          : forceToolsOff
+            ? `stuck · answering · step ${step}`
+            : lengthContinues > 0
+              ? `continuing · step ${step}`
+              : `streaming · step ${step}`,
       );
 
       dbg(ns, `step.${step}.start`, {
         messages: sampleMessages.length,
         tools: toolsEnabled,
         isLast,
+        forceToolsOff,
         maxStepsPrompt: isLast,
         tokensApprox: approxTokensFromMessages(sampleMessages),
         effort,
@@ -406,7 +440,7 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
                 tool_choice: !toolsEnabled
                   ? "none"
                   : (toolChoice ?? "auto"),
-                temperature: lightReasoning ? 0.2 : 0.4,
+                temperature: lightReasoning || forceToolsOff ? 0.2 : 0.4,
                 stream: true,
                 applyNativeReasoning: true,
                 // Explicit child/spawn effort override (native still applied first)
@@ -446,7 +480,49 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         const c = result.usage.completion_tokens ?? 0;
         promptTok += p;
         completionTok += c;
+        if (p > 0) lastApiPromptTokens = p;
         hooks.onUsage?.(p, c);
+      }
+
+      // Client-side thinking-tail loop (Grok Build spirit without server signals)
+      if (
+        !forceToolsOff &&
+        !isLast &&
+        detectThoughtLoop(thoughtLoop, result.reasoning)
+      ) {
+        thoughtLoop.recoveries++;
+        dbg(ns, `step.${step}.thought_loop`, {
+          recoveries: thoughtLoop.recoveries,
+          reasoningLen: result.reasoning?.length ?? 0,
+        });
+        if (result.content?.trim() || result.reasoning?.trim()) {
+          messages.push(
+            attachInTurnReasoning(
+              {
+                role: "assistant",
+                content: result.content?.trim() || null,
+              },
+              result.reasoning,
+            ),
+          );
+        }
+        messages.push({ role: "user", content: THOUGHT_LOOP_REMINDER });
+        if (thoughtLoop.recoveries >= 2) {
+          forceToolsOff = true;
+          hooks.onPhase?.("streaming", "thought-loop · answering");
+        }
+        // If model also emitted tools this round, still allow one tool wave
+        // unless we're already force-off — fall through only when tools present
+        // and first recovery; otherwise continue to re-sample with reminder.
+        const hasTools = result.tool_calls.some((t) => t.function?.name);
+        if (!hasTools || thoughtLoop.recoveries >= 2) {
+          finalText = result.content?.trim() || finalText;
+          if (thoughtLoop.recoveries >= 2 && !hasTools) {
+            // Will re-sample with tools off on next iteration
+            continue;
+          }
+          if (!hasTools) continue;
+        }
       }
 
       // OpenCode: tool_calls present ⇒ continue even if finish_reason=stop
@@ -509,8 +585,8 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         continue;
       }
 
-      // Valid tool calls → execute and loop (never on last step)
-      if (openTools.length && !isLast && !brokenTools) {
+      // Valid tool calls → execute and loop (never on last step / force-answer)
+      if (openTools.length && !isLast && !brokenTools && !forceToolsOff) {
         const wireTools = normalizeToolCallsForWire(openTools);
         const dispatchCalls = buildDispatchCalls(openTools);
 
@@ -536,6 +612,10 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
           customDispatch: hooks.customDispatch,
         });
 
+        let waveDoom = 0;
+        let waveFail = 0;
+        let waveMutateOk = 0;
+
         for (let i = 0; i < outputs.length; i++) {
           const out = outputs[i]!;
           const d = dispatchCalls[i]!;
@@ -547,6 +627,7 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
             ms: out.durationMs,
             cached: out.cached,
             doomLoop: out.doomLoop,
+            doomReason: out.doomReason,
             outLen: out.output.length,
           });
           hooks.onToolDone?.(i, d, out);
@@ -555,16 +636,101 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
             tool_call_id: out.callId,
             content: out.output || "(empty)",
           });
+
+          if (out.doomLoop) waveDoom++;
+          if (!out.ok && !out.doomLoop) {
+            waveFail++;
+            recentFailFps.push(out.fingerprint);
+            if (recentFailFps.length > 16) recentFailFps.shift();
+            const snip = (out.output || "").slice(0, 120).toLowerCase();
+            if (snip) {
+              recentErrorSnips.push(snip);
+              if (recentErrorSnips.length > 8) recentErrorSnips.shift();
+            }
+          }
+          if (
+            out.ok &&
+            (out.name === "search_replace" ||
+              out.name === "write" ||
+              out.name === "write_file" ||
+              out.name === "edit_file")
+          ) {
+            waveMutateOk++;
+          }
         }
 
         toolSpan.end({
           ok: outputs.filter((o) => o.ok).length,
           fail: outputs.filter((o) => !o.ok).length,
+          doom: waveDoom,
         });
+
+        // Doom escalation: only on waves that actually blocked a tool
+        if (waveDoom > 0) {
+          doomWaves++;
+          dbg(ns, `step.${step}.doom`, {
+            waveDoom,
+            doomHits: runtime.doomHitCount,
+            doomWaves,
+          });
+          messages.push({
+            role: "user",
+            content: DOOM_FORCE_ANSWER_REMINDER,
+          });
+          if (
+            doomWaves >= DOOM_FORCE_ANSWER_AFTER ||
+            runtime.doomHitCount >= DOOM_LOOP_THRESHOLD
+          ) {
+            forceToolsOff = true;
+            hooks.onPhase?.("streaming", "doom-loop · answering");
+          }
+        }
+
+        // Stuck progress: same fail fingerprint or identical error snips
+        const stuck = detectStuckProgress(
+          recentFailFps,
+          recentErrorSnips,
+          waveFail,
+          waveMutateOk,
+          outputs.length,
+        );
+        if (stuck) {
+          stuckWaves++;
+          dbg(ns, `step.${step}.stuck`, { stuckWaves, waveFail });
+          messages.push({ role: "user", content: STUCK_PROGRESS_REMINDER });
+          if (stuckWaves >= STUCK_FORCE_ANSWER_AFTER) {
+            forceToolsOff = true;
+            hooks.onPhase?.("streaming", "stuck · answering");
+          }
+        } else if (waveMutateOk > 0) {
+          // Progress resets stuck counter
+          stuckWaves = 0;
+        }
 
         // After tool wave: notify parent of any subagents that finished
         maybeInjectSubagentNotices(messages, hooks.drainSubagentNotices);
 
+        finalText = result.content?.trim() || finalText;
+        continue;
+      }
+
+      // Model asked for tools but we forced answer — drop tools and nudge
+      if (openTools.length && forceToolsOff && !isLast) {
+        if (result.content?.trim() || result.reasoning?.trim()) {
+          messages.push(
+            attachInTurnReasoning(
+              {
+                role: "assistant",
+                content: result.content?.trim() || null,
+              },
+              result.reasoning,
+            ),
+          );
+        }
+        messages.push({
+          role: "user",
+          content: DOOM_FORCE_ANSWER_REMINDER,
+        });
         finalText = result.content?.trim() || finalText;
         continue;
       }
@@ -780,7 +946,7 @@ export async function runStoreTurn(
             type: "reasoning",
             content: part.content,
             streaming: false,
-            collapsed: false,
+            collapsed: true,
             title: part.title,
           });
         }
@@ -1060,6 +1226,33 @@ function maybeInjectSubagentNotices(
     role: "user",
     content: `<system-reminder>\nSubagent(s) finished since last notice:\n\n${text}\n</system-reminder>`,
   });
+}
+
+/** Detect thrashing: repeated fail fingerprints or identical error text. */
+function detectStuckProgress(
+  recentFailFps: string[],
+  recentErrorSnips: string[],
+  waveFail: number,
+  waveMutateOk: number,
+  waveSize: number,
+): boolean {
+  if (waveMutateOk > 0 || waveSize === 0) return false;
+  if (waveFail === 0) return false;
+
+  // Same fail fingerprint ≥2 in recent window
+  if (recentFailFps.length >= 2) {
+    const last = recentFailFps[recentFailFps.length - 1]!;
+    const count = recentFailFps.filter((f) => f === last).length;
+    if (count >= 2) return true;
+  }
+
+  // Last 3 error snips identical (and non-empty)
+  if (recentErrorSnips.length >= 3) {
+    const last3 = recentErrorSnips.slice(-3);
+    if (last3[0] && last3.every((s) => s === last3[0])) return true;
+  }
+
+  return false;
 }
 
 /** Title for a session after auto-compaction rollover. */

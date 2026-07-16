@@ -126,12 +126,15 @@ export function layoutPrompt(
     placeholder?: string;
     /** Inline ghost completion drawn after the cursor */
     ghost?: string;
+    /** Prompt glyph (❯ / >) */
+    promptGlyph?: string;
   },
 ): { rows: Row[]; cursorRow: number; cursorCol: number; height: number } {
   const placeholder =
     opts?.placeholder ?? "Message libra...  (/ command  @ file  tab complete)";
   const ghost = opts?.ghost ?? "";
-  const prefix = focused ? "> " : "  ";
+  const g = opts?.promptGlyph ?? ">";
+  const prefix = focused ? `${g} ` : "  ";
   const prefixW = stringWidth(prefix);
   const inner = Math.max(1, width - prefixW);
 

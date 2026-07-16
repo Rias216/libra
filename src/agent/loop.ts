@@ -142,8 +142,8 @@ export class AgentLoop {
               type: "reasoning",
               content: part.content.trim(),
               streaming: false,
-              // Dual fusion traces: expanded so both models are visible
-              collapsed: part.collapsed ?? false,
+              // Collapsed by default — click or leave collapsed for a quiet TUI
+              collapsed: part.collapsed ?? true,
               title: part.title,
             });
           }
@@ -157,8 +157,7 @@ export class AgentLoop {
             type: "reasoning",
             content: singleSeed,
             streaming: false,
-            // Fusion single-block seed stays expanded so dual traces are readable
-            collapsed: false,
+            collapsed: true,
           });
           dbg("agent", "seed_reasoning", {
             chars: singleSeed.length,

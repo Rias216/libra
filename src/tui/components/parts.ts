@@ -17,6 +17,8 @@ import type {
   ToolPart,
 } from "../../core/types.js";
 import { wrapStreamPlain } from "../stream-layout.js";
+import { renderCodeBox, langFromPath } from "../codebox.js";
+import type { GlyphSet } from "../font.js";
 
 /**
  * Cache of fully materialised streaming body rows (borders + styles).
@@ -113,6 +115,8 @@ export function renderPart(
     tick: number;
     /** Required for click-to-expand hit targets */
     messageId?: string;
+    /** Glyph profile for chrome (chevrons, icons). */
+    glyphs?: GlyphSet;
   },
 ): Row[] {
   switch (part.type) {
@@ -120,12 +124,19 @@ export function renderPart(
       return renderText(part, theme, opts.width);
     case "reasoning":
       return opts.showThinking
-        ? renderReasoning(part, theme, opts.width, opts.tick, opts.messageId)
+        ? renderReasoning(
+            part,
+            theme,
+            opts.width,
+            opts.tick,
+            opts.messageId,
+            opts.glyphs,
+          )
         : [];
     case "tool":
       return renderTool(part, theme, opts);
     case "diff":
-      return renderDiff(part, theme, opts.width, opts.messageId);
+      return renderDiff(part, theme, opts.width, opts.messageId, opts.glyphs);
     case "file":
       return renderFile(part, theme, opts.width);
     case "status":
@@ -135,12 +146,20 @@ export function renderPart(
   }
 }
 
-/** OpenCode default: expanded while streaming, folded when finished. */
+/**
+ * Thinking traces are collapsed by default (including while streaming).
+ * Only expand when the user explicitly sets collapsed === false (click / key).
+ */
 export function isReasoningCollapsed(part: ReasoningPart): boolean {
-  if (part.collapsed != null) return part.collapsed;
-  return !part.streaming;
+  if (part.collapsed === false) return false;
+  if (part.collapsed === true) return true;
+  return true; // default collapsed
 }
 
+/**
+ * Tool cards are collapsed by default. showToolDetails=true expands the
+ * default for parts without an explicit collapsed flag.
+ */
 export function isToolCollapsed(
   part: ToolPart,
   showToolDetails: boolean,
@@ -269,21 +288,28 @@ function renderReasoning(
   width: number,
   tick: number,
   messageId?: string,
+  glyphs?: GlyphSet,
 ): Row[] {
   const collapsed = isReasoningCollapsed(part);
-  // OpenCode-style chevron: collapsed ▶ / expanded ▼ (ASCII fallback)
+  const chevronOpen = glyphs?.chevronOpen ?? "v";
+  const chevronClosed = glyphs?.chevronClosed ?? ">";
+  const rail = glyphs?.vline ?? "|";
+  // Spinner while streaming (still clickable); chevron when finished
   const chevron = part.streaming
     ? spinnerFrame(tick)
     : collapsed
-      ? ">"
-      : "v";
+      ? chevronClosed
+      : chevronOpen;
   const baseLabel = part.streaming ? "Thinking" : "Thought";
   const label = part.title?.trim()
     ? `${baseLabel} · ${part.title.trim()}`
     : baseLabel;
   const sizeHint = formatSizeHint(part.content);
+  // Live thinking is collapsible too — default closed, click to peek mid-stream
   const meta = part.streaming
-    ? " streaming"
+    ? collapsed
+      ? " streaming  click to expand"
+      : " streaming  click to collapse"
     : collapsed
       ? sizeHint
         ? `  ${sizeHint}  click to expand`
@@ -292,10 +318,10 @@ function renderReasoning(
         ? `  ${sizeHint}  click to collapse`
         : "  click to collapse";
 
-  const hit: RowHit | undefined =
-    messageId && !part.streaming
-      ? { action: "toggle-collapse", messageId, partId: part.id }
-      : undefined;
+  // Hit target always on (including live stream) so current thinking can expand
+  const hit: RowHit | undefined = messageId
+    ? { action: "toggle-collapse", messageId, partId: part.id }
+    : undefined;
 
   const header: Row = {
     segments: [
@@ -325,7 +351,7 @@ function renderReasoning(
   for (const line of body) {
     rows.push({
       segments: [
-        { text: "| ", style: { fg: theme.border } },
+        { text: `${rail} `, style: { fg: theme.thinking } },
         ...line.segments.map((s) => ({
           text: s.text,
           style: { ...s.style, fg: theme.fgMuted, italic: true },
@@ -507,11 +533,12 @@ function renderTool(
     showToolDetails: boolean;
     tick: number;
     messageId?: string;
+    glyphs?: GlyphSet;
   },
 ): Row[] {
   const rows: Row[] = [];
   const statusStyle = toolStatusStyle(part, theme);
-  const icon = toolIcon(part, opts.tick);
+  const icon = toolIcon(part, opts.tick, opts.glyphs);
   const duration =
     part.startedAt && part.finishedAt
       ? ` ${formatMs(part.finishedAt - part.startedAt)}`
@@ -521,12 +548,14 @@ function renderTool(
 
   const summary = toolSummary(part);
   const collapsed = isToolCollapsed(part, opts.showToolDetails);
+  const chOpen = opts.glyphs?.chevronOpen ?? "v";
+  const chClosed = opts.glyphs?.chevronClosed ?? ">";
   const chevron =
     part.status === "running"
       ? ""
       : collapsed
-        ? "> "
-        : "v ";
+        ? `${chClosed} `
+        : `${chOpen} `;
   const header = `${chevron}${icon} ${part.toolName}`;
   const rest = summary ? `  ${summary}` : "";
   const trail = `${duration}`;
@@ -556,7 +585,7 @@ function renderTool(
   for (const line of argLines.slice(0, 6)) {
     rows.push({
       segments: [
-        { text: "  > ", style: { fg: theme.fgFaint } },
+        { text: "  › ", style: { fg: theme.fgFaint } },
         { text: line, style: { fg: theme.fgMuted } },
       ],
     });
@@ -565,25 +594,38 @@ function renderTool(
     rows.push({
       segments: [
         {
-          text: `  > ... +${argLines.length - 6} more`,
+          text: `  › ... +${argLines.length - 6} more`,
           style: { fg: theme.fgFaint },
         },
       ],
     });
   }
 
-  // Result / error — always as a compact code block (not a wall of raw text)
+  // Result / error — full-width highlighted code card
+  const pathHint = toolPathHint(part);
+  const lang = langFromPath(pathHint);
+  const expanded = !collapsed || opts.showToolDetails;
   if (part.error) {
-    rows.push(...renderCodeBlock(part.error, theme, opts.width, {
-      label: "error",
-      maxLines: 10,
-      error: true,
-    }));
+    rows.push(
+      ...renderCodeBox(part.error, theme, opts.width, {
+        label: "error",
+        maxLines: expanded ? 40 : 10,
+        error: true,
+        indent: "  ",
+        parseLineGutters: true,
+        path: pathHint,
+        lang,
+      }),
+    );
   } else if (part.result && (part.status === "completed" || opts.showToolDetails)) {
     rows.push(
-      ...renderCodeBlock(part.result, theme, opts.width, {
-        label: "result",
-        maxLines: 14,
+      ...renderCodeBox(part.result, theme, opts.width, {
+        label: pathHint ? basename(pathHint) : "result",
+        maxLines: expanded ? 40 : 14,
+        indent: "  ",
+        parseLineGutters: true,
+        path: pathHint,
+        lang,
       }),
     );
   }
@@ -591,53 +633,18 @@ function renderTool(
   return rows;
 }
 
-/** Compact fenced-style block for tool output / errors. */
-function renderCodeBlock(
-  body: string,
-  theme: Theme,
-  width: number,
-  opts: { label: string; maxLines: number; error?: boolean },
-): Row[] {
-  const rows: Row[] = [];
-  const innerW = Math.max(1, width - 4);
-  const lines = wrapPlain(body, innerW);
-  const shown = lines.slice(0, opts.maxLines);
-  const fg = opts.error ? theme.toolError : theme.fgMuted;
-  const headFg = opts.error ? theme.toolError : theme.fgFaint;
+function toolPathHint(part: ToolPart): string | undefined {
+  const a = part.args;
+  for (const k of ["path", "file_path", "target_file", "file"]) {
+    if (typeof a[k] === "string") return a[k] as string;
+  }
+  return undefined;
+}
 
-  rows.push({
-    segments: [
-      { text: "  ┌── ", style: { fg: headFg } },
-      { text: opts.label + " ", style: { fg: headFg } },
-    ],
-  });
-  for (const line of shown) {
-    rows.push({
-      segments: [
-        { text: "  │ ", style: { fg: theme.border } },
-        {
-          text: line,
-          style: opts.error
-            ? { fg }
-            : { fg: theme.tool, bg: theme.bgSubtle },
-        },
-      ],
-    });
-  }
-  if (lines.length > opts.maxLines) {
-    rows.push({
-      segments: [
-        {
-          text: `  │ … ${lines.length - opts.maxLines} more lines`,
-          style: { fg: theme.fgFaint },
-        },
-      ],
-    });
-  }
-  rows.push({
-    segments: [{ text: "  └────────", style: { fg: headFg } }],
-  });
-  return rows;
+function basename(p: string): string {
+  const s = p.replace(/\\/g, "/");
+  const i = s.lastIndexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
 }
 
 function toolStatusStyle(part: ToolPart, theme: Theme): Style {
@@ -655,18 +662,22 @@ function toolStatusStyle(part: ToolPart, theme: Theme): Style {
   }
 }
 
-function toolIcon(part: ToolPart, tick: number): string {
+function toolIcon(
+  part: ToolPart,
+  tick: number,
+  glyphs?: GlyphSet,
+): string {
   switch (part.status) {
     case "pending":
-      return "o";
+      return glyphs?.toolPending ?? "o";
     case "running":
       return spinnerFrame(tick);
     case "completed":
-      return "+";
+      return glyphs?.toolOk ?? "+";
     case "error":
-      return "x";
+      return glyphs?.toolError ?? "x";
     case "cancelled":
-      return "-";
+      return glyphs?.toolCancelled ?? "-";
   }
 }
 
@@ -703,10 +714,14 @@ function renderDiff(
   theme: Theme,
   width: number,
   messageId?: string,
+  glyphs?: GlyphSet,
 ): Row[] {
   const rows: Row[] = [];
   const stats = `+${part.additions} -${part.deletions}`;
-  const chevron = part.collapsed ? "> " : "v ";
+  const ch = part.collapsed
+    ? (glyphs?.chevronClosed ?? ">")
+    : (glyphs?.chevronOpen ?? "v");
+  const chevron = `${ch} `;
   const hit: RowHit | undefined = messageId
     ? { action: "toggle-collapse", messageId, partId: part.id }
     : undefined;
@@ -722,6 +737,10 @@ function renderDiff(
 
   if (part.collapsed) return rows;
 
+  // Soft add/del background strips (frontier harness look)
+  const addBg = dimBg(theme.diffAdd, theme.bg, 0.12);
+  const delBg = dimBg(theme.diffDel, theme.bg, 0.12);
+
   for (const hunk of part.hunks) {
     rows.push({
       segments: [
@@ -733,17 +752,37 @@ function renderDiff(
         line.kind === "add" ? "+" : line.kind === "del" ? "-" : " ";
       const style: Style =
         line.kind === "add"
-          ? { fg: theme.diffAdd }
+          ? { fg: theme.diffAdd, bg: addBg }
           : line.kind === "del"
-            ? { fg: theme.diffDel }
+            ? { fg: theme.diffDel, bg: delBg }
             : { fg: theme.fgMuted };
       const text = truncate(`${prefix}${line.text}`, width - 2);
+      const pad = Math.max(0, width - 2 - stringWidth(text));
       rows.push({
-        segments: [{ text: "  " + text, style }],
+        segments: [
+          {
+            text: "  " + text + (pad > 0 ? " ".repeat(pad) : ""),
+            style,
+          },
+        ],
+        bg: style.bg,
       });
     }
   }
   return rows;
+}
+
+/** Blend accent into bg for soft diff strips. */
+function dimBg(
+  accent: { r: number; g: number; b: number },
+  bg: { r: number; g: number; b: number },
+  t: number,
+): { r: number; g: number; b: number } {
+  return {
+    r: Math.round(bg.r + (accent.r - bg.r) * t),
+    g: Math.round(bg.g + (accent.g - bg.g) * t),
+    b: Math.round(bg.b + (accent.b - bg.b) * t),
+  };
 }
 
 function renderFile(part: FilePart, theme: Theme, width: number): Row[] {
@@ -809,11 +848,13 @@ export function renderRoleHeader(
   role: string,
   theme: Theme,
   meta?: string,
+  glyphs?: GlyphSet,
 ): Row {
   if (role === "user") {
+    const g = glyphs?.user ?? ">";
     return {
       segments: [
-        { text: "> ", style: { fg: theme.accentUser, bold: true } },
+        { text: `${g} `, style: { fg: theme.accentUser, bold: true } },
         { text: "you", style: { fg: theme.accentUser, bold: true } },
         {
           text: meta ? `  ${meta}` : "",
@@ -823,9 +864,10 @@ export function renderRoleHeader(
     };
   }
   if (role === "assistant") {
+    const g = glyphs?.assistant ?? "*";
     return {
       segments: [
-        { text: "* ", style: { fg: theme.accentAssistant, bold: true } },
+        { text: `${g} `, style: { fg: theme.accentAssistant, bold: true } },
         { text: "libra", style: { fg: theme.accentAssistant, bold: true } },
         {
           text: meta ? `  ${meta}` : "",

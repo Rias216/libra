@@ -21,6 +21,7 @@ import {
   gcStreamLayouts,
 } from "./stream-layout.js";
 import { clearMarkdownCache } from "./markdown.js";
+import type { GlyphSet } from "./font.js";
 
 export interface ScrollModel {
   rows: Row[];
@@ -56,8 +57,9 @@ export function buildScrollRows(
   theme: Theme,
   contentWidth: number,
   tick: number,
+  glyphs?: GlyphSet,
 ): Row[] {
-  return buildScrollDocument(state, theme, contentWidth, tick).rows;
+  return buildScrollDocument(state, theme, contentWidth, tick, { glyphs }).rows;
 }
 
 export function buildScrollDocument(
@@ -65,9 +67,10 @@ export function buildScrollDocument(
   theme: Theme,
   contentWidth: number,
   tick: number,
-  opts?: { needPlain?: boolean },
+  opts?: { needPlain?: boolean; glyphs?: GlyphSet },
 ): ScrollDocument {
   const needPlain = opts?.needPlain ?? false;
+  const glyphs = opts?.glyphs;
   const liveIds = new Set<string>();
   const layoutOpts = {
     width: contentWidth,
@@ -76,10 +79,11 @@ export function buildScrollDocument(
     tick,
     themeName: theme.name,
     compact: state.compact,
+    glyphs,
   };
 
   if (state.messages.length === 0) {
-    const rows = emptyStateRows(theme, contentWidth);
+    const rows = emptyStateRows(theme, contentWidth, glyphs);
     return {
       rows,
       plain: needPlain ? rowsToPlain(rows) : [],
@@ -89,7 +93,10 @@ export function buildScrollDocument(
   }
 
   const split = findLiveSplit(state);
-  const prefixKey = makePrefixKey(state, theme, contentWidth, split);
+  const glyphKey = glyphs
+    ? `${glyphs.assistant}${glyphs.toolOk}${glyphs.chevronOpen}`
+    : "";
+  const prefixKey = makePrefixKey(state, theme, contentWidth, split, glyphKey);
 
   let prefixRows: Row[];
   let prefixPlain: string[];
@@ -192,6 +199,13 @@ function makeLiveSig(
       if (p.type === "text" || p.type === "reasoning") {
         h = mixNum(h, p.content.length);
         h = mixNum(h, p.streaming ? 1 : 0);
+        // Collapse toggle must invalidate live tail (expand mid-stream)
+        if (p.type === "reasoning") {
+          h = mixNum(
+            h,
+            p.collapsed === true ? 1 : p.collapsed === false ? 2 : 0,
+          );
+        }
         // Sample content so mid-stream length-stable edits still invalidate
         if (p.content.length > 0) {
           h = mixNum(h, p.content.charCodeAt(p.content.length - 1));
@@ -199,6 +213,10 @@ function makeLiveSig(
       } else if (p.type === "tool") {
         h = mixStr(h, p.status);
         h = mixNum(h, p.result?.length ?? 0);
+        h = mixNum(
+          h,
+          p.collapsed === true ? 1 : p.collapsed === false ? 2 : 0,
+        );
       } else {
         h = mixStr(h, p.type);
       }
@@ -217,9 +235,11 @@ function makePrefixKey(
   theme: Theme,
   contentWidth: number,
   split: number,
+  glyphKey = "",
 ): string {
   let h = 2166136261 >>> 0;
   h = mixStr(h, theme.name);
+  h = mixStr(h, glyphKey);
   h = mixNum(h, contentWidth);
   h = mixNum(h, state.compact ? 1 : 0);
   h = mixNum(h, state.showToolDetails ? 1 : 0);
@@ -231,7 +251,7 @@ function makePrefixKey(
     lastId = m.id;
     h = mixStr(h, messageStableKey(m));
   }
-  return `${theme.name}|${contentWidth}|${state.compact ? 1 : 0}|${state.showToolDetails ? 1 : 0}|${state.showThinking ? 1 : 0}|${split}|${lastId}|${(h >>> 0).toString(36)}`;
+  return `${theme.name}|${glyphKey}|${contentWidth}|${state.compact ? 1 : 0}|${state.showToolDetails ? 1 : 0}|${state.showThinking ? 1 : 0}|${split}|${lastId}|${(h >>> 0).toString(36)}`;
 }
 
 function mixStr(h: number, s: string): number {
@@ -306,6 +326,7 @@ function appendMessage(
     tick: number;
     themeName: string;
     compact: boolean;
+    glyphs?: GlyphSet;
   },
   liveIds: Set<string>,
 ): void {
@@ -318,7 +339,7 @@ function appendMessage(
       msg.usage != null
         ? formatCompactCount(msg.usage.input + msg.usage.output)
         : undefined;
-    rows.push(renderRoleHeader(msg.role, theme, meta));
+    rows.push(renderRoleHeader(msg.role, theme, meta, opts.glyphs));
   }
 
   for (const part of msg.parts) {
@@ -330,6 +351,7 @@ function appendMessage(
       tick: opts.tick,
       themeName: opts.themeName,
       messageId: msg.id,
+      glyphs: opts.glyphs,
     });
     // Push one-by-one — avoid spread allocating an intermediate arg array
     // for multi-thousand-line reasoning/tool bodies.
@@ -349,6 +371,7 @@ function renderPartCached(
     tick: number;
     themeName: string;
     messageId?: string;
+    glyphs?: GlyphSet;
   },
 ): Row[] {
   const streaming =
@@ -384,9 +407,13 @@ function partSignature(
     showThinking: boolean;
     themeName: string;
     messageId?: string;
+    glyphs?: GlyphSet;
   },
 ): string {
-  const base = `${opts.themeName}|${opts.width}|${opts.showToolDetails ? 1 : 0}|${opts.showThinking ? 1 : 0}|${opts.messageId ?? ""}`;
+  const gk = opts.glyphs
+    ? `${opts.glyphs.assistant}${opts.glyphs.toolOk}${opts.glyphs.chevronOpen}`
+    : "";
+  const base = `${opts.themeName}|${gk}|${opts.width}|${opts.showToolDetails ? 1 : 0}|${opts.showThinking ? 1 : 0}|${opts.messageId ?? ""}`;
   switch (part.type) {
     case "text":
       return `${base}|t|${part.content.length}|${hashStr(part.content)}`;
@@ -429,19 +456,24 @@ export function clearScrollCache(): void {
   clearMarkdownCache();
 }
 
-function emptyStateRows(theme: Theme, width: number): Row[] {
+function emptyStateRows(
+  theme: Theme,
+  width: number,
+  glyphs?: GlyphSet,
+): Row[] {
   const title = "libra";
   const subtitle = "AI harness TUI — inspired by OpenCode & Grok CLI";
+  const mark = glyphs?.assistant ?? "*";
   const hints = [
     "Type a message and press Enter to send",
     "Tab  focus scrollback   Ctrl+C  quit   Ctrl+L  clear",
-    "/help  slash commands   Ctrl+T  toggle thinking   click Thought to expand",
+    "/help  ·  Ctrl+T thinking  ·  Ctrl+E collapse all thoughts  ·  click to expand",
   ];
   const rows: Row[] = [
     { segments: [] },
     {
       segments: [
-        { text: "  * ", style: { fg: theme.accent } },
+        { text: `  ${mark} `, style: { fg: theme.accent } },
         { text: title, style: { fg: theme.accent, bold: true } },
       ],
     },

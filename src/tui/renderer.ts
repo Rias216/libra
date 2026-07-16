@@ -77,6 +77,7 @@ import { setSpinnerGlyphs } from "./components/parts.js";
 import {
   fontChangeSequence,
   glyphsFor,
+  preferBoxGlyphsOnModernTerminal,
   resolveFont,
   type FontProfile,
   type GlyphSet,
@@ -107,6 +108,8 @@ export interface RendererOptions {
    * Click on the part header when selection is empty (pure click).
    */
   onTogglePart?: (messageId: string, partId: string) => void;
+  /** Ctrl+E — collapse every thinking/reasoning block in the transcript. */
+  onCollapseAllThinking?: () => void;
 }
 
 export class TuiRenderer {
@@ -249,7 +252,11 @@ export class TuiRenderer {
     this.stdin = process.stdin;
     this.stdout = process.stdout;
     this.theme = resolveTheme(opts.theme ?? "libra-night");
-    this.font = resolveFont(opts.font ?? "default");
+    // Prefer box glyphs on modern terminals unless user pinned a font profile
+    const fontName =
+      opts.font ??
+      (preferBoxGlyphsOnModernTerminal() ? "cascadia" : "default");
+    this.font = resolveFont(fontName);
     this.glyphs = glyphsFor(this.font);
     setSpinnerGlyphs(this.glyphs.spinner);
     this.colorLevel = detectColorLevel();
@@ -843,6 +850,13 @@ export class TuiRenderer {
       return;
     }
 
+    // Ctrl+E — collapse all thinking (End key still jumps to end of line)
+    if (ev.name === "ctrl+e") {
+      this.opts.onCollapseAllThinking?.();
+      this.paint();
+      return;
+    }
+
     // Tab: complete first, else toggle focus
     if (ev.name === "tab") {
       if (this.focus === "prompt" && this.completeOpen) {
@@ -1222,8 +1236,12 @@ export class TuiRenderer {
         this.paint();
         break;
       case "end":
-      case "ctrl+e":
         this.modal.cursor = this.modal.value.length;
+        this.paint();
+        break;
+      case "ctrl+e":
+        // Global: collapse all thinking even while a modal is open
+        this.opts.onCollapseAllThinking?.();
         this.paint();
         break;
       case "paste":
@@ -1455,7 +1473,7 @@ export class TuiRenderer {
         this.paint();
         break;
       case "end":
-      case "ctrl+e":
+        // Ctrl+E is global: collapse all thoughts (see handleKey)
         this.prompt.cursor = this.prompt.text.length;
         this.refreshComplete();
         this.paint();
@@ -1552,7 +1570,13 @@ export class TuiRenderer {
     const gutter = 1;
     const contentWidth = Math.max(20, cols - padX * 2 - gutter);
 
-    const headerRows = renderHeader(state, this.theme, contentWidth, compact);
+    const headerRows = renderHeader(
+      state,
+      this.theme,
+      contentWidth,
+      compact,
+      this.glyphs.assistant,
+    );
     const headerH = headerRows.length + (compact ? 0 : 1);
     // status line + dedicated context usage bar at the very bottom
     const statusH = 2;
@@ -1566,7 +1590,7 @@ export class TuiRenderer {
       this.theme,
       contentWidth,
       this.focus === "prompt",
-      { ghost },
+      { ghost, promptGlyph: this.glyphs.prompt },
     );
     const promptH = promptLayout.height;
 
@@ -1618,7 +1642,7 @@ export class TuiRenderer {
       this.theme,
       contentWidth,
       this.tick,
-      { needPlain },
+      { needPlain, glyphs: this.glyphs },
     );
     this.lastLiveSig = liveSig;
     this.lastContentWidth = contentWidth;
@@ -1644,7 +1668,7 @@ export class TuiRenderer {
       this.paintRow(
         padX,
         y++,
-        renderDivider(this.theme, contentWidth),
+        renderDivider(this.theme, contentWidth, this.glyphs.hline),
         contentWidth,
       );
     }
@@ -1709,7 +1733,7 @@ export class TuiRenderer {
     this.paintRow(
       padX,
       y++,
-      renderDivider(this.theme, contentWidth),
+      renderDivider(this.theme, contentWidth, this.glyphs.hline),
       contentWidth,
     );
 
@@ -1798,11 +1822,16 @@ export class TuiRenderer {
       docLine !== undefined &&
       this.selection &&
       this.lineInSelection(docLine);
+    // Full-width panel bg (code boxes) — pad rest of row with row.bg
+    const rowBg = row.bg;
 
     for (const seg of row.segments) {
       if (col >= end) break;
       // Memoized bg attach — no per-segment object churn on the hot path
-      const style = this.buf.withBg(seg.style);
+      let style = this.buf.withBg(seg.style);
+      if (rowBg && !style.bg) {
+        style = { ...style, bg: rowBg };
+      }
 
       if (selecting) {
         // Avoid [...seg.text] spread (allocates full codepoint array)
@@ -1835,9 +1864,13 @@ export class TuiRenderer {
         if (written === 0 && seg.text) break;
       }
     }
-    // Erase stale glyphs past end of content on this row
+    // Erase stale glyphs past end of content — keep code-panel bg when set
     if (col < end) {
-      this.buf.clearRowRest(col, y);
+      if (rowBg) {
+        this.buf.fill(col, y, end - col, " ", { bg: rowBg });
+      } else {
+        this.buf.clearRowRest(col, y);
+      }
     } else {
       // Content filled the row — touch without forcing dirty (cells already set)
       this.buf.touchRow(y);

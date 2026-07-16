@@ -44,6 +44,18 @@ export interface Theme {
   info: Rgb;
   spinner: Rgb;
   selection: Rgb;
+  /** Full-width code panel background */
+  codeBg: Rgb;
+  /** Line-number gutter in code boxes */
+  codeGutter: Rgb;
+  synKeyword: Rgb;
+  synString: Rgb;
+  synComment: Rgb;
+  synNumber: Rgb;
+  synFunction: Rgb;
+  synType: Rgb;
+  synOperator: Rgb;
+  synProperty: Rgb;
 }
 
 /**
@@ -67,6 +79,18 @@ function t(
   const accentUser = base.accentUser;
   const fgMuted = base.fgMuted;
 
+  const codeBg = own("codeBg") ? base.codeBg : base.bgElevated;
+  const codeGutter = own("codeGutter") ? base.codeGutter : base.fgFaint;
+  // Syntax: derive from palette so every theme stays coherent
+  const synKeyword = own("synKeyword") ? base.synKeyword : accent;
+  const synString = own("synString") ? base.synString : toolOk;
+  const synComment = own("synComment") ? base.synComment : base.fgFaint;
+  const synNumber = own("synNumber") ? base.synNumber : base.toolRunning;
+  const synFunction = own("synFunction") ? base.synFunction : accentUser;
+  const synType = own("synType") ? base.synType : base.thinking;
+  const synOperator = own("synOperator") ? base.synOperator : fgMuted;
+  const synProperty = own("synProperty") ? base.synProperty : base.tool;
+
   return {
     ...base,
     toolOk,
@@ -82,6 +106,16 @@ function t(
     diffAdd: own("diffAdd") ? base.diffAdd : toolOk,
     diffDel: own("diffDel") ? base.diffDel : toolError,
     diffMeta: own("diffMeta") ? base.diffMeta : fgMuted,
+    codeBg,
+    codeGutter,
+    synKeyword,
+    synString,
+    synComment,
+    synNumber,
+    synFunction,
+    synType,
+    synOperator,
+    synProperty,
   };
 }
 
@@ -111,6 +145,16 @@ const defaults = {
   info: { r: 125, g: 211, b: 252 },
   spinner: { r: 167, g: 139, b: 250 },
   selection: { r: 55, g: 48, b: 90 },
+  codeBg: { r: 22, g: 25, b: 34 },
+  codeGutter: { r: 90, g: 98, b: 118 },
+  synKeyword: { r: 167, g: 139, b: 250 },
+  synString: { r: 74, g: 222, b: 128 },
+  synComment: { r: 90, g: 98, b: 118 },
+  synNumber: { r: 251, g: 191, b: 36 },
+  synFunction: { r: 125, g: 211, b: 252 },
+  synType: { r: 196, g: 167, b: 231 },
+  synOperator: { r: 148, g: 156, b: 176 },
+  synProperty: { r: 94, g: 234, b: 212 },
 };
 
 const night = t({

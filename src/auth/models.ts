@@ -479,14 +479,55 @@ export function findModel(id: string): RemoteModel | undefined {
 
 /**
  * Look up a model in the live catalog cache (provider + id).
+ * Tolerant of case and common id shapes (exact, suffix, provider/model).
  */
 export function findModelForProvider(
   provider: ProviderId | string,
   modelId: string,
 ): RemoteModel | undefined {
+  const id = modelId.trim();
+  if (!id) return undefined;
   const list = cache.get(provider)?.models;
-  if (!list) return findModel(modelId);
-  return list.find((m) => m.id === modelId) ?? findModel(modelId);
+  const pool = list && list.length > 0 ? list : undefined;
+
+  const matchIn = (models: RemoteModel[]): RemoteModel | undefined => {
+    const exact = models.find((m) => m.id === id);
+    if (exact) return exact;
+    const lower = id.toLowerCase();
+    const ci = models.find((m) => m.id.toLowerCase() === lower);
+    if (ci) return ci;
+    // OpenRouter-style: catalog id is "org/model", session may store the same
+    const ends = models.find(
+      (m) =>
+        m.id.endsWith(`/${id}`) ||
+        m.id.toLowerCase().endsWith(`/${lower}`) ||
+        id.endsWith(`/${m.id}`) ||
+        lower.endsWith(`/${m.id.toLowerCase()}`),
+    );
+    return ends;
+  };
+
+  if (pool) {
+    const hit = matchIn(pool);
+    if (hit) return hit;
+  }
+  return findModel(id) ?? findModelLoose(id);
+}
+
+function findModelLoose(id: string): RemoteModel | undefined {
+  const lower = id.toLowerCase();
+  for (const [, v] of cache) {
+    const hit =
+      v.models.find((m) => m.id === id) ??
+      v.models.find((m) => m.id.toLowerCase() === lower) ??
+      v.models.find(
+        (m) =>
+          m.id.endsWith(`/${id}`) ||
+          m.id.toLowerCase().endsWith(`/${lower}`),
+      );
+    if (hit) return hit;
+  }
+  return undefined;
 }
 
 /**

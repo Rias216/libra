@@ -42,6 +42,7 @@ import {
   connectedProviders,
   fetchAllConnectedModels,
   fetchModelsForProvider,
+  getModelContextWindow,
   modelKey,
   parseModelKey,
   pickHighestReasoningModel,
@@ -180,18 +181,52 @@ After install:  bun run link   (from the libra repo)
     .find((a) => a.startsWith("--notice="))
     ?.slice("--notice=".length);
 
+  const bootProvider = (cfg.provider ?? "none") as ProviderId | string;
+  const bootModel = cfg.model ?? "unset";
+  const bootCtx =
+    bootModel !== "unset"
+      ? getModelContextWindow(bootProvider, bootModel)
+      : null;
   const store = new HarnessStore({
     title: "demo session",
-    model: cfg.model ?? "unset",
-    provider: cfg.provider ?? "none",
+    model: bootModel,
+    provider: bootProvider,
     cwd: process.cwd(),
+    contextWindow: bootCtx ?? undefined,
   });
   dbg("cli", "boot", {
     model: cfg.model,
     provider: cfg.provider,
     reasoning: loadAgentSettings().reasoning.custom,
     resume: resumeArg ?? null,
+    contextWindow: bootCtx,
   });
+  // Warm catalog so ctx limit is accurate even if cache was cold at boot
+  if (
+    bootProvider &&
+    bootProvider !== "none" &&
+    bootModel &&
+    bootModel !== "unset"
+  ) {
+    void (async () => {
+      try {
+        await fetchModelsForProvider(bootProvider as ProviderId, {
+          force: false,
+        });
+        const ctx = getModelContextWindow(bootProvider, bootModel);
+        if (
+          ctx != null &&
+          ctx > 0 &&
+          store.state.session.model === bootModel &&
+          store.state.session.contextWindow !== ctx
+        ) {
+          store.patchSession({ contextWindow: ctx });
+        }
+      } catch {
+        /* ignore */
+      }
+    })();
+  }
 
   // Resume prior .libe session (self-review relaunch path)
   if (resumeArg) {
@@ -266,6 +301,10 @@ After install:  bun run link   (from the libra repo)
     onTogglePart: (messageId, partId) => {
       togglePartCollapsed(store, messageId, partId);
     },
+    // Ctrl+E — collapse every thinking block (silent; no toast spam)
+    onCollapseAllThinking: () => {
+      collapseAllThinking(store);
+    },
   });
 
   store.subscribe((_event, state) => {
@@ -328,6 +367,7 @@ After install:  bun run link   (from the libra repo)
 /**
  * OpenCode-style expand/collapse for reasoning, tool, and diff parts.
  * Pure click on the header row (no drag) invokes this via the renderer.
+ * Defaults: tools + thoughts collapsed unless explicitly expanded.
  */
 function togglePartCollapsed(
   store: HarnessStore,
@@ -339,9 +379,8 @@ function togglePartCollapsed(
   if (!part) return;
 
   if (part.type === "reasoning") {
-    // Default: expanded while streaming, folded when done
-    const collapsed =
-      part.collapsed != null ? part.collapsed : !part.streaming;
+    // Default collapsed (including mid-stream)
+    const collapsed = part.collapsed !== false;
     store.patchPart(messageId, partId, {
       collapsed: !collapsed,
     } as never);
@@ -363,6 +402,19 @@ function togglePartCollapsed(
     store.patchPart(messageId, partId, {
       collapsed: !part.collapsed,
     } as never);
+  }
+}
+
+/** Collapse every thinking/reasoning part in the session (Ctrl+E). Silent. */
+function collapseAllThinking(store: HarnessStore): void {
+  for (const msg of store.state.messages) {
+    for (const part of msg.parts) {
+      if (part.type !== "reasoning") continue;
+      // Only parts the user explicitly expanded
+      if (part.collapsed === false) {
+        store.patchPart(msg.id, part.id, { collapsed: true } as never);
+      }
+    }
   }
 }
 
@@ -941,7 +993,11 @@ async function onProviderConnected(
       model: best.id,
       modelKey: modelKey({ provider, model: best.id }),
     });
-    store.patchSession({ provider, model: best.id });
+    store.patchSession({
+      provider,
+      model: best.id,
+      contextWindow: getModelContextWindow(provider, best.id) ?? undefined,
+    });
     notify(
       store,
       `${provider} OK — ${listed.models.length} models; active ${best.id}`,
@@ -1073,8 +1129,43 @@ function applyModel(
     model: id,
     modelKey: key,
   });
-  store.patchSession({ provider, model: id });
-  toast(store, `model → ${key}`);
+  // Pin context window from catalog immediately so the footer limit updates
+  const ctxNow = getModelContextWindow(provider, id);
+  store.patchSession({
+    provider,
+    model: id,
+    contextWindow: ctxNow ?? undefined,
+  });
+  toast(
+    store,
+    ctxNow
+      ? `model → ${key} · ctx ${formatCtx(ctxNow)}`
+      : `model → ${key}`,
+  );
+  // Refresh catalog in background if we lacked a figure (or to pick up new ones)
+  void (async () => {
+    try {
+      await fetchModelsForProvider(provider, { force: !ctxNow });
+      const ctx = getModelContextWindow(provider, id);
+      if (ctx != null && ctx > 0) {
+        const cur = store.state.session;
+        if (cur.provider === provider && cur.model === id) {
+          if (cur.contextWindow !== ctx) {
+            store.patchSession({ contextWindow: ctx });
+            toast(store, `ctx window → ${formatCtx(ctx)}`);
+          }
+        }
+      }
+    } catch {
+      /* ignore catalog refresh errors */
+    }
+  })();
+}
+
+function formatCtx(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return String(n);
 }
 
 // ── reasoning ─────────────────────────────────────────
@@ -2355,7 +2446,7 @@ async function handleUserSubmit(
           type: "reasoning",
           content: "",
           streaming: true,
-          collapsed: false,
+          collapsed: true,
           title: `Main · ${provider}/${model}`,
         });
         store.appendPart(mid, {
@@ -2363,7 +2454,7 @@ async function handleUserSubmit(
           type: "reasoning",
           content: "",
           streaming: true,
-          collapsed: false,
+          collapsed: true,
           title: "Peer · …",
         });
 
@@ -2389,7 +2480,7 @@ async function handleUserSubmit(
         store.patchPart(mid, mainPartId, {
           content: mainDisp?.content ?? prep.mainReasoning.text ?? "",
           streaming: false,
-          collapsed: false,
+          collapsed: true,
           title: mainDisp?.title ?? `Main · ${provider}/${model}`,
         } as never);
         store.patchPart(mid, peerPartId, {
@@ -2399,7 +2490,7 @@ async function handleUserSubmit(
             prep.secondaries[0]?.error ??
             "(no peer)",
           streaming: false,
-          collapsed: false,
+          collapsed: true,
           title: peerDisp?.title ?? "Peer",
         } as never);
 

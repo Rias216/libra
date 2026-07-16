@@ -113,6 +113,12 @@ export interface GlyphSet {
   thumb: string;
   track: string;
   spinner: string[];
+  chevronOpen: string;
+  chevronClosed: string;
+  toolOk: string;
+  toolError: string;
+  toolPending: string;
+  toolCancelled: string;
 }
 
 export function glyphsFor(profile: FontProfile): GlyphSet {
@@ -127,6 +133,12 @@ export function glyphsFor(profile: FontProfile): GlyphSet {
         thumb: "█",
         track: "│",
         spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+        chevronOpen: "▼",
+        chevronClosed: "▶",
+        toolOk: "✓",
+        toolError: "✗",
+        toolPending: "○",
+        toolCancelled: "—",
       };
     case "rounded":
       return {
@@ -138,6 +150,12 @@ export function glyphsFor(profile: FontProfile): GlyphSet {
         thumb: "●",
         track: "·",
         spinner: ["◐", "◓", "◑", "◒"],
+        chevronOpen: "▾",
+        chevronClosed: "▸",
+        toolOk: "✓",
+        toolError: "✗",
+        toolPending: "○",
+        toolCancelled: "–",
       };
     default:
       return {
@@ -150,6 +168,35 @@ export function glyphsFor(profile: FontProfile): GlyphSet {
         track: "|",
         // OpenCode-style braille loader even on the ascii chrome profile
         spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+        chevronOpen: "v",
+        chevronClosed: ">",
+        toolOk: "+",
+        toolError: "x",
+        toolPending: "o",
+        toolCancelled: "-",
       };
   }
+}
+
+/**
+ * Prefer box glyphs on modern truecolor terminals (Windows Terminal, etc.)
+ * when the user has not explicitly chosen a font profile.
+ */
+export function preferBoxGlyphsOnModernTerminal(): boolean {
+  if (process.env.LIBRA_GLYPHS === "ascii") return false;
+  if (process.env.LIBRA_GLYPHS === "box") return true;
+  if (process.env.WT_SESSION) return true;
+  if (process.platform === "win32") return true;
+  if (
+    process.env.TERM_PROGRAM === "iTerm.app" ||
+    process.env.TERM_PROGRAM === "Apple_Terminal" ||
+    process.env.TERM_PROGRAM === "WezTerm" ||
+    process.env.TERM_PROGRAM === "ghostty"
+  ) {
+    return true;
+  }
+  if (process.env.COLORTERM === "truecolor" || process.env.COLORTERM === "24bit") {
+    return true;
+  }
+  return false;
 }

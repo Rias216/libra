@@ -246,14 +246,15 @@ export async function prepareFusionForMain(
     secondaries,
     mainKey,
   );
-  // Compact system addon: full dual traces ship once via seedReasoning
-  // (assistant wire reasoning). Avoids ~2× context on heavy hy3 plans.
+  // Budgeted dual traces on the *system wire* so execute actually sees them.
+  // UI Thoughts are display-only and are skipped by historyToMessages for
+  // trailing reasoning-only assistants — do not rely on seedReasoning for wire.
   const systemAddon = buildMainCompareAddon(
     userPrompt,
     mainReasoning,
     secondaries,
     fusion,
-    { compact: true, displayAlreadySeeded: true },
+    { compact: true },
   );
   const summary = `Ultra + Fusion · ${mainKey} + peer → compare & execute (${phase1Ms}ms phase1)`;
 
@@ -276,8 +277,13 @@ export async function prepareFusionForMain(
   };
 }
 
-/** Soft cap for UI-only display of dual traces (wire seed keeps full text elsewhere). */
+/** Soft cap for UI-only display of dual traces. */
 const DISPLAY_BODY_MAX = 12_000;
+/**
+ * Per-plan char budget when embedding phase-1 traces on the execute wire.
+ * Compact mode uses this so dual hy3 plans don't double the full context.
+ */
+export const WIRE_PLAN_BODY_MAX = 4_000;
 
 function softTruncateDisplay(body: string, max = DISPLAY_BODY_MAX): string {
   if (body.length <= max) return body;
@@ -352,13 +358,64 @@ export function formatFusionReasoningDisplay(
 
 export interface BuildCompareAddonOptions {
   /**
-   * When true (default for seedReasoning path), do not re-embed full phase-1
-   * bodies in the system prompt — they already appear in the assistant
-   * reasoning block. Cuts dual-hy3 context roughly in half on heavy tasks.
+   * When true, embed phase-1 plan bodies up to {@link WIRE_PLAN_BODY_MAX}
+   * chars each (default for live execute). When false, embed full bodies.
+   * Bodies are always on the wire — UI Thoughts alone are not enough
+   * (history skips trailing reasoning-only assistants).
    */
   compact?: boolean;
-  /** Hint text that dual traces were seeded into the thinking block. */
+  /**
+   * @deprecated No longer used. Dual traces always ship on the system wire;
+   * UI seed is display-only.
+   */
   displayAlreadySeeded?: boolean;
+}
+
+function wirePlanBody(
+  text: string | undefined,
+  error: string | undefined,
+  maxChars: number,
+): string {
+  if (error) return `(failed: ${error})`;
+  const body = text?.trim() || "(empty)";
+  if (maxChars <= 0 || body.length <= maxChars) return body;
+  return `${body.slice(0, maxChars)}\n…(truncated for wire; execute from this plan seed — do not re-plan from scratch)`;
+}
+
+/**
+ * Build a user-message `<system-reminder>` carrying phase-1 dual plans.
+ * Prefer embedding via {@link buildMainCompareAddon}; this helper is for
+ * tests and optional mid-turn re-injection.
+ */
+export function buildFusionWirePlansReminder(
+  mainReasoning: FusionCandidate,
+  secondaries: FusionCandidate[],
+  opts?: { maxBodyChars?: number },
+): string {
+  const max = opts?.maxBodyChars ?? WIRE_PLAN_BODY_MAX;
+  const mainBody = wirePlanBody(
+    mainReasoning.text,
+    mainReasoning.error,
+    max,
+  );
+  const peerBlocks = secondaries
+    .map((c, i) => {
+      const body = wirePlanBody(c.text, c.error, max);
+      return `## Peer #${i + 1} · ${c.modelKey}\n${body}`;
+    })
+    .join("\n\n");
+
+  return [
+    "<system-reminder>",
+    "Phase-1 dual plans (execute from these; do not re-plan from scratch):",
+    "",
+    `## Main · ${mainReasoning.modelKey}`,
+    mainBody,
+    peerBlocks ? `\n${peerBlocks}` : "",
+    "</system-reminder>",
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
 }
 
 export function buildMainCompareAddon(
@@ -368,7 +425,8 @@ export function buildMainCompareAddon(
   fusion: FusionConfig,
   opts?: BuildCompareAddonOptions,
 ): string {
-  const compact = opts?.compact === true;
+  const compact = opts?.compact !== false; // default true = budgeted bodies
+  const maxBody = compact ? WIRE_PLAN_BODY_MAX : Number.POSITIVE_INFINITY;
   const reviewHint =
     fusion.fuseInstructions?.trim() ||
     "Compare first-pass vs peer traces. Prefer stronger arguments, drop contradictions, keep only what serves the USER request. Then act.";
@@ -398,6 +456,18 @@ export function buildMainCompareAddon(
           ? "All peers failed — proceed with the main first-pass trace alone."
           : "";
 
+  const mainBody = wirePlanBody(
+    mainReasoning.text,
+    mainReasoning.error,
+    maxBody,
+  );
+  const peerTraces = secondaries
+    .map((c, i) => {
+      const body = wirePlanBody(c.text, c.error, maxBody);
+      return `### Secondary reasoning #${i + 1} — ${c.modelKey} (${c.ms}ms)\n${body}`;
+    })
+    .join("\n\n");
+
   const header = `
 ## Fusion phase 2 — execute the USER request
 
@@ -405,11 +475,7 @@ export function buildMainCompareAddon(
 ${userPrompt}
 
 Phase 1 already produced dual reasoning plans (no tools).
-${
-  opts?.displayAlreadySeeded
-    ? "Full dual traces are in your prior thinking block (sections **Main** and **Peer**)."
-    : "Full traces are included below."
-}
+**Plan bodies are included below on this system message — use them. Do not re-derive the plan from scratch.**
 ${partialFailureNote ? `\n### Status reminder\n${partialFailureNote}\n` : ""}
 ### Job
 1. Compare first-pass + peer traces against the user request above (planning only — dual traces are not execution)
@@ -428,31 +494,13 @@ ${partialFailureNote ? `\n### Status reminder\n${partialFailureNote}\n` : ""}
 - Peers: ${peerStatus || "(none)"}
 `.trim();
 
-  if (compact) {
-    return header;
-  }
-
-  // Full traces — no internal truncation; API effort is the only depth control
-  const mainBody = mainReasoning.error
-    ? `(failed: ${mainReasoning.error})`
-    : mainReasoning.text?.trim() || "(empty)";
-
-  const peerTraces = secondaries
-    .map((c, i) => {
-      const body = c.error
-        ? `(failed: ${c.error})`
-        : c.text?.trim() || "(empty trace)";
-      return `### Secondary reasoning #${i + 1} — ${c.modelKey} (${c.ms}ms)\n${body}`;
-    })
-    .join("\n\n");
-
   return `${header}
 
 ### Your first-pass reasoning — ${mainReasoning.modelKey}
 ${mainBody}
 
 ### Secondary reasoning traces
-${peerTraces}`;
+${peerTraces || "(none)"}`;
 }
 
 /**

@@ -29,9 +29,16 @@ import {
 import { withRetry } from "../src/llm/retry.js";
 import {
   runTurnCore,
+  MAX_STEPS,
   MAX_STEPS_PROMPT,
   type TurnCoreInput,
 } from "../src/agent/turn.js";
+import {
+  DOOM_FORCE_ANSWER_REMINDER,
+  THOUGHT_LOOP_REMINDER,
+  STUCK_PROGRESS_REMINDER,
+} from "../src/agent/thought-loop.js";
+import { approxTokensFromMessages } from "../src/agent/history.js";
 import {
   buildSystemPrompt,
   resolvePromptPackId,
@@ -805,11 +812,12 @@ test("runTurnCore: max-steps injects MAX_STEPS_PROMPT and disables tools", async
   let toolsOnLast: boolean | undefined;
   const chat = async (req: ChatRequest): Promise<ChatResult> => {
     // always request tools so we keep looping until max
+    // Nudge is a user-role <system-reminder> (not fake assistant speech)
     const hasNudge = req.messages.some(
       (m) =>
-        m.role === "assistant" &&
+        m.role === "user" &&
         typeof m.content === "string" &&
-        m.content.includes(MAX_STEPS_PROMPT.slice(0, 40)),
+        m.content.includes("maximum number of steps"),
     );
     if (hasNudge) {
       sawNudge = true;
@@ -828,6 +836,240 @@ test("runTurnCore: max-steps injects MAX_STEPS_PROMPT and disables tools", async
   assert.ok(sawNudge);
   assert.equal(toolsOnLast, false);
   assert.equal(result.finalText, "final under max steps");
+});
+
+test("shipped MAX_STEPS is at least 40", () => {
+  assert.ok(MAX_STEPS >= 40, `MAX_STEPS=${MAX_STEPS}`);
+});
+
+/**
+ * Doom-loop v2 via real ToolCallRuntime inside runTurnCore:
+ * same fingerprint 3× executes, 4th+ blocked; after 2 doom waves tools off.
+ */
+test("runTurnCore: doom-loop blocks 4th identical tool and forces tools off", async () => {
+  let step = 0;
+  let sawDoomText = false;
+  let sawDoomReminder = false;
+  let toolsOffAfterDoom = false;
+  const sameArgs = '{"target_directory":"."}';
+  const chat = async (req: ChatRequest): Promise<ChatResult> => {
+    step++;
+    // Detect doom tool output from prior wave
+    for (const m of req.messages) {
+      if (
+        m.role === "tool" &&
+        typeof m.content === "string" &&
+        /Doom-loop/i.test(m.content)
+      ) {
+        sawDoomText = true;
+      }
+      if (
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.includes("Tool doom-loop detected")
+      ) {
+        sawDoomReminder = true;
+      }
+    }
+    // After 2 doom waves, forceToolsOff — tools schema must be absent
+    if (sawDoomReminder && step >= 6) {
+      toolsOffAfterDoom = !req.tools || req.tools.length === 0;
+      return okResult({
+        content: "answering after doom force",
+        finish_reason: "stop",
+      });
+    }
+    return okResult({
+      content: "",
+      finish_reason: "tool_calls",
+      tool_calls: [tc(`doom_${step}`, "list_dir", sameArgs)],
+    });
+  };
+
+  const result = await runTurnCore(
+    makeCore(chat, {
+      maxSteps: 12,
+      hooks: {
+        isCustomTool: () => true,
+        customDispatch: async () => ({
+          ok: true,
+          output: "listed",
+          durationMs: 1,
+        }),
+      },
+    }),
+  );
+
+  assert.ok(sawDoomText, "tool result must include Doom-loop text from ToolCallRuntime");
+  assert.ok(sawDoomReminder, "user reminder must be injected after doom wave");
+  assert.ok(
+    toolsOffAfterDoom ||
+      result.messages.some(
+        (m) =>
+          m.role === "user" &&
+          typeof m.content === "string" &&
+          m.content.includes(DOOM_FORCE_ANSWER_REMINDER.slice(0, 40)),
+      ),
+    "force-answer path after repeated doom",
+  );
+  // At least one tool message is a doom block (not CUSTOM_OK)
+  const doomTools = result.messages.filter(
+    (m) =>
+      m.role === "tool" &&
+      typeof m.content === "string" &&
+      /Doom-loop/i.test(m.content),
+  );
+  assert.ok(doomTools.length >= 1, `expected doom tool msgs, got ${doomTools.length}`);
+});
+
+/**
+ * Thought-loop: identical long reasoning across samples injects
+ * THOUGHT_LOOP_REMINDER on the wire messages array.
+ */
+test("runTurnCore: repeated reasoning injects thought-loop system-reminder", async () => {
+  let step = 0;
+  const sameReason =
+    "I need to replace the mini-planet drawer with full quality renders " +
+    "and complete the implementation without long preamble right now.";
+  assert.ok(sameReason.length >= 80);
+
+  const chat = async (req: ChatRequest): Promise<ChatResult> => {
+    step++;
+    const hasThoughtReminder = req.messages.some(
+      (m) =>
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.includes("repeating the same reasoning"),
+    );
+    if (hasThoughtReminder && step >= 3) {
+      return okResult({
+        content: "stopped re-planning",
+        finish_reason: "stop",
+      });
+    }
+    // Keep tool_calls so the turn does not end before loop is detected
+    return okResult({
+      content: "",
+      reasoning: sameReason,
+      finish_reason: "tool_calls",
+      tool_calls: [
+        tc(`th_${step}`, "list_dir", `{"target_directory":"step${step}"}`),
+      ],
+    });
+  };
+
+  const result = await runTurnCore(
+    makeCore(chat, {
+      maxSteps: 10,
+      hooks: {
+        isCustomTool: () => true,
+        customDispatch: async () => ({
+          ok: true,
+          output: "ok",
+          durationMs: 1,
+        }),
+      },
+    }),
+  );
+
+  const reminders = result.messages.filter(
+    (m) =>
+      m.role === "user" &&
+      typeof m.content === "string" &&
+      m.content.includes("repeating the same reasoning"),
+  );
+  assert.ok(
+    reminders.length >= 1,
+    "expected THOUGHT_LOOP_REMINDER on messages after repeated CoT",
+  );
+  assert.ok(
+    reminders[0]!.content!.includes(THOUGHT_LOOP_REMINDER.slice(20, 50)) ||
+      /Stop re-planning/i.test(String(reminders[0]!.content)),
+  );
+  assert.ok(result.rounds >= 2);
+});
+
+/**
+ * Stuck progress: same failing tool fingerprint across waves injects
+ * STUCK_PROGRESS_REMINDER and can force tools off.
+ */
+test("runTurnCore: repeated failed tool fingerprint injects stuck reminder", async () => {
+  let step = 0;
+  let sawStuck = false;
+  let toolsOff = false;
+  const sameArgs = '{"target_directory":"stuck-path"}';
+
+  const chat = async (req: ChatRequest): Promise<ChatResult> => {
+    step++;
+    for (const m of req.messages) {
+      if (
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.includes("Progress appears stuck")
+      ) {
+        sawStuck = true;
+      }
+    }
+    if (sawStuck && step >= 5) {
+      toolsOff = !req.tools || req.tools.length === 0;
+      return okResult({
+        content: "changing strategy after stuck",
+        finish_reason: "stop",
+      });
+    }
+    return okResult({
+      content: "",
+      finish_reason: "tool_calls",
+      tool_calls: [tc(`st_${step}`, "list_dir", sameArgs)],
+    });
+  };
+
+  const result = await runTurnCore(
+    makeCore(chat, {
+      maxSteps: 12,
+      hooks: {
+        isCustomTool: () => true,
+        customDispatch: async () => ({
+          ok: false,
+          output: "ERROR: old_string not found in file",
+          durationMs: 1,
+        }),
+      },
+    }),
+  );
+
+  assert.ok(sawStuck, "stuck progress reminder must appear on user messages");
+  const stuckMsgs = result.messages.filter(
+    (m) =>
+      m.role === "user" &&
+      typeof m.content === "string" &&
+      m.content.includes("Progress appears stuck"),
+  );
+  assert.ok(stuckMsgs.length >= 1);
+  assert.match(String(stuckMsgs[0]!.content), /stuck/i);
+  // After second stuck wave, tools forced off before final answer
+  assert.ok(
+    toolsOff || stuckMsgs.length >= 2,
+    "expected force-tools-off or repeated stuck reminders",
+  );
+  void STUCK_PROGRESS_REMINDER;
+});
+
+test("approxTokensFromMessages counts reasoning on ChatMessage", () => {
+  const withReason = approxTokensFromMessages([
+    {
+      role: "assistant",
+      content: "hi",
+      reasoning: "r".repeat(400),
+    } as ChatMessage,
+  ]);
+  const without = approxTokensFromMessages([
+    { role: "assistant", content: "hi" },
+  ]);
+  assert.ok(
+    withReason > without + 50,
+    `reasoning must increase estimate: with=${withReason} without=${without}`,
+  );
 });
 
 test("runTurnCore: onSampleReset clears before retry (no stale prepend path)", async () => {
@@ -1006,11 +1248,14 @@ test("fusion formatFusionReasoningDisplay + prepareFusionForMain with chatImpl",
     },
   );
 
-  // Compact system addon: user request first; full bodies live in displayReasoning
+  // System addon must carry dual plan bodies on the wire (UI Thoughts alone
+  // are skipped for trailing reasoning-only assistants).
   assert.ok(prep.systemAddon.length > 50);
   assert.match(prep.systemAddon, /implement feature X/);
   assert.match(prep.systemAddon, /User request/i);
   assert.match(prep.systemAddon, /phase 2/i);
+  assert.match(prep.systemAddon, /MAIN_PLAN/, "execute wire must include main plan");
+  assert.match(prep.systemAddon, /PEER_PLAN/, "execute wire must include peer plan");
   // Must not steer models into building an "AI harness" meta-project
   assert.ok(
     !/plan for a multi-model harness/i.test(prep.systemAddon),
@@ -1027,11 +1272,6 @@ test("fusion formatFusionReasoningDisplay + prepareFusionForMain with chatImpl",
   assert.equal(prep.displayParts[1]!.role, "peer");
   assert.match(prep.displayParts[0]!.content, /MAIN_PLAN/);
   assert.match(prep.displayParts[1]!.content, /PEER_PLAN/);
-  // Compact path must not re-embed full dual bodies into system
-  assert.ok(
-    !prep.systemAddon.includes("MAIN_PLAN"),
-    "systemAddon should stay compact when seeded",
-  );
 
   const display = formatFusionReasoningDisplay(
     prep.mainReasoning,
