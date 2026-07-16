@@ -33,6 +33,7 @@ import {
   type ToolTraceCall,
 } from "./discipline.js";
 import { globalLatency } from "./latency.js";
+import { installFormatHook } from "./format-hook.js";
 
 export interface ToolRunnerOptions extends ToolExecutorOptions {
   permissions?: PermissionRules;
@@ -87,6 +88,8 @@ export class ToolRunner {
     );
     this.registry = opts.registry ?? createDefaultRegistry(opts.toolsets);
     this.cache = opts.cache ?? new Map();
+    // Phase 7: format after-hook on write/search_replace/patch_apply
+    installFormatHook(this.registry, cwd);
   }
 
   clearHistory(): void {

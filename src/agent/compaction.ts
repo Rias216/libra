@@ -18,8 +18,24 @@ import { approxTokensFromMessages } from "./history.js";
 export const DEFAULT_COMPACT_TOKEN_BUDGET = 90_000;
 /** Fraction of the model context window that triggers auto-compact. */
 export const COMPACT_CONTEXT_RATIO = 0.8;
+/**
+ * Free / flash models: compact earlier (OpenCode-style thrift on long tool loops).
+ * Bench evidence: free DeepSeek runs hit ~39k prompt tokens with 91% wall in sampling.
+ */
+export const COMPACT_CONTEXT_RATIO_FREE = 0.65;
 /** Keep this many most-recent messages fully intact. */
 export const DEFAULT_KEEP_RECENT = 16;
+
+/** Models that benefit from earlier compaction + cheaper reasoning. */
+export function isFreeTierModelId(model: string): boolean {
+  const m = (model ?? "").toLowerCase();
+  return (
+    /:free$/i.test(m) ||
+    /\/free$/i.test(m) ||
+    /-free$/i.test(m) ||
+    /flash-free|hy3|big-pickle|pickle|deepseek-v4-flash|tencent\/hy3/i.test(m)
+  );
+}
 
 export interface CompactOptions {
   tokenBudget?: number;
@@ -37,9 +53,16 @@ export function compactBudgetForModel(
   model: string,
   fallback: number = DEFAULT_COMPACT_TOKEN_BUDGET,
 ): number {
+  const ratio = isFreeTierModelId(model)
+    ? COMPACT_CONTEXT_RATIO_FREE
+    : COMPACT_CONTEXT_RATIO;
   const ctx = getModelContextWindow(provider, model);
   if (ctx != null && ctx > 1024) {
-    return Math.max(4_096, Math.floor(ctx * COMPACT_CONTEXT_RATIO));
+    return Math.max(4_096, Math.floor(ctx * ratio));
+  }
+  // Free models without a catalog window: still compact sooner than default.
+  if (isFreeTierModelId(model)) {
+    return Math.max(4_096, Math.floor(fallback * (COMPACT_CONTEXT_RATIO_FREE / COMPACT_CONTEXT_RATIO)));
   }
   return fallback;
 }

@@ -177,6 +177,31 @@ export function normalizeToolArgs(
       }
       break;
     }
+    case "read_image": {
+      if (out.file_path != null && out.path == null) {
+        out.path = out.file_path;
+        delete out.file_path;
+      }
+      if (out.target_file != null && out.path == null) {
+        out.path = out.target_file;
+        delete out.target_file;
+      }
+      break;
+    }
+    case "patch_apply": {
+      if (out.patch != null && out.diff == null) {
+        out.diff = out.patch;
+        delete out.patch;
+      }
+      break;
+    }
+    case "find_symbol": {
+      if (out.name != null && out.symbol == null) {
+        out.symbol = out.name;
+        delete out.name;
+      }
+      break;
+    }
     case "run_terminal_command": {
       // Catalog / models often pass timeout or timeout_s instead of timeout_ms
       if (out.timeout_s != null && out.timeout_ms == null) {

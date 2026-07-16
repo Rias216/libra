@@ -423,6 +423,261 @@ export const OPENAI_TOOLS: OpenAITool[] = [
       },
     },
   },
+  // ── Expansion tools (libra-expansion.md) ──────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "list_windows",
+      description: [
+        "Enumerate visible OS windows.",
+        "",
+        "Usage:",
+        "- Returns {pid, title, processName, bounds}[] for each visible window.",
+        "- Use before screenshot when targeting a specific window by pid.",
+        "- Read-only; no capture.",
+      ].join("\n"),
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "screenshot",
+      description: [
+        "Capture a screenshot of a window, browser tab, or (explicitly) the full screen.",
+        "",
+        "Usage:",
+        "- Prefer session_id (background process), pid (from list_windows), or url (browser).",
+        "- Browser defaults to raw CDP (remote-debugging-port). engine:\"playwright\" is optional.",
+        "- Never captures beyond the resolved target unless full_screen=true (requires approval).",
+        "- Saves under .libra/screenshots/ and returns an image content block when the model has vision.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          session_id: {
+            type: "string",
+            description: "Background process session from run_terminal_command(background=true)",
+          },
+          pid: { type: "integer", description: "Process id of the window to capture" },
+          url: { type: "string", description: "Browser URL (CDP or Playwright)" },
+          selector: {
+            type: "string",
+            description: "CSS selector for element capture (Playwright)",
+          },
+          full_page: { type: "boolean", description: "Full-page browser capture" },
+          engine: {
+            type: "string",
+            enum: ["cdp", "playwright"],
+            description: 'Browser engine (default "cdp")',
+          },
+          full_screen: {
+            type: "boolean",
+            description: "Capture entire screen (explicit opt-in; requires ask)",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_image",
+      description: [
+        "Read an existing image file from the workspace and return it as an image content block.",
+        "",
+        "Usage:",
+        "- Use for PNGs/JPEGs that read_file rejects as binary.",
+        "- Path must be inside the workspace.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Image path relative to workspace" },
+          file_path: { type: "string", description: "Alias for path" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_devtools",
+      description: [
+        "Drive a Chrome/Edge tab via raw CDP (no Playwright).",
+        "",
+        "Actions (same multiplexing shape as process):",
+        '- goto — navigate targetId to url',
+        '- click — click selector',
+        '- fill — set selector value to text',
+        '- screenshot — capture tab (scoped to targetId)',
+        '- console_log — page context snapshot',
+        '- eval — Runtime.evaluate expression',
+        "",
+        "Always scoped to one targetId (tab). Requires a browser with --remote-debugging-port.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["goto", "click", "fill", "screenshot", "console_log", "eval"],
+          },
+          targetId: { type: "string", description: "CDP target id (tab)" },
+          target_id: { type: "string", description: "Alias for targetId" },
+          url: { type: "string" },
+          selector: { type: "string" },
+          text: { type: "string", description: "Value for fill" },
+          expression: { type: "string", description: "JS for eval" },
+          cdp_port: { type: "integer", description: "Default 9222" },
+          cdp_host: { type: "string", description: "Default 127.0.0.1" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "check",
+      description: [
+        "Run project typecheck (tsc --noEmit) and eslint when configured; return structured diagnostics.",
+        "",
+        "Usage:",
+        "- Prefer over raw shell tsc for parseable {file,line,col,severity,code,message}[].",
+        "- Read-only.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          tsc: { type: "boolean", description: "Run tsc (default true when tsconfig exists)" },
+          eslint: {
+            type: "boolean",
+            description: "Run eslint when config present (default auto)",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git",
+      description: [
+        "Structured git status / diff / log / blame (prefer over raw shell git for UI-friendly output).",
+        "",
+        "Actions:",
+        '- status — branch + porcelain files',
+        '- diff — unified diff parsed into DiffHunk/DiffLine',
+        '- log — recent commits',
+        '- blame — per-line blame for path',
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["status", "diff", "log", "blame"],
+          },
+          path: { type: "string", description: "File path for diff/blame" },
+          staged: { type: "boolean", description: "diff --cached" },
+          limit: { type: "integer", description: "log limit (default 10)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "patch_apply",
+      description: [
+        "Apply a unified diff to workspace files. Fails loudly if hunk context does not match.",
+        "",
+        "Usage:",
+        "- Pass the full unified diff (---/+++/@@ hunks).",
+        "- Prefer for multi-hunk edits; use search_replace for small single-site edits.",
+        "- Does not silently mis-apply.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          diff: { type: "string", description: "Unified diff text" },
+          patch: { type: "string", description: "Alias for diff" },
+        },
+        required: ["diff"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "wait_for_port",
+      description: [
+        "Poll 127.0.0.1:<port> until TCP accepts connections or timeout.",
+        "",
+        "Usage:",
+        "- Use before browser_devtools/screenshot against a freshly-started dev server.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          port: { type: "integer", description: "TCP port (1-65535)" },
+          host: { type: "string", description: "Default 127.0.0.1" },
+          timeout_ms: {
+            type: "integer",
+            description: "Max wait (default 30000)",
+          },
+        },
+        required: ["port"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "clipboard_read",
+      description: [
+        "Read the system clipboard text (pbpaste / Get-Clipboard / xclip|wl-paste).",
+        "",
+        "Usage:",
+        "- Companion to OSC-52 clipboard write in the TUI.",
+        "- May require approval (outside workspace data).",
+      ].join("\n"),
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_symbol",
+      description: [
+        "Find TypeScript/JavaScript symbol definition, references, or implementations by name.",
+        "",
+        "Usage:",
+        "- Prefer over grep when you need go-to-definition style navigation.",
+        "- action: definition (default) | references | implementations.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Symbol name" },
+          name: { type: "string", description: "Alias for symbol" },
+          action: {
+            type: "string",
+            enum: ["definition", "references", "implementations"],
+          },
+          file: { type: "string", description: "Optional source file for position" },
+          line: { type: "integer" },
+          col: { type: "integer" },
+        },
+        required: ["symbol"],
+      },
+    },
+  },
 ];
 
 export function toolNamesFromSchema(): string[] {

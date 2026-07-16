@@ -82,7 +82,10 @@ export interface DisciplineReport {
   notes: string[];
 }
 
-/** Map common shell anti-patterns to preferred specialized tools. */
+/**
+ * Map common shell anti-patterns to preferred specialized tools.
+ * Codex/OpenCode spirit: file ops + git porcelain + typecheck via dedicated tools.
+ */
 export function preferredToolForShell(command: unknown): string | null {
   if (typeof command !== "string") return null;
   const c = command.trim();
@@ -90,6 +93,18 @@ export function preferredToolForShell(command: unknown): string | null {
   if (/^(cat|type|Get-Content|head|tail)\b/i.test(c)) return "read_file";
   if (/^(rg|grep|findstr|Select-String)\b/i.test(c)) return "grep";
   if (/^(find|fd|Get-ChildItem\s+.*-Recurse)\b/i.test(c)) return "glob";
+  // Structured git tool (status/diff/log/blame) — not push/pull/commit
+  if (/\bgit\s+(status|diff|log|blame)\b/i.test(c)) return "git";
+  // Typecheck / lint → check tool (structured diagnostics)
+  if (
+    /\btsc\b/i.test(c) &&
+    /(--noEmit|noEmit)/i.test(c)
+  ) {
+    return "check";
+  }
+  if (/\b(bun|npm|pnpm|yarn)\s+run\s+typecheck\b/i.test(c)) return "check";
+  if (/\bnpx\s+(--yes\s+)?tsc\b/i.test(c)) return "check";
+  if (/\beslint\b/i.test(c) && !/\beslint\s+--init\b/i.test(c)) return "check";
   return null;
 }
 

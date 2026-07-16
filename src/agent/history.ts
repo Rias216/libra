@@ -8,6 +8,7 @@ import type { HarnessStore } from "../core/store.js";
 import type { Message, Part, ToolPart } from "../core/types.js";
 import {
   attachInTurnReasoning,
+  type ChatContent,
   type ChatMessage,
   type ToolCall,
 } from "../llm/client.js";
@@ -15,6 +16,10 @@ import {
   TOOL_OUTPUT_HISTORY_MAX,
   truncateToolOutput,
 } from "../toolcalling/truncate.js";
+import {
+  toolResultContent,
+  type ChatContentPart,
+} from "../toolcalling/multimodal.js";
 
 export interface HistoryOptions {
   /** Max messages from store tail (default 48). */
@@ -23,6 +28,8 @@ export interface HistoryOptions {
   toolOutputMaxChars?: number;
   /** Attach reasoning parts to assistant wire msgs (default true for in-context CoT). */
   includeReasoning?: boolean;
+  /** Active model id — used to vision-gate image tool results. */
+  model?: string;
 }
 
 /**
@@ -125,7 +132,7 @@ export function messagesToWire(
           out.push({
             role: "tool",
             tool_call_id: tc.id,
-            content: toolPartBody(p, toolMax),
+            content: toolPartBody(p, toolMax, opts.model),
           });
         }
       } else if (text || reasoning) {
@@ -157,9 +164,39 @@ function reasoningFromParts(parts: Part[]): string {
     .join("\n\n");
 }
 
-function toolPartBody(p: ToolPart, max: number): string {
-  if (p.status === "completed" && p.result != null) {
-    return truncateToolOutput(String(p.result), max) || "(empty result)";
+function toolPartBody(
+  p: ToolPart,
+  max: number,
+  model?: string,
+): ChatContent {
+  if (p.status === "completed") {
+    if (p.contentParts?.length) {
+      // Emit content-part array when tool result carries an image (Phase 0).
+      // Non-vision models get the explicit text fallback.
+      const gated = toolResultContent(p.contentParts as ChatContentPart[], {
+        model,
+      });
+      if (gated == null || typeof gated === "string") {
+        return (
+          truncateToolOutput(
+            typeof gated === "string" ? gated : "",
+            max,
+          ) || "(empty result)"
+        );
+      }
+      // Truncate only text parts; keep images intact for vision models.
+      return gated.map((part) =>
+        part.type === "text"
+          ? {
+              type: "text" as const,
+              text: truncateToolOutput(part.text, max) || part.text,
+            }
+          : part,
+      );
+    }
+    if (p.result != null) {
+      return truncateToolOutput(String(p.result), max) || "(empty result)";
+    }
   }
   if (p.status === "error" && p.error) {
     return truncateToolOutput(`ERROR: ${String(p.error)}`, max);
@@ -175,6 +212,12 @@ export function approxTokensFromMessages(messages: ChatMessage[]): number {
   let n = 0;
   for (const m of messages) {
     if (typeof m.content === "string") n += m.content.length;
+    else if (Array.isArray(m.content)) {
+      for (const p of m.content) {
+        if (p.type === "text") n += p.text.length;
+        else n += Math.round((p.data?.length ?? 0) * 0.75);
+      }
+    }
     // In-turn reasoning / CoT is often large; omitting it under-triggers compact.
     const any = m as ChatMessage & {
       reasoning?: string;

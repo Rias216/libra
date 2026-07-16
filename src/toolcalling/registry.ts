@@ -26,7 +26,10 @@ export type ToolsetId =
   | "web"
   | "meta"
   | "catalog"
-  | "process";
+  | "process"
+  | "vision"
+  | "devtools"
+  | "vcs";
 
 /** Risk for permission defaults and UI badges. */
 export type ToolRisk = "read" | "write" | "exec" | "network" | "meta";
@@ -160,6 +163,67 @@ const ENTRIES: RegistryEntry[] = [
     risk: "meta",
     description: "Complete harness task",
   },
+  // Expansion tools
+  {
+    name: "list_windows",
+    toolset: "vision",
+    risk: "read",
+    description: "Enumerate visible OS windows",
+  },
+  {
+    name: "screenshot",
+    toolset: "vision",
+    risk: "read",
+    description: "Capture window/browser/screen screenshot",
+  },
+  {
+    name: "read_image",
+    toolset: "vision",
+    risk: "read",
+    description: "Read workspace image as content block",
+  },
+  {
+    name: "browser_devtools",
+    toolset: "devtools",
+    risk: "network",
+    description: "CDP browser actions",
+  },
+  {
+    name: "check",
+    toolset: "shell",
+    risk: "read",
+    description: "Structured tsc/eslint diagnostics",
+  },
+  {
+    name: "git",
+    toolset: "vcs",
+    risk: "read",
+    description: "Structured git status/diff/log/blame",
+  },
+  {
+    name: "patch_apply",
+    toolset: "fs",
+    risk: "write",
+    description: "Apply unified diff (fail-loud)",
+  },
+  {
+    name: "wait_for_port",
+    toolset: "devtools",
+    risk: "read",
+    description: "Poll local TCP port until open",
+  },
+  {
+    name: "clipboard_read",
+    toolset: "meta",
+    risk: "read",
+    description: "Read system clipboard",
+  },
+  {
+    name: "find_symbol",
+    toolset: "search",
+    risk: "read",
+    description: "TS go-to-definition / references",
+  },
 ];
 
 const BY_NAME = new Map<string, RegistryEntry>();
@@ -189,6 +253,9 @@ export const ALL_TOOLSETS: ToolsetId[] = [
   "meta",
   "process",
   "catalog",
+  "vision",
+  "devtools",
+  "vcs",
 ];
 
 /** Default interactive agent toolsets (no catalog finish unless asked). */
@@ -199,6 +266,9 @@ export const DEFAULT_AGENT_TOOLSETS: ToolsetId[] = [
   "web",
   "meta",
   "process",
+  "vision",
+  "devtools",
+  "vcs",
 ];
 
 /** Fusion / headless eval toolsets. */

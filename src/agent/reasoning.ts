@@ -539,8 +539,29 @@ function normalizeEfforts(raw: string[]): EffortLevel[] {
 }
 
 /**
+ * Free / flash / :free ids — thrift on CoT so tool loops are not 90% sampling
+ * (bench: deepseek-v4-flash-free heavy coding ~91% wall in stream phases).
+ * Codex/OpenCode also avoid max effort on free tiers by default.
+ */
+export function isFreeTierReasoningModel(model: string): boolean {
+  const m = (model ?? "").toLowerCase();
+  return (
+    /:free$/i.test(m) ||
+    /\/free$/i.test(m) ||
+    /-free$/i.test(m) ||
+    /flash-free|hy3|big-pickle|\bpickle\b|deepseek-v4-flash(?!-pro)/i.test(m)
+  );
+}
+
+/** Highest effort free-tier models get without an explicit per-model pin. */
+export const FREE_TIER_EFFORT_CAP: EffortLevel = "medium";
+
+/**
  * Resolve the effort to send for a model: per-model override → global → default.
  * Clamped to what the model supports. Returns null when we should omit the field.
+ *
+ * Free-tier models are capped at {@link FREE_TIER_EFFORT_CAP} unless the user
+ * set a **per-model** effort pin (explicit opt-in to high CoT on free models).
  */
 export function resolveEffortForModel(
   provider: ProviderId,
@@ -558,6 +579,8 @@ export function resolveEffortForModel(
   const key = modelKey({ provider, model });
   const perModel = cfg.reasoning.perModelEffort?.[key];
   const global = cfg.reasoning.effort;
+  const free = isFreeTierReasoningModel(model);
+  const explicitPerModel = Boolean(perModel && perModel !== "default");
 
   let desired: string | undefined =
     perModel ??
@@ -572,6 +595,15 @@ export function resolveEffortForModel(
         : undefined;
   }
 
+  // Free tier + no explicit desired → prefer medium (not silent max from provider)
+  if (free && (!desired || desired === "default")) {
+    desired = caps.efforts.includes(FREE_TIER_EFFORT_CAP)
+      ? FREE_TIER_EFFORT_CAP
+      : caps.efforts.includes("low")
+        ? "low"
+        : caps.efforts[0];
+  }
+
   if (!desired || desired === "default") {
     return { effort: null, caps, clamped: false };
   }
@@ -581,6 +613,16 @@ export function resolveEffortForModel(
   if (!caps.efforts.includes(effort)) {
     effort = clampEffort(effort, caps.efforts);
     clamped = true;
+  }
+
+  // Free tier: cap high/xhigh/max unless user pinned this model explicitly
+  if (free && !explicitPerModel) {
+    const capIdx = EFFORT_ORDER.indexOf(FREE_TIER_EFFORT_CAP);
+    const curIdx = EFFORT_ORDER.indexOf(effort);
+    if (curIdx > capIdx) {
+      effort = clampEffort(FREE_TIER_EFFORT_CAP, caps.efforts);
+      clamped = true;
+    }
   }
 
   // Mandatory models reject none

@@ -15,13 +15,32 @@ import {
   toAnthropicTools,
   toGeminiFunctionDeclarations,
 } from "../toolcalling/compat.js";
+import {
+  contentToPlainText,
+  isContentParts,
+  toAnthropicContentBlocks,
+  toGeminiParts,
+  toOpenAIContentParts,
+  type ChatContent,
+  type ChatContentPart,
+} from "../toolcalling/multimodal.js";
 import { resolveToolName } from "../toolcalling/tool.js";
 import { buildReasoningApiFields } from "../agent/reasoning.js";
-import { dbg, dbgTrace, modelTag, span } from "../agent/debug.js";
+import { dbg, dbgTrace, modelTag, span, isFullPayloads } from "../agent/debug.js";
+
+export type { ChatContent, ChatContentPart };
+export {
+  contentToPlainText,
+  isContentParts,
+  toAnthropicContentBlocks,
+  toGeminiParts,
+  toOpenAIContentParts,
+} from "../toolcalling/multimodal.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  /** Plain text, null, or multimodal content-part array (text + image). */
+  content: ChatContent;
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
@@ -895,7 +914,7 @@ export function sanitizeOpenCodeMessages(
   return messages.map((m) => {
     const out: Record<string, unknown> = {
       role: m.role,
-      content: m.content,
+      content: toOpenAIContentParts(m.content),
     };
     if (m.name) out.name = m.name;
     if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
@@ -903,6 +922,30 @@ export function sanitizeOpenCodeMessages(
     // Prefer reasoning_content; never send empty
     const r = (m.reasoning_content ?? m.reasoning ?? "").trim();
     if (r) out.reasoning_content = r;
+    return out;
+  });
+}
+
+/**
+ * Serialize messages for OpenAI-compatible chat/completions bodies.
+ * Emits image_url parts when content is a multimodal array.
+ */
+export function serializeOpenAIMessages(
+  messages: ChatMessage[],
+): Array<Record<string, unknown>> {
+  return messages.map((m) => {
+    const out: Record<string, unknown> = {
+      role: m.role,
+      content: toOpenAIContentParts(m.content),
+    };
+    if (m.name) out.name = m.name;
+    if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+    if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
+    const r = (m.reasoning_content ?? m.reasoning ?? "").trim();
+    if (r) {
+      out.reasoning = r;
+      out.reasoning_content = r;
+    }
     return out;
   });
 }
@@ -1016,9 +1059,10 @@ async function chatOpenAI(
     model: req.model,
     // Zen/Go: only send wire-safe message fields (avoids dual reasoning
     // string fields confusing OR-backed free models).
+    // Multimodal: image parts → OpenAI image_url blocks for all OpenAI-compatible providers.
     messages: isOpenCode
       ? sanitizeOpenCodeMessages(req.messages)
-      : req.messages,
+      : serializeOpenAIMessages(req.messages),
     temperature: req.temperature ?? 0.2,
     stream: req.stream !== false,
   };
@@ -1084,7 +1128,9 @@ async function chatOpenAI(
       content:
         typeof m.content === "string"
           ? m.content.slice(0, 300)
-          : m.content,
+          : Array.isArray(m.content)
+            ? contentToPlainText(m.content).slice(0, 300)
+            : m.content,
       tool_calls: m.tool_calls?.map((t) => t.function.name),
       tool_call_id: m.tool_call_id,
     })),
@@ -1500,6 +1546,7 @@ async function consumeOpenAIStream(
   }
 
   const normalized = toolCalls.filter((t) => t.function.name);
+  const full = isFullPayloads();
   dbg("llm", "stream.done", {
     finish,
     ttftMs,
@@ -1507,10 +1554,13 @@ async function consumeOpenAIStream(
     chunks: chunkCount,
     contentLen: content.length,
     reasoningLen: reasoning.length,
+    contentPreview: content.slice(0, full ? 8_000 : 300),
+    reasoningPreview: reasoning.slice(0, full ? 4_000 : 200),
     tools: normalized.map((t) => ({
       id: t.id,
       name: t.function.name,
-      argsPreview: t.function.arguments.slice(0, 120),
+      argsChars: t.function.arguments.length,
+      argsPreview: t.function.arguments.slice(0, full ? 8_000 : 400),
     })),
     usage,
     durationMs: Date.now() - t0,
@@ -1534,12 +1584,17 @@ function toGeminiContents(messages: ChatMessage[]): Array<{ role: string; parts:
   for (const m of messages) {
     if (m.role === "system") continue;
     if (m.role === "user") {
-      contents.push({ role: "user", parts: [{ text: m.content ?? "" }] });
+      contents.push({ role: "user", parts: toGeminiParts(m.content) });
       continue;
     }
     if (m.role === "assistant") {
       const parts: unknown[] = [];
-      if (m.content?.trim()) parts.push({ text: m.content });
+      const text = contentToPlainText(m.content).trim();
+      if (isContentParts(m.content) && m.content.some((p) => p.type === "image")) {
+        parts.push(...toGeminiParts(m.content));
+      } else if (text) {
+        parts.push({ text });
+      }
       for (const tc of m.tool_calls ?? []) {
         idToName.set(tc.id, tc.function.name);
         let args: Record<string, unknown> = {};
@@ -1560,16 +1615,35 @@ function toGeminiContents(messages: ChatMessage[]): Array<{ role: string; parts:
       continue;
     }
     if (m.role === "tool") {
-      // Gemini expects functionResponse on a user turn
+      // Gemini expects functionResponse on a user turn.
+      // Image-bearing tool results: send as user parts (inlineData) so vision models see them.
       const name =
         m.name ||
         (m.tool_call_id ? idToName.get(m.tool_call_id) : undefined) ||
         "tool";
-      let response: unknown = m.content ?? "";
+      if (isContentParts(m.content) && m.content.some((p) => p.type === "image")) {
+        contents.push({
+          role: "user",
+          parts: [
+            {
+              functionResponse: {
+                name,
+                response: {
+                  result: contentToPlainText(m.content),
+                },
+              },
+            },
+            ...toGeminiParts(m.content),
+          ],
+        });
+        continue;
+      }
+      const plain = contentToPlainText(m.content);
+      let response: unknown = plain;
       try {
-        response = JSON.parse(String(m.content));
+        response = JSON.parse(plain);
       } catch {
-        response = { result: m.content ?? "" };
+        response = { result: plain };
       }
       contents.push({
         role: "user",
@@ -1606,7 +1680,8 @@ async function chatGemini(
 ): Promise<ChatResult> {
   const id = req.model.replace(/^models\//, "");
   const url = `${base}/models/${id}:streamGenerateContent?alt=sse&key=${encodeURIComponent(token)}`;
-  const system = req.messages.find((m) => m.role === "system")?.content ?? "";
+  const systemRaw = req.messages.find((m) => m.role === "system")?.content;
+  const system = contentToPlainText(systemRaw ?? "");
   const contents = toGeminiContents(req.messages);
   const native = buildReasoningApiFields(req.provider, req.model);
   const genCfg = (native.generationConfig as Record<string, unknown> | undefined) ?? {};
@@ -1826,14 +1901,20 @@ function toAnthropicMessages(
       continue;
     }
     if (m.role === "user") {
-      out.push({ role: "user", content: m.content ?? "" });
+      out.push({
+        role: "user",
+        content: toAnthropicContentBlocks(m.content),
+      });
       i++;
       continue;
     }
     if (m.role === "assistant") {
       const blocks: unknown[] = [];
-      if (m.content?.trim()) {
-        blocks.push({ type: "text", text: m.content });
+      if (isContentParts(m.content)) {
+        blocks.push(...(toAnthropicContentBlocks(m.content) as unknown[]));
+      } else {
+        const text = contentToPlainText(m.content).trim();
+        if (text) blocks.push({ type: "text", text });
       }
       for (const tc of m.tool_calls ?? []) {
         let input: Record<string, unknown> = {};
@@ -1861,10 +1942,13 @@ function toAnthropicMessages(
       const results: unknown[] = [];
       while (i < messages.length && messages[i]!.role === "tool") {
         const tm = messages[i]!;
+        const toolContent = isContentParts(tm.content)
+          ? toAnthropicContentBlocks(tm.content)
+          : contentToPlainText(tm.content);
         results.push({
           type: "tool_result",
           tool_use_id: tm.tool_call_id ?? "tool",
-          content: tm.content ?? "",
+          content: toolContent === "" ? "" : toolContent,
         });
         i++;
       }
@@ -1885,7 +1969,8 @@ async function chatAnthropic(
   const system =
     req.messages
       .filter((m) => m.role === "system")
-      .map((m) => m.content)
+      .map((m) => contentToPlainText(m.content))
+      .filter(Boolean)
       .join("\n") || undefined;
   const messages = toAnthropicMessages(req.messages);
   const native = buildReasoningApiFields(req.provider, req.model);

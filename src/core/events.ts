@@ -34,6 +34,7 @@ export type HarnessEvent =
       status: ToolStatus;
       result?: string;
       error?: string;
+      contentParts?: ToolPart["contentParts"];
     }
   | { type: "phase"; phase: AgentPhase; label?: string }
   | { type: "tokens"; input: number; output: number }
@@ -166,6 +167,9 @@ export function reduce(state: HarnessState, event: HarnessEvent): HarnessState {
           tool.status = event.status;
           if (event.result !== undefined) tool.result = event.result;
           if (event.error !== undefined) tool.error = event.error;
+          if (event.contentParts !== undefined) {
+            tool.contentParts = event.contentParts;
+          }
           if (event.status === "running" && !tool.startedAt) {
             tool.startedAt = Date.now();
           }

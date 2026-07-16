@@ -38,6 +38,14 @@ export interface ToolPart {
   status: ToolStatus;
   result?: string;
   error?: string;
+  /**
+   * Multimodal tool result (text + image content parts).
+   * When present, history → wire emits this as ChatMessage.content array.
+   */
+  contentParts?: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; mimeType: string; data: string }
+  >;
   /** Provider tool_call id — required for proper multi-turn wire history */
   callId?: string;
   startedAt?: number;

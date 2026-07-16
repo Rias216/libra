@@ -86,6 +86,22 @@ export const DEFAULT_PERMISSIONS: PermissionRules = {
   update_goal: "allow",
   process: "allow",
   finish: "allow",
+  // Expansion tools
+  list_windows: "allow",
+  screenshot: {
+    "*": "allow",
+    // full_screen handled via pattern / permission check in runner when args.full_screen
+    full_screen: "ask",
+  },
+  read_image: "allow",
+  browser_devtools: "allow",
+  check: "allow",
+  git: "allow",
+  patch_apply: "allow",
+  wait_for_port: "allow",
+  // Outside workspace data → ask
+  clipboard_read: "ask",
+  find_symbol: "allow",
   // Mutations: allow by default (harness agents need them); user can set ask
   write: "allow",
   write_file: "allow",
@@ -261,6 +277,10 @@ export class PermissionChecker {
       tool === "edit_file"
     ) {
       return String(args.file_path ?? args.path ?? "").trim();
+    }
+    // full_screen screenshot → "full_screen" pattern (DEFAULT_PERMISSIONS ask)
+    if (tool === "screenshot" && args.full_screen === true) {
+      return "full_screen";
     }
     return tool;
   }

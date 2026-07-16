@@ -36,6 +36,10 @@ import {
   type DispatchResult,
 } from "../toolcalling/runtime.js";
 import {
+  contentToPlainText,
+  toolResultContent,
+} from "../toolcalling/multimodal.js";
+import {
   buildDispatchCalls,
   normalizeToolCallsForWire,
   type DispatchCall,
@@ -58,7 +62,7 @@ import { approxTokensFromMessages, historyToMessages } from "./history.js";
 import { createSampleProcessor } from "./processor.js";
 import { loadAgentSettings } from "./config.js";
 import { resolveEffortForModel } from "./reasoning.js";
-import { dbg, span } from "./debug.js";
+import { dbg, span, summarizeMessagesForDebug, isFullPayloads } from "./debug.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { SubagentRuntime } from "./subagent/runtime.js";
 import { buildSubagentNoticeMessage } from "./subagent/types.js";
@@ -77,6 +81,10 @@ import {
   DOOM_FORCE_ANSWER_REMINDER,
   STUCK_PROGRESS_REMINDER,
 } from "./thought-loop.js";
+import {
+  dispatchExpansionCustomTool,
+  isExpansionCustomTool,
+} from "../toolcalling/expansion-custom.js";
 
 /** OpenCode-style step cap before max-steps nudge (raised for multi-file coding). */
 export const MAX_STEPS = 40;
@@ -166,7 +174,9 @@ export interface TurnOptions {
   /** Dispatch custom tools (peer multi-agent) for headless children. */
   customDispatch?: (
     call: DispatchCall,
-  ) => Promise<{ ok: boolean; output: string; durationMs?: number }>;
+  ) => Promise<
+    import("../toolcalling/runtime.js").CustomDispatchResult
+  >;
   /**
    * Session-scoped multi-agent runtime. When provided, threads and finished
    * children survive across parent turns (resume_from / background work).
@@ -234,7 +244,9 @@ export interface TurnCoreHooks {
   isCustomTool?: (name: string) => boolean;
   customDispatch?: (
     call: DispatchCall,
-  ) => Promise<{ ok: boolean; output: string; durationMs?: number }>;
+  ) => Promise<
+    import("../toolcalling/runtime.js").CustomDispatchResult
+  >;
   /** Soft compact token budget (same softCompactMessages for both). */
   compactBudget?: number;
   compactKeepRecent?: number;
@@ -327,12 +339,25 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
   /** Only one full session rollover per turn (then soft digests). */
   let didSessionRollover = false;
 
+  const systemMsg = messages.find((m) => m.role === "system");
+  const systemChars =
+    typeof systemMsg?.content === "string"
+      ? systemMsg.content.length
+      : 0;
   const turnSpan = span(ns, `${label}.turn`, {
     model: `${provider}/${model}`,
     tools: Boolean(toolSchemas?.length) && toolsEnabledInitially,
+    toolCount: toolSchemas?.length ?? 0,
+    toolNames: toolSchemas?.map((t) => t.function.name) ?? [],
     maxSteps,
     contextWindow,
     compactBudget,
+    systemChars,
+    messageCount: messages.length,
+  });
+  dbg(ns, "turn.wire_snapshot", {
+    label,
+    messages: summarizeMessagesForDebug(messages),
   });
 
   /** Finalize mid-stream UI parts even when the sample throws. */
@@ -455,15 +480,28 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
               : `streaming · step ${step}`,
       );
 
+      const tokensApprox = approxTokensFromMessages(sampleMessages);
       dbg(ns, `step.${step}.start`, {
         messages: sampleMessages.length,
         tools: toolsEnabled,
+        toolSchemaCount: toolsEnabled ? (toolSchemas?.length ?? 0) : 0,
+        tool_choice: !toolsEnabled ? "none" : (toolChoice ?? "auto"),
         isLast,
         forceToolsOff,
         maxStepsPrompt: isLast,
-        tokensApprox: approxTokensFromMessages(sampleMessages),
+        tokensApprox,
+        lastApiPromptTokens,
         effort,
         lengthContinues,
+        doomWaves,
+        stuckWaves,
+        lightReasoning,
+        temperature: lightReasoning || forceToolsOff ? 0.2 : 0.4,
+      });
+      // Full wire state every step (roles / tool_call ids / sizes) — critical
+      // for prompt + tool-calling postmortems.
+      dbg(ns, `step.${step}.wire`, {
+        messages: summarizeMessagesForDebug(sampleMessages),
       });
 
       const sampleHandlers = hooks.onSampleStart?.(step);
@@ -499,6 +537,7 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
             signal: abortSignal,
             onRetry: (attempt, err, delayMs) => {
               dbg(ns, "llm.retry", {
+                step,
                 attempt,
                 delayMs,
                 error: err instanceof Error ? err.message : String(err),
@@ -514,6 +553,9 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
       } catch (err) {
         // Clear streaming flags so the UI does not freeze mid-stream
         endSample(step, null, sampleHandlers);
+        dbg(ns, `step.${step}.sample_error`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
         throw err;
       }
 
@@ -525,6 +567,35 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         if (p > 0) lastApiPromptTokens = p;
         hooks.onUsage?.(p, c);
       }
+
+      // Full sample outcome — every field needed to debug toolcalling
+      dbg(ns, `step.${step}.sample`, {
+        finish_reason: result.finish_reason,
+        ttftMs: result.ttftMs,
+        contentLen: result.content?.length ?? 0,
+        reasoningLen: result.reasoning?.length ?? 0,
+        contentPreview: (result.content ?? "").slice(
+          0,
+          isFullPayloads() ? 8_000 : 400,
+        ),
+        reasoningPreview: (result.reasoning ?? "").slice(
+          0,
+          isFullPayloads() ? 8_000 : 400,
+        ),
+        tool_calls: result.tool_calls.map((t) => ({
+          id: t.id,
+          name: t.function?.name,
+          argsChars: t.function?.arguments?.length ?? 0,
+          argsPreview: (t.function?.arguments ?? "").slice(
+            0,
+            isFullPayloads() ? 8_000 : 500,
+          ),
+          argsFull: isFullPayloads() ? t.function?.arguments : undefined,
+        })),
+        usage: result.usage,
+        promptTok,
+        completionTok,
+      });
 
       // Client-side thinking-tail loop (Grok Build spirit without server signals)
       if (
@@ -646,12 +717,22 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
         const toolSpan = span(ns, `step.${step}.tools`, {
           count: dispatchCalls.length,
           names: dispatchCalls.map((d) => d.name),
+          callIds: dispatchCalls.map((d) => d.callId),
+        });
+        dbg(ns, `step.${step}.tools.dispatch`, {
+          tools: dispatchCalls.map((d) => ({
+            id: d.callId,
+            name: d.name,
+            args: d.args,
+            argsChars: JSON.stringify(d.args ?? {}).length,
+          })),
         });
 
         const outputs = await runtime.dispatchAll(dispatchCalls, {
           signal: abortSignal,
           isCustomTool: hooks.isCustomTool,
           customDispatch: hooks.customDispatch,
+          model,
         });
 
         let waveDoom = 0;
@@ -662,21 +743,35 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
           const out = outputs[i]!;
           const d = dispatchCalls[i]!;
           toolsUsed.push(out.name);
+          const outPreviewMax = isFullPayloads() ? 50_000 : 1_500;
           dbg(ns, out.cached ? "tool.cache_hit" : "tool.done", {
+            step,
+            waveIndex: i,
             id: out.callId,
             name: out.name,
             ok: out.ok,
             ms: out.durationMs,
             cached: out.cached,
+            denied: out.denied,
+            invalid: out.invalid,
+            aborted: out.aborted,
             doomLoop: out.doomLoop,
             doomReason: out.doomReason,
+            fingerprint: out.fingerprint,
+            args: d.args,
             outLen: out.output.length,
+            outPreview: out.output.slice(0, outPreviewMax),
+            hasContentParts: Boolean(out.contentParts?.length),
           });
           hooks.onToolDone?.(i, d, out);
+          // Phase 0: emit content-part array when tool result carries an image.
+          const toolContent = out.contentParts?.length
+            ? toolResultContent(out.contentParts, { model })
+            : out.output || "(empty)";
           messages.push({
             role: "tool",
             tool_call_id: out.callId,
-            content: out.output || "(empty)",
+            content: toolContent,
           });
 
           if (out.doomLoop) waveDoom++;
@@ -695,7 +790,8 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
             (out.name === "search_replace" ||
               out.name === "write" ||
               out.name === "write_file" ||
-              out.name === "edit_file")
+              out.name === "edit_file" ||
+              out.name === "patch_apply")
           ) {
             waveMutateOk++;
           }
@@ -705,6 +801,21 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
           ok: outputs.filter((o) => o.ok).length,
           fail: outputs.filter((o) => !o.ok).length,
           doom: waveDoom,
+          totalMs: outputs.reduce((n, o) => n + (o.durationMs ?? 0), 0),
+          names: outputs.map((o) => o.name),
+        });
+        dbg(ns, `step.${step}.tools.wave_summary`, {
+          ok: outputs.filter((o) => o.ok).length,
+          fail: outputs.filter((o) => !o.ok).length,
+          doom: waveDoom,
+          mutateOk: waveMutateOk,
+          results: outputs.map((o) => ({
+            name: o.name,
+            ok: o.ok,
+            ms: o.durationMs,
+            outLen: o.output.length,
+            doomLoop: o.doomLoop,
+          })),
         });
 
         // Doom escalation: only on waves that actually blocked a tool
@@ -843,7 +954,27 @@ export async function runTurnCore(input: TurnCoreInput): Promise<TurnResult> {
     turnSpan.end({
       rounds: step,
       tools: toolsUsed.length,
+      toolsUsed,
       cancelled,
+      promptTok,
+      completionTok,
+      doomWaves,
+      stuckWaves,
+      lengthContinues,
+      finalTextChars: finalText.length,
+    });
+    dbg(ns, "turn.complete", {
+      label,
+      rounds: step,
+      toolsUsed,
+      promptTok,
+      completionTok,
+      doomWaves,
+      stuckWaves,
+      lengthContinues,
+      cancelled,
+      finalTextPreview: finalText.slice(0, isFullPayloads() ? 8_000 : 500),
+      wireTail: summarizeMessagesForDebug(messages.slice(-12)),
     });
 
     return {
@@ -1042,7 +1173,9 @@ export async function runStoreTurn(
 
   const messages: ChatMessage[] = [
     { role: "system", content: system },
-    ...historyToMessages(ctx.store),
+    // Pass model so vision-gate keeps image contentParts for vision models
+    // on store→wire multi-turn rebuild (Phase 0).
+    ...historyToMessages(ctx.store, { model: opts.model }),
   ];
 
   const toolSchemas =
@@ -1153,11 +1286,13 @@ export async function runStoreTurn(
             {
               result: out.ok ? out.output : undefined,
               error: out.ok ? undefined : out.output,
+              contentParts: out.ok ? out.contentParts : undefined,
             },
           );
         },
         isCustomTool: (name) =>
           isMultiAgentTool(name) ||
+          isExpansionCustomTool(name) ||
           (Boolean(opts.goalOrchestrator) && isGoalTool(name)),
         customDispatch: async (call) => {
           if (opts.goalOrchestrator && isGoalTool(call.name)) {
@@ -1168,6 +1303,21 @@ export async function runStoreTurn(
               ok: r.ok,
               output: r.output,
               durationMs: Date.now() - t0,
+            };
+          }
+          if (isExpansionCustomTool(call.name)) {
+            ctx.store.setPhase("tool", call.name);
+            const t0 = Date.now();
+            const r = await dispatchExpansionCustomTool(call, {
+              cwd: opts.cwd ?? process.cwd(),
+              model: opts.model,
+              signal: opts.abortSignal,
+            });
+            return {
+              ok: r.ok,
+              output: r.output,
+              durationMs: r.durationMs ?? Date.now() - t0,
+              savedPath: r.savedPath,
             };
           }
           if (!subRuntime) {
@@ -1282,8 +1432,22 @@ export async function runHeadlessTurn(
           COMPACT_TOKEN_BUDGET_CHILD,
         ),
         compactKeepRecent: 12,
-        isCustomTool: opts.isCustomTool,
-        customDispatch: opts.customDispatch,
+        isCustomTool: (name) =>
+          Boolean(opts.isCustomTool?.(name)) || isExpansionCustomTool(name),
+        customDispatch: async (call) => {
+          if (isExpansionCustomTool(call.name)) {
+            return dispatchExpansionCustomTool(call, {
+              cwd,
+              model: opts.model,
+              signal: opts.abortSignal,
+            });
+          }
+          if (opts.customDispatch) return opts.customDispatch(call);
+          return {
+            ok: false,
+            output: `Custom tool "${call.name}" unavailable`,
+          };
+        },
         // Headless has no UI session — wire messages are already replaced
         // in maybeCompact; no onSessionRollover needed.
       },

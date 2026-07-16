@@ -11,6 +11,8 @@ import {
   TOOL_OUTPUT_LIVE_MAX,
 } from "./truncate.js";
 import type { DispatchCall } from "./router.js";
+import type { ChatContentPart } from "./multimodal.js";
+import { contentToPlainText } from "./multimodal.js";
 
 /** Same fingerprint this many times this turn (anywhere) → doom-loop. */
 export const DOOM_LOOP_THRESHOLD = 3;
@@ -24,7 +26,13 @@ export interface DispatchResult {
   args: Record<string, unknown>;
   fingerprint: string;
   ok: boolean;
+  /** Always a string for UI / fingerprinting; image tools also set contentParts. */
   output: string;
+  /**
+   * Multimodal tool result (text + image parts). When set, the agent turn
+   * should put this on the tool-result message content (after vision gate).
+   */
+  contentParts?: ChatContentPart[];
   durationMs: number;
   cached: boolean;
   denied?: boolean;
@@ -35,13 +43,23 @@ export interface DispatchResult {
   doomReason?: "repeat" | "oscillation";
 }
 
+export interface CustomDispatchResult {
+  ok: boolean;
+  output: string | ChatContentPart[];
+  durationMs?: number;
+  /** Explicit saved path for vision-fallback text when output is parts. */
+  savedPath?: string;
+}
+
 export interface RuntimeHandlers {
   /** Multi-agent or other non-runner tools */
   customDispatch?: (
     call: DispatchCall,
-  ) => Promise<{ ok: boolean; output: string; durationMs?: number }>;
+  ) => Promise<CustomDispatchResult>;
   isCustomTool?: (name: string) => boolean;
   signal?: AbortSignal;
+  /** Active model id — used to vision-gate image tool results. */
+  model?: string;
 }
 
 type WaveCall = DispatchCall & { id: string };
@@ -119,17 +137,45 @@ export class ToolCallRuntime {
         let result: DispatchResult;
         if (handlers.isCustomTool?.(call.name) && handlers.customDispatch) {
           const t0 = Date.now();
+          // Permission gate for custom tools (e.g. screenshot full_screen=ask)
+          try {
+            const decision =
+              await this.runner.permissions.resolveAndMaybeAsk(
+                call.name,
+                call.args,
+              );
+            if (decision.action === "deny") {
+              const { deniedToolOutput } = await import("./permissions.js");
+              result = {
+                callId: call.callId,
+                name: call.name,
+                args: call.args,
+                fingerprint: call.fingerprint,
+                ok: false,
+                output: deniedToolOutput(decision),
+                durationMs: Date.now() - t0,
+                cached: false,
+                denied: true,
+              };
+              this.recordFingerprint(call.fingerprint);
+              return result;
+            }
+          } catch {
+            /* if permissions unavailable, proceed */
+          }
           const r = await handlers.customDispatch(call);
+          const parts = Array.isArray(r.output) ? r.output : undefined;
+          const textOut = parts
+            ? contentToPlainText(parts) || "(empty)"
+            : String(r.output || "(empty)");
           result = {
             callId: call.callId,
             name: call.name,
             args: call.args,
             fingerprint: call.fingerprint,
             ok: r.ok,
-            output: truncateToolOutput(
-              r.output || "(empty)",
-              this.outputMax,
-            ),
+            output: truncateToolOutput(textOut, this.outputMax),
+            contentParts: parts,
             durationMs: r.durationMs ?? Date.now() - t0,
             cached: false,
           };
@@ -228,6 +274,9 @@ function fromRunResult(
   exec: RunCallResult,
   max: number,
 ): DispatchResult {
+  const parts =
+    exec.contentParts ??
+    (exec.data?.contentParts as ChatContentPart[] | undefined);
   return {
     callId: call.callId,
     name: call.name,
@@ -238,6 +287,7 @@ function fromRunResult(
       exec.output || (exec.ok ? "(empty)" : "error"),
       max,
     ),
+    contentParts: Array.isArray(parts) ? parts : undefined,
     durationMs: exec.durationMs,
     cached: exec.cached,
     denied: exec.denied,

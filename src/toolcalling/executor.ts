@@ -46,6 +46,18 @@ import {
   webFetchUrl,
   webSearch,
 } from "./web.js";
+import { listWindows } from "./list-windows.js";
+import { waitForPort } from "./wait-port.js";
+import { clipboardRead } from "./clipboard.js";
+import { runCheck } from "./check.js";
+import { runGitTool, type GitAction } from "./git-tool.js";
+import {
+  applyFilePatch,
+  hunksToDiffParts,
+  parseUnifiedDiff,
+} from "./patch.js";
+import { findSymbol, type FindSymbolAction } from "./find-symbol.js";
+import { imagePart, mimeFromPath, textPart } from "./multimodal.js";
 
 const MAX_RESULT = 24_000;
 /** OpenCode default — avoid blowing context */
@@ -111,6 +123,8 @@ export interface ToolExecResult {
   output: string;
   /** Structured payload when available (especially json style) */
   data?: Record<string, unknown>;
+  /** Multimodal content parts (e.g. read_image) */
+  contentParts?: import("./multimodal.js").ChatContentPart[];
   durationMs: number;
   /** Machine code when ok=false */
   code?: string;
@@ -167,10 +181,14 @@ export class ToolExecutor {
         this.resultStyle === "json"
           ? truncate(JSON.stringify(data), MAX_RESULT)
           : truncate(this.formatText(name, data), MAX_RESULT);
+      const contentParts = Array.isArray(data.contentParts)
+        ? (data.contentParts as import("./multimodal.js").ChatContentPart[])
+        : undefined;
       return {
         ok: data.ok !== false,
         output,
         data,
+        contentParts,
         durationMs: Date.now() - t0,
         code: data.ok === false ? String(data.code ?? "error") : undefined,
       };
@@ -291,6 +309,48 @@ export class ToolExecutor {
           provider: String(data.provider ?? ""),
           error: data.error != null ? String(data.error) : undefined,
         });
+      case "list_windows": {
+        const windows = data.windows as unknown[] | undefined;
+        return windows?.length
+          ? JSON.stringify(windows, null, 0)
+          : "(no windows)";
+      }
+      case "read_image":
+        return String(
+          data.summary ??
+            `image ${data.path ?? ""} (${data.mimeType ?? "image"})`,
+        );
+      case "check": {
+        const diags = data.diagnostics as unknown[] | undefined;
+        if (!diags?.length) return "check: no diagnostics";
+        return JSON.stringify(diags, null, 0);
+      }
+      case "git":
+        return JSON.stringify(data.data ?? data, null, 0);
+      case "patch_apply":
+        return String(
+          data.summary ??
+            `applied patch to ${Array.isArray(data.files) ? (data.files as string[]).join(", ") : "files"}`,
+        );
+      case "wait_for_port":
+        return data.open
+          ? `port ${data.host}:${data.port} open after ${data.waitedMs}ms`
+          : String(data.error ?? `port ${data.port} not open`);
+      case "clipboard_read":
+        return data.ok === false
+          ? String(data.error ?? "clipboard_read failed")
+          : String(data.text ?? "");
+      case "find_symbol":
+        return JSON.stringify(
+          {
+            action: data.action,
+            symbol: data.symbol,
+            locations: data.locations,
+            engine: data.engine,
+          },
+          null,
+          0,
+        );
       default:
         return JSON.stringify(data);
     }
@@ -390,6 +450,33 @@ export class ToolExecutor {
           finished: true,
           answer: str(args.answer),
           success: args.success !== false,
+        };
+      case "list_windows":
+        return this.listWindowsTool();
+      case "read_image":
+        return this.readImage(
+          str(args.path || args.file_path || args.target_file),
+        );
+      case "check":
+        return this.checkTool(args);
+      case "git":
+        return this.gitTool(args);
+      case "patch_apply":
+        return this.patchApply(str(args.diff || args.patch));
+      case "wait_for_port":
+        return this.waitForPortTool(args);
+      case "clipboard_read":
+        return this.clipboardReadTool();
+      case "find_symbol":
+        return this.findSymbolTool(args);
+      case "screenshot":
+      case "browser_devtools":
+        // Custom tools — handled by expansion-custom via turn isCustomTool.
+        // Bare executor path returns a clear redirect error.
+        return {
+          ok: false,
+          error: `${name} is a custom tool (image/CDP runtime); use agent customDispatch`,
+          code: "custom_tool",
         };
       default:
         throw Object.assign(new Error(`unknown tool: ${name}`), {
@@ -873,6 +960,207 @@ export class ToolExecutor {
     };
   }
 
+  private async listWindowsTool(): Promise<Record<string, unknown>> {
+    const windows = await listWindows();
+    return { ok: true, windows, count: windows.length };
+  }
+
+  private readImage(path: string): Record<string, unknown> {
+    if (!path?.trim()) {
+      throw Object.assign(new Error("read_image requires path"), {
+        code: "invalid_args",
+      });
+    }
+    const abs = this.resolveSafe(path);
+    if (!existsSync(abs)) {
+      throw Object.assign(new Error(`not found: ${path}`), {
+        code: "not_found",
+      });
+    }
+    const st = statSync(abs);
+    if (st.isDirectory()) {
+      throw Object.assign(new Error(`is a directory: ${path}`), {
+        code: "is_directory",
+      });
+    }
+    if (st.size > 8_000_000) {
+      throw Object.assign(
+        new Error(`image too large (${st.size} bytes): ${path}`),
+        { code: "too_large" },
+      );
+    }
+    const buf = readFileSync(abs);
+    const mime = mimeFromPath(abs);
+    if (!mime.startsWith("image/") && mime !== "image/svg+xml") {
+      // Still allow if magic looks like PNG/JPEG
+      const isPng =
+        buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+      const isJpeg = buf[0] === 0xff && buf[1] === 0xd8;
+      if (!isPng && !isJpeg) {
+        throw Object.assign(
+          new Error(`not an image file: ${path} (mime=${mime})`),
+          { code: "not_image" },
+        );
+      }
+    }
+    const b64 = buf.toString("base64");
+    const resolvedMime =
+      mime.startsWith("image/") || mime === "image/svg+xml"
+        ? mime
+        : buf[0] === 0x89
+          ? "image/png"
+          : "image/jpeg";
+    const summary = `read_image ${path} (${resolvedMime}, ${buf.length} bytes)`;
+    return {
+      ok: true,
+      path,
+      mimeType: resolvedMime,
+      bytes: buf.length,
+      summary,
+      // contentParts for custom path; formatText uses summary
+      contentParts: [textPart(summary), imagePart(resolvedMime, b64)],
+      // Also embed for ToolExecResult consumers that look at data
+      _imageBase64: b64,
+    };
+  }
+
+  private async checkTool(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const r = await runCheck(this.cwd, {
+      tsc: args.tsc !== false,
+      eslint:
+        args.eslint === true
+          ? true
+          : args.eslint === false
+            ? false
+            : undefined,
+      signal: this.opts.signal,
+    });
+    return {
+      ok: r.ok,
+      diagnostics: r.diagnostics,
+      commands: r.commands,
+      error: r.error,
+    };
+  }
+
+  private async gitTool(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const action = str(args.action, "status") as GitAction;
+    const r = await runGitTool(this.cwd, action, args);
+    return {
+      ok: r.ok,
+      action: r.action,
+      data: r.data,
+      error: r.error,
+    };
+  }
+
+  private patchApply(diff: string): Record<string, unknown> {
+    if (!diff?.trim()) {
+      throw Object.assign(new Error("patch_apply requires diff"), {
+        code: "invalid_args",
+      });
+    }
+    const files = parseUnifiedDiff(diff);
+    if (!files.length) {
+      throw Object.assign(
+        new Error("patch_apply: no file hunks found in diff"),
+        { code: "invalid_args" },
+      );
+    }
+    const applied: string[] = [];
+    const diffs: Array<Record<string, unknown>> = [];
+    for (const fp of files) {
+      const rel =
+        fp.newPath && fp.newPath !== "/dev/null" ? fp.newPath : fp.oldPath;
+      if (!rel || rel === "/dev/null") {
+        throw Object.assign(
+          new Error("patch_apply: cannot apply /dev/null-only patch"),
+          { code: "invalid_args" },
+        );
+      }
+      const abs = this.resolveSafe(rel);
+      let content = "";
+      if (existsSync(abs)) {
+        content = readFileSync(abs, "utf8");
+      } else if (fp.oldPath === "/dev/null" || fp.hunks[0]?.oldCount === 0) {
+        content = "";
+      } else {
+        throw Object.assign(new Error(`patch target not found: ${rel}`), {
+          code: "not_found",
+        });
+      }
+      const r = applyFilePatch(content, fp);
+      if (!r.ok) {
+        const base = r.error ?? `patch failed for ${rel}`;
+        throw Object.assign(
+          new Error(
+            base.includes("Re-read") ? base : `${base}.${PATCH_REREAD_HINT}`,
+          ),
+          { code: "hunk_mismatch" },
+        );
+      }
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, r.content!, "utf8");
+      applied.push(rel);
+      diffs.push({
+        path: rel,
+        hunks: hunksToDiffParts(fp.hunks),
+      });
+    }
+    return {
+      ok: true,
+      files: applied,
+      diffs,
+      summary: `applied patch to ${applied.join(", ")}`,
+    };
+  }
+
+  private async waitForPortTool(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const port = num(args.port);
+    if (port == null) {
+      throw Object.assign(new Error("wait_for_port requires port"), {
+        code: "invalid_args",
+      });
+    }
+    const r = await waitForPort({
+      port,
+      host: args.host != null ? str(args.host) : undefined,
+      timeoutMs: num(args.timeout_ms, 30_000) ?? 30_000,
+      signal: this.opts.signal,
+    });
+    return { ...r };
+  }
+
+  private async clipboardReadTool(): Promise<Record<string, unknown>> {
+    const r = await clipboardRead();
+    return { ...r };
+  }
+
+  private async findSymbolTool(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const symbol = str(args.symbol || args.name);
+    if (!symbol) {
+      throw Object.assign(new Error("find_symbol requires symbol"), {
+        code: "invalid_args",
+      });
+    }
+    const action = (str(args.action, "definition") ||
+      "definition") as FindSymbolAction;
+    const r = await findSymbol(this.cwd, symbol, action, {
+      file: args.file != null ? str(args.file) : undefined,
+      line: num(args.line),
+      col: num(args.col),
+    });
+    return { ...r };
+  }
+
   private calc(expression: string): Record<string, unknown> {
     const value = evalMath(expression);
     return { ok: true, value };
@@ -942,6 +1230,10 @@ export function coerceTodoItems(raw: unknown): unknown[] | null {
 /** Appended on NoMatches / ambiguous search_replace failures (Grok edit hint). */
 export const EDIT_REREAD_HINT =
   " File may have changed — re-read with read_file before retrying.";
+
+/** Appended on patch_apply hunk mismatch (Codex-style fail-loud + recovery). */
+export const PATCH_REREAD_HINT =
+  " Re-read the target with read_file, copy exact lines into the unified diff, then retry patch_apply.";
 
 /**
  * Resolve 1-based or negative offset to 0-based start index.
@@ -1161,9 +1453,11 @@ function hintForError(code: string, _msg: string): string | undefined {
     case "path_escape":
       return "Use paths relative to the workspace root only.";
     case "binary":
-      return "Skip binary files; use shell/file tools designed for that type.";
+      return "Use read_image for images; skip other binaries or use specialized tools.";
     case "too_large":
       return "Read with offset/limit or search with grep.";
+    case "hunk_mismatch":
+      return "Re-read the file, fix unified-diff context lines, retry patch_apply.";
     case "unknown_tool":
       return "Use only tools listed in the schema.";
     default:

@@ -20,6 +20,14 @@ const PARALLEL_SAFE = new Set([
   "spawn_agents_batch",
   "message_agent",
   "get_agent_result",
+  // Expansion read tools
+  "list_windows",
+  "read_image",
+  "check",
+  "git",
+  "wait_for_port",
+  "clipboard_read",
+  "find_symbol",
 ]);
 
 /** Mutators / exclusive tools — need write-lock style admission. */
@@ -28,6 +36,9 @@ const EXCLUSIVE = new Set([
   "search_replace",
   "run_terminal_command",
   "process",
+  "patch_apply",
+  "screenshot",
+  "browser_devtools",
   // Blocks until children finish — never treat as parallel-safe with parent work
   "wait_agent",
   "send_input",

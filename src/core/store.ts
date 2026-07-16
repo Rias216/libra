@@ -120,7 +120,11 @@ export class HarnessStore {
     messageId: string,
     partId: string,
     status: ToolStatus,
-    extra?: { result?: string; error?: string },
+    extra?: {
+      result?: string;
+      error?: string;
+      contentParts?: import("./types.js").ToolPart["contentParts"];
+    },
   ): void {
     this.dispatch({
       type: "tool.status",
@@ -129,6 +133,7 @@ export class HarnessStore {
       status,
       result: extra?.result,
       error: extra?.error,
+      contentParts: extra?.contentParts,
     });
   }
 
