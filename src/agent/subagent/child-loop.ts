@@ -6,7 +6,10 @@
 
 import type { ProviderId } from "../../auth/types.js";
 import type { ChatMessage } from "../../llm/client.js";
-import type { PermissionRules } from "../../toolcalling/permissions.js";
+import type {
+  PermissionAskFn,
+  PermissionRules,
+} from "../../toolcalling/permissions.js";
 import type { ToolsetId } from "../../toolcalling/registry.js";
 import type { OpenAITool } from "../../toolcalling/schema.js";
 import { runHeadlessTurn, type TurnOptions } from "../turn.js";
@@ -43,6 +46,17 @@ export interface ChildLoopOptions {
   chatImpl?: TurnOptions["chatImpl"];
   /** Codex v2 peer messaging hooks */
   peer?: ChildPeerHooks;
+  /**
+   * Parent permission-ask hook. When set with interactivePermissions,
+   * "ask" rules surface through this hook instead of auto-approving.
+   */
+  onPermission?: PermissionAskFn;
+  /**
+   * When true (default if no interactive path), "ask" rules become allow
+   * without prompting — static allow/deny only. Set false when a parent
+   * ask hook should handle execute/all children.
+   */
+  autoApprove?: boolean;
 }
 
 export async function runChildLoop(
@@ -57,6 +71,10 @@ export async function runChildLoop(
     if (idx >= 0) messages[idx] = { role: "system", content: opts.system };
   }
 
+  // Default: non-interactive static allow/deny (autoApprove converts ask→allow).
+  // Interactive only when caller opts in with a hook + autoApprove false.
+  const autoApprove = opts.autoApprove ?? true;
+
   const result = await runHeadlessTurn({
     provider: opts.provider,
     model: opts.model,
@@ -64,7 +82,8 @@ export async function runChildLoop(
     tools: true,
     toolsets: opts.toolsets,
     permissions: opts.permissions,
-    autoApprove: true,
+    autoApprove,
+    onPermission: autoApprove ? undefined : opts.onPermission,
     abortSignal: opts.signal,
     label: opts.label ?? "subagent",
     maxSteps: opts.maxRounds ?? MAX_CHILD_ROUNDS,

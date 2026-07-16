@@ -8,6 +8,7 @@
 import type {
   AgentPhase,
   DiffPart,
+  GoalUiSnapshot,
   HarnessState,
   Message,
   Part,
@@ -39,6 +40,7 @@ export type HarnessEvent =
   | { type: "draft"; text: string }
   | { type: "ui.toggle"; key: "showToolDetails" | "showThinking" | "compact" }
   | { type: "diff.append"; messageId: string; part: DiffPart }
+  | { type: "goal"; goal: GoalUiSnapshot | null }
   | { type: "error"; message: string };
 
 export type HarnessListener = (event: HarnessEvent, state: HarnessState) => void;
@@ -215,6 +217,9 @@ export function reduce(state: HarnessState, event: HarnessEvent): HarnessState {
             : m,
         ),
       };
+
+    case "goal":
+      return { ...state, goal: event.goal };
 
     case "error":
       return { ...state, phase: "error", activityLabel: event.message };

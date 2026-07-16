@@ -95,7 +95,17 @@ export function validateToolArgs(
 
   for (const key of required) {
     const v = args[key];
-    if (v === undefined || v === null || v === "") {
+    if (v === undefined || v === null) {
+      issues.push({
+        path: key,
+        message: `missing required parameter "${key}"`,
+        hint: hintForMissing(name, key, properties[key]),
+      });
+      continue;
+    }
+    // Empty string is missing for paths/ids/commands, but valid for body fields
+    // (write content="", search_replace new_string="" to clear text).
+    if (v === "" && !allowsEmptyString(name, key)) {
       issues.push({
         path: key,
         message: `missing required parameter "${key}"`,
@@ -292,16 +302,37 @@ function coerceValue(
   return value;
 }
 
+/**
+ * Required params that may legally be empty string after normalize.
+ * Path/command fields still treat "" as missing.
+ */
+function allowsEmptyString(tool: string, key: string): boolean {
+  const t = tool === "write_file" ? "write" : tool === "edit_file" ? "search_replace" : tool;
+  if ((t === "write" || t === "write_file") && (key === "content" || key === "contents")) {
+    return true;
+  }
+  if (
+    (t === "search_replace" || t === "edit_file") &&
+    key === "new_string"
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function hintForMissing(
   tool: string,
   key: string,
   prop?: Record<string, unknown>,
 ): string {
-  if (tool === "write" && key === "content") {
-    return 'Provide full file contents: {"file_path":"…","content":"…"}';
+  if ((tool === "write" || tool === "write_file") && key === "content") {
+    return 'Provide full file contents: {"file_path":"…","content":"…"}. Use content:"" only to create an empty file.';
   }
   if (tool === "search_replace" && key === "old_string") {
     return "Read the file first so old_string matches exactly.";
+  }
+  if (tool === "search_replace" && key === "new_string") {
+    return 'Provide replacement text (use "" to delete the matched old_string).';
   }
   if (prop?.description) return String(prop.description);
   return `Include "${key}" in the tool arguments.`;

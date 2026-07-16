@@ -164,6 +164,24 @@ export interface AgentThreadSummary {
   endedAt?: number;
 }
 
+/**
+ * Live goal badge for TUI chrome (grok-build goal status chip spirit).
+ * Owned by the goal orchestrator; mirrored into HarnessState for render.
+ */
+export interface GoalUiSnapshot {
+  objective: string;
+  status: string;
+  /** e.g. "Active — Verifying (2/8)" or "Paused" */
+  statusLine: string;
+  /** Footer chip e.g. "[Goal: Executing · 3m]" */
+  chip: string;
+  /** active | paused | done | error */
+  tone: "active" | "paused" | "done" | "error";
+  nextStep?: string;
+  planning?: boolean;
+  verifying?: boolean;
+}
+
 export interface HarnessState {
   session: SessionMeta;
   messages: Message[];
@@ -188,6 +206,8 @@ export interface HarnessState {
    * off or no subagent has spawned yet this session.
    */
   agents: AgentThreadSummary[];
+  /** Active / recent goal badge for chrome (null when no goal). */
+  goal?: GoalUiSnapshot | null;
 }
 
 export function createEmptyState(partial?: Partial<SessionMeta>): HarnessState {
@@ -211,6 +231,7 @@ export function createEmptyState(partial?: Partial<SessionMeta>): HarnessState {
     showThinking: true,
     compact: false,
     agents: [],
+    goal: null,
   };
 }
 

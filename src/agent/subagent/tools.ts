@@ -11,11 +11,13 @@ import {
 
 export const MULTI_AGENT_TOOL_NAMES = [
   "spawn_agent",
+  "spawn_agents_batch",
   "wait_agent",
   "send_input",
   "message_agent",
   "close_agent",
   "list_agents",
+  "get_agent_result",
 ] as const;
 
 export type MultiAgentToolName = (typeof MULTI_AGENT_TOOL_NAMES)[number];
@@ -60,18 +62,19 @@ export function buildMultiAgentTools(roles: ResolvedRole[]): OpenAITool[] {
       function: {
         name: "spawn_agent",
         description: [
-          "Spawn a specialized subagent.",
-          "Use for independent parallel work: deep reasoning (reason), exploration, review, tests, focused implementation.",
-          "Under Ultra, prefer agent_type=reason with reasoning_effort=max to extend thinking on hard sub-problems.",
-          "Returns agent_id immediately; the child runs in the background.",
+          "Spawn a specialized subagent that runs in an isolated background context.",
+          "Returns agent_id immediately; the child continues independently (non-blocking).",
+          "Cost: each child has its own context and tool rounds — only spawn when policy allows (see system multi-agent guidance).",
           "CRITICAL: Do NOT idle-wait after spawn. Keep doing other parent work (reads, edits, more spawns) while children run.",
           "Call wait_agent only when you need their summaries before your next decision — not immediately after every spawn.",
           "You may also rely on <subagent_completed> notices injected mid-turn.",
-          "Prefer: spawn several agents in one tool step (with any other independent tools), continue work, then wait once if needed.",
+          "When spawning multiple: prefer one tool step with several spawn_agent calls (plus any independent tools), continue work, then wait once if needed.",
+          "Under Ultra, agent_type=reason with reasoning_effort=max extends thinking on hard sub-problems.",
           "Peers can coordinate with message_agent (and children can message each other under Ultra).",
           "Resume a completed agent with resume_from=<agent_id> + a new message.",
           "Optional capability_mode: read-only | read-write | execute | all.",
           "Optional reasoning_effort applied to the child request.",
+          "Optional isolate_worktree: run workspace-write children in a git worktree (path reported; no auto-merge). Auto when ≥2 concurrent writers.",
           "",
           "Available agent_type values:",
           `- ${roleHelp}`,
@@ -119,8 +122,73 @@ export function buildMultiAgentTools(roles: ResolvedRole[]): OpenAITool[] {
               description:
                 "If true, include a short parent-context summary in the child prompt. Default false.",
             },
+            isolate_worktree: {
+              type: "boolean",
+              description:
+                "If true, run a workspace-write child in a fresh git worktree (path reported for manual review/merge; never auto-merged). Also auto-engages when ≥2 concurrent workspace-write children share the parent cwd.",
+            },
           },
           required: ["message"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "spawn_agents_batch",
+        description: [
+          "Fan out one uniform task over a list of items (CSV rows, paths, or strings).",
+          "Spawns one background child per item with exactly-once assignment — prefer this over N manual spawn_agent calls.",
+          "Each child message is message_template with {{item}} substituted (or the item alone if no template).",
+          "Returns agent_ids + item assignments immediately; children run in parallel (subject to max_threads).",
+          "Use wait_agent / get_agent_result / list_agents for durable reports.",
+        ].join("\n"),
+        parameters: {
+          type: "object",
+          properties: {
+            items: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "List of items (paths, CSV cells, ids). Exactly one child per item.",
+            },
+            csv_text: {
+              type: "string",
+              description:
+                "Alternative to items: CSV or newline-separated text (one item per line; commas split a single line into cells when no newlines).",
+            },
+            message: {
+              type: "string",
+              description:
+                "Task template. Use {{item}} or {item} as the per-item placeholder.",
+            },
+            message_template: {
+              type: "string",
+              description: "Alias for message (template with {{item}}).",
+            },
+            agent_type: {
+              type: "string",
+              description: `Role for every child. One of: ${roleIds.join(", ")}`,
+              enum: roleIds.length ? roleIds : undefined,
+            },
+            description: {
+              type: "string",
+              description: "Short label prefix for UI / logs",
+            },
+            model: { type: "string" },
+            reasoning_effort: { type: "string" },
+            capability_mode: {
+              type: "string",
+              enum: ["read-only", "read-write", "execute", "all"],
+            },
+            isolate_worktree: {
+              type: "boolean",
+              description:
+                "Isolate each workspace-write child in its own git worktree.",
+            },
+            fork_context: { type: "boolean" },
+          },
+          required: [],
         },
       },
     },
@@ -222,7 +290,7 @@ export function buildMultiAgentTools(roles: ResolvedRole[]): OpenAITool[] {
       function: {
         name: "list_agents",
         description:
-          "List subagent threads and their status (running / completed / failed / closed). Use before message_agent to pick peers.",
+          "List subagent threads and their status (running / completed / failed / closed). Use before message_agent to pick peers. Includes worktree_path when isolation is active.",
         parameters: {
           type: "object",
           properties: {
@@ -232,6 +300,27 @@ export function buildMultiAgentTools(roles: ResolvedRole[]): OpenAITool[] {
             },
           },
           required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_agent_result",
+        description: [
+          "Fetch a finished child's result by agent_id (mailbox-style get).",
+          "Use when wait_agent summaries were truncated or you need the full budgeted body for one agent.",
+          "Returns result capped at the child output budget; does not re-run the child.",
+        ].join("\n"),
+        parameters: {
+          type: "object",
+          properties: {
+            agent_id: {
+              type: "string",
+              description: "Agent id from spawn_agent / spawn_agents_batch / list_agents",
+            },
+          },
+          required: ["agent_id"],
         },
       },
     },
@@ -291,8 +380,9 @@ Do not dump raw tool logs to the user — summarize path:line findings.
 `
     : `
 # When to delegate
-Spawn subagents when the user asks for parallel agents, or when independent workstreams would clearly reduce context pollution.
-Spawn several in the background → keep parent work going → one wait_agent only when you need summaries.
+Spawn subagents only when the user explicitly asks for parallel or delegated work, or when workstreams are genuinely non-decomposable in a single pass.
+When in doubt, do it yourself.
+If you do spawn: several in the background → keep parent work going → one wait_agent only when you need summaries.
 Use message_agent for peer handoffs; resume_from / send_input for follow-ups.
 `;
 
@@ -301,22 +391,28 @@ Use message_agent for peer handoffs; resume_from / send_input for follow-ups.
 You coordinate specialized subagents. Each runs in an isolated context; summaries and peer messages return here.
 
 ## Tools
-- spawn_agent — start a child (returns agent_id immediately; runs in background). Supports reasoning_effort, capability_mode, resume_from.
+- spawn_agent — start a child (returns agent_id immediately; runs in background). Supports reasoning_effort, capability_mode, resume_from, isolate_worktree.
+- spawn_agents_batch — fan out one template over N items (CSV/list); one child per item, exactly-once assignment.
 - wait_agent — block until children finish; get summaries. Use sparingly — only when blocked without their output.
+- get_agent_result — fetch one finished child's full budgeted result by agent_id (when wait truncated).
 - message_agent — message any live agent by id (parent→child, child→child, child→root via "parent"/"root"); queue or resume
 - send_input — parent follow-up / resume a child (queued if still running)
 - close_agent — cancel and free a slot
-- list_agents — status overview (includes parent row + children)
+- list_agents — status overview (includes parent row + children; worktree_path when isolated)
 
 ## Parallelism (important)
 - spawn_agent is non-blocking. After spawn, continue useful parent work in the same turn.
 - Do not call wait_agent in the same breath as spawn unless you have nothing else to do.
 - Parent may receive mid-turn <subagent_completed> and <agent_message to="parent"> notices — incorporate them without re-spawning.
 - Prefer: spawn N (+ independent tools) → more parent work → one wait_agent if still needed.
+
+## Arena pattern
+When a problem is ambiguous and you want independent competing solutions: spawn **N agents of the same role** (same agent_type and similar message) on that one problem, let them finish in parallel, then **pick the best** result as parent. No special Arena mode — just multiple spawn_agent (or spawn_agents_batch) calls and a parent comparison. Example: three reason agents on an architecture choice; synthesize the strongest plan.
 ${peerNote}
 ## Limits
 - max concurrent threads: ${opts.maxThreads}
 - max spawn depth: ${opts.maxDepth} (children spawn only when depth remains)
+- workspace-write isolation: isolate_worktree or auto when ≥2 concurrent writers; review/merge worktree paths manually (no auto-merge)
 
 ## Roles
 ${roleLines}

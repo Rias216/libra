@@ -18,6 +18,7 @@ import { dbg, span } from "./debug.js";
 import { historyToMessages } from "./history.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { runStoreTurn, type TurnOptions } from "./turn.js";
+import type { SubagentRuntime } from "./subagent/runtime.js";
 
 export { buildSystemPrompt } from "./prompt.js";
 export {
@@ -89,20 +90,48 @@ export interface AgentLoopOptions {
     req: ChatRequest,
     handlers?: StreamHandlers,
   ) => Promise<ChatResult>;
+  /**
+   * Active goal orchestrator — registers update_goal tool dispatch and
+   * injects goal rules into the system prompt when present and active.
+   */
+  goalOrchestrator?: import("./goal/orchestrator.js").GoalOrchestrator | null;
+  /**
+   * Extra absolute roots for file tools (goal plan/scratch). Merged with
+   * goalOrchestrator.toolAllowedRoots() inside the turn runner.
+   */
+  allowedRoots?: string[];
 }
 
 export class AgentLoop {
   private busy = false;
   private abort = false;
+  /**
+   * Session-scoped multi-agent runtime — survives across handle() turns so
+   * children can run in the background and resume_from works next message.
+   */
+  private subRuntime: SubagentRuntime | null = null;
 
   constructor(private store: HarnessStore) {}
 
   cancel(): void {
     this.abort = true;
+    // Interrupt in-flight children for the active turn only
+    this.subRuntime?.cancelTurn();
   }
 
   get isBusy(): boolean {
     return this.busy;
+  }
+
+  /** Session-hoisted multi-agent runtime (null until first multi-agent turn). */
+  get subagentRuntime(): SubagentRuntime | null {
+    return this.subRuntime;
+  }
+
+  /** Drop session runtime (tests / hard reset). Cancels open children. */
+  resetSubagentRuntime(): void {
+    this.subRuntime?.cancelAll();
+    this.subRuntime = null;
   }
 
   async handle(userText: string, opts: AgentLoopOptions): Promise<void> {
@@ -165,11 +194,34 @@ export class AgentLoop {
         }
       }
 
+      // Inject goal rules when an active goal is bound to this turn
+      let systemPrompt = opts.systemPrompt;
+      const goalOrch = opts.goalOrchestrator;
+      if (goalOrch?.isActive()) {
+        const addon = goalOrch.buildGoalSystemAddon();
+        if (addon.trim()) {
+          if (!opts.systemPrompt) {
+            const { buildSystemPrompt } = await import("./prompt.js");
+            systemPrompt =
+              buildSystemPrompt({
+                model: opts.model,
+                provider: opts.provider,
+                cwd: opts.cwd,
+                profile: opts.promptProfile,
+              }) +
+              "\n\n" +
+              addon;
+          } else {
+            systemPrompt = opts.systemPrompt + "\n\n" + addon;
+          }
+        }
+      }
+
       const turnOpts: TurnOptions = {
         provider: opts.provider,
         model: opts.model,
         cwd: opts.cwd,
-        systemPrompt: opts.systemPrompt,
+        systemPrompt,
         tools: opts.tools,
         abortSignal: opts.abortSignal,
         seedReasoning:
@@ -188,6 +240,13 @@ export class AgentLoop {
         promptProfile: opts.promptProfile,
         slimTools: opts.slimTools,
         chatImpl: opts.chatImpl,
+        // Hoist SubagentRuntime across turns (review2 #1)
+        subagentRuntime: this.subRuntime,
+        adoptSubagentRuntime: (rt) => {
+          this.subRuntime = rt;
+        },
+        goalOrchestrator: goalOrch ?? null,
+        allowedRoots: opts.allowedRoots,
       };
 
       const result = await runStoreTurn(

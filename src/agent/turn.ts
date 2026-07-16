@@ -61,10 +61,12 @@ import { resolveEffortForModel } from "./reasoning.js";
 import { dbg, span } from "./debug.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { SubagentRuntime } from "./subagent/runtime.js";
+import { buildSubagentNoticeMessage } from "./subagent/types.js";
 import {
   buildMultiAgentSystemAddon,
   isMultiAgentTool,
 } from "./subagent/tools.js";
+import { isGoalTool } from "./goal/progress-tool.js";
 import { forceUltraReasoningExtension } from "./ultra-reason.js";
 import { getModelContextWindow } from "../auth/models.js";
 import { newId } from "../core/types.js";
@@ -88,6 +90,26 @@ export const COMPACT_TOKEN_BUDGET_CHILD = 40_000;
 export const DOOM_FORCE_ANSWER_AFTER = 2;
 /** Stuck progress waves before force-answer. */
 export const STUCK_FORCE_ANSWER_AFTER = 2;
+
+/** Merge optional allowed-root lists (cwd is always separate). */
+export function mergeAllowedRoots(
+  ...lists: Array<string[] | null | undefined>
+): string[] | undefined {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const list of lists) {
+    if (!list) continue;
+    for (const r of list) {
+      if (!r?.trim()) continue;
+      const key =
+        process.platform === "win32" ? r.trim().toLowerCase() : r.trim();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(r.trim());
+    }
+  }
+  return out.length ? out : undefined;
+}
 
 /**
  * Injected on the final step (both parent and child) when tools would
@@ -145,6 +167,26 @@ export interface TurnOptions {
   customDispatch?: (
     call: DispatchCall,
   ) => Promise<{ ok: boolean; output: string; durationMs?: number }>;
+  /**
+   * Session-scoped multi-agent runtime. When provided, threads and finished
+   * children survive across parent turns (resume_from / background work).
+   * When omitted, a fresh runtime is created for this turn only.
+   */
+  subagentRuntime?: SubagentRuntime | null;
+  /**
+   * Called when runStoreTurn creates a new SubagentRuntime so the session
+   * owner (AgentLoop) can hoist and reuse it.
+   */
+  adoptSubagentRuntime?: (rt: SubagentRuntime) => void;
+  /**
+   * Active goal orchestrator for update_goal tool dispatch.
+   */
+  goalOrchestrator?: import("./goal/orchestrator.js").GoalOrchestrator | null;
+  /**
+   * Extra absolute roots tools may read/write (goal plan dir, scratch, …).
+   * Merged with goalOrchestrator.toolAllowedRoots() when both present.
+   */
+  allowedRoots?: string[];
 }
 
 export interface TurnResult {
@@ -837,6 +879,10 @@ export async function runStoreTurn(
   const label = opts.label ?? "agent";
   const maxSteps = opts.maxSteps ?? MAX_STEPS;
   const toolCache = new Map<string, string>();
+  const allowedRoots = mergeAllowedRoots(
+    opts.allowedRoots,
+    opts.goalOrchestrator?.toolAllowedRoots?.() ?? null,
+  );
   const runner = new ToolRunner(cwd, {
     signal: opts.abortSignal,
     permissions: opts.permissions,
@@ -844,6 +890,7 @@ export async function runStoreTurn(
     autoApprove: opts.autoApprove,
     toolsets: opts.toolsets,
     cache: toolCache,
+    allowedRoots,
   });
   const runtime = new ToolCallRuntime(runner);
 
@@ -851,28 +898,51 @@ export async function runStoreTurn(
     opts.subagents !== false &&
     settings.subagents.enabled &&
     opts.tools !== false;
-  const subRuntime = multiAgentOn
-    ? new SubagentRuntime({
+  const parentContextSummary =
+    [...ctx.store.state.messages]
+      .reverse()
+      .find((m) => m.role === "user")
+      ?.parts.filter((p) => p.type === "text")
+      .map((p) => (p.type === "text" ? p.content : ""))
+      .join("\n")
+      .slice(0, 2000) ?? "";
+
+  let subRuntime: SubagentRuntime | null = multiAgentOn
+    ? (opts.subagentRuntime ?? null)
+    : null;
+  if (multiAgentOn) {
+    if (subRuntime) {
+      // Session-hoisted: rebind turn-scoped deps; keep threads Map alive.
+      subRuntime.rebind({
+        parentProvider: opts.provider,
+        parentModel: opts.model,
+        cwd,
+        config: settings.subagents,
+        parentContextSummary,
+        signal: opts.abortSignal,
+        preferredModelKey: settings.subagents.preferredModelKey,
+        chatImpl: opts.chatImpl,
+        onPermission: opts.onPermission,
+      });
+    } else {
+      subRuntime = new SubagentRuntime({
         parentProvider: opts.provider,
         parentModel: opts.model,
         cwd,
         depth: 0,
         config: settings.subagents,
-        parentContextSummary:
-          [...ctx.store.state.messages]
-            .reverse()
-            .find((m) => m.role === "user")
-            ?.parts.filter((p) => p.type === "text")
-            .map((p) => (p.type === "text" ? p.content : ""))
-            .join("\n")
-            .slice(0, 2000) ?? "",
+        parentContextSummary,
         signal: opts.abortSignal,
         preferredModelKey: settings.subagents.preferredModelKey,
-        // Tests inject chatImpl for parent + forced Ultra reasoners
         chatImpl: opts.chatImpl,
-      })
-    : null;
+        onPermission: opts.onPermission,
+      });
+      opts.adoptSubagentRuntime?.(subRuntime);
+    }
+  }
   const turnId = subRuntime?.beginTurn();
+  /** True when runtime is session-scoped (must not cancel children on normal end). */
+  const sessionScoped = Boolean(opts.subagentRuntime || opts.adoptSubagentRuntime);
 
   const isUltra = settings.reasoning.custom === "ultra";
   const isUltraFusion = settings.reasoning.custom === "ultra-fusion";
@@ -1086,8 +1156,20 @@ export async function runStoreTurn(
             },
           );
         },
-        isCustomTool: (name) => isMultiAgentTool(name),
+        isCustomTool: (name) =>
+          isMultiAgentTool(name) ||
+          (Boolean(opts.goalOrchestrator) && isGoalTool(name)),
         customDispatch: async (call) => {
+          if (opts.goalOrchestrator && isGoalTool(call.name)) {
+            ctx.store.setPhase("tool", "update_goal");
+            const t0 = Date.now();
+            const r = opts.goalOrchestrator.handleProgressTool(call.args);
+            return {
+              ok: r.ok,
+              output: r.output,
+              durationMs: Date.now() - t0,
+            };
+          }
           if (!subRuntime) {
             return {
               ok: false,
@@ -1106,9 +1188,21 @@ export async function runStoreTurn(
       },
     });
   } finally {
-    // Cancel only agents tagged to this parent turn
-    if (turnId) subRuntime?.cancelTurn(turnId);
-    else subRuntime?.cancelTurn();
+    // Session-scoped runtime: only cancel when the turn was aborted/interrupted.
+    // Normal completion leaves children running so resume_from and background
+    // work survive across parent messages (review2 #1).
+    const aborted =
+      opts.abortSignal?.aborted === true ||
+      (typeof ctx.abort === "function" && ctx.abort());
+    if (aborted) {
+      if (turnId) subRuntime?.cancelTurn(turnId);
+      else subRuntime?.cancelTurn();
+    } else if (!sessionScoped) {
+      // Ephemeral (no hoist): keep prior test isolation — cancel this turn's kids.
+      if (turnId) subRuntime?.cancelTurn(turnId);
+      else subRuntime?.cancelTurn();
+    }
+    // else: session-scoped + normal end → leave threads intact
   }
 }
 
@@ -1121,12 +1215,21 @@ export async function runHeadlessTurn(
   const cwd = opts.cwd ?? process.cwd();
   const label = opts.label ?? "subagent";
   const maxSteps = opts.maxSteps ?? DEFAULT_CHILD_MAX_STEPS;
+  // Default autoApprove true (static allow/deny) unless caller opts into
+  // interactive ask via autoApprove:false + onPermission (execute/all children).
+  const autoApprove = opts.autoApprove ?? true;
+  const allowedRoots = mergeAllowedRoots(
+    opts.allowedRoots,
+    opts.goalOrchestrator?.toolAllowedRoots?.() ?? null,
+  );
   const runner = new ToolRunner(cwd, {
     headless: true,
-    autoApprove: true,
+    autoApprove,
+    ask: autoApprove ? undefined : opts.onPermission,
     permissions: opts.permissions,
     toolsets: opts.toolsets,
     signal: opts.abortSignal,
+    allowedRoots,
   });
   const runtime = new ToolCallRuntime(runner);
   // If caller did not inject a system message, build one with profile.
@@ -1216,7 +1319,7 @@ function mergeToolSchemas(
 
 /**
  * Append deduped subagent completion + parent-mailbox notices as a
- * system-reminder user turn (Grok completions + Codex v2 child→root).
+ * system-role reminder (never user — avoids fake user turns).
  */
 function maybeInjectSubagentNotices(
   messages: ChatMessage[],
@@ -1225,18 +1328,8 @@ function maybeInjectSubagentNotices(
   if (!drain) return;
   const text = drain()?.trim();
   if (!text) return;
-  const hasMail = text.includes("<agent_message");
-  const hasDone = text.includes("<subagent_completed");
-  const label =
-    hasMail && hasDone
-      ? "Subagent updates since last notice (completions + parent mailbox):"
-      : hasMail
-        ? "Parent mailbox messages since last notice:"
-        : "Subagent(s) finished since last notice:";
-  messages.push({
-    role: "user",
-    content: `<system-reminder>\n${label}\n\n${text}\n</system-reminder>`,
-  });
+  const msg = buildSubagentNoticeMessage(text);
+  if (msg) messages.push(msg);
 }
 
 /** Detect thrashing: repeated fail fingerprints or identical error text. */

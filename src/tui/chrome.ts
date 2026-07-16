@@ -295,7 +295,7 @@ export function renderStatus(
 ): Row {
   const phase = state.phase;
   let phaseText: string;
-  let phaseStyle = { fg: theme.fgMuted };
+  let phaseStyle: { fg: Rgb } = { fg: theme.fgMuted };
 
   if (phase === "idle") {
     phaseText = state.activityLabel?.trim() || "ready";
@@ -311,6 +311,9 @@ export function renderStatus(
     phaseStyle = { fg: theme.spinner };
   }
 
+  // Grok-style goal chip: `[Goal: Executing · 3m]`
+  const goalChip = formatGoalStatusChip(state, theme, tick);
+
   const mode = reasoningModeDisplay(state);
   const focusHint = focus === "prompt" ? "PROMPT" : "SCROLL";
   const scroll = extra?.scroll ? `  |  ${extra.scroll}` : "";
@@ -322,14 +325,25 @@ export function renderStatus(
         ? "wheel scroll  enter send  ctrl+e fold  drag=copy"
         : "wheel scroll  tab prompt  ctrl+e fold";
 
-  const left = phaseText;
-  const mid = `  |  ${focusHint}${scroll}`;
-  const segs: Row["segments"] = [
-    { text: left, style: phaseStyle },
-    { text: mid, style: { fg: theme.fgFaint } },
-  ];
+  const segs: Row["segments"] = [];
+  if (goalChip && phase === "idle" && !state.activityLabel?.trim()) {
+    // Goal owns the left when idle+ready — chip is the status
+    segs.push({ text: goalChip.text, style: { fg: goalChip.fg, bold: true } });
+  } else {
+    segs.push({ text: phaseText, style: phaseStyle });
+    if (goalChip) {
+      segs.push({ text: "  ", style: {} });
+      segs.push({
+        text: goalChip.text,
+        style: { fg: goalChip.fg, bold: true },
+      });
+    }
+  }
 
-  const used = stringWidth(left + mid);
+  const mid = `  |  ${focusHint}${scroll}`;
+  segs.push({ text: mid, style: { fg: theme.fgFaint } });
+
+  const used = segs.reduce((n, s) => n + stringWidth(s.text), 0);
   const room = width - used - 1;
   if (room > 8) {
     const glowSegs = mode
@@ -356,6 +370,30 @@ export function renderStatus(
   }
 
   return { segments: segs };
+}
+
+/** Compact goal chip for the status bar (grok `[Goal: …]` spirit). */
+export function formatGoalStatusChip(
+  state: HarnessState,
+  theme: Theme,
+  tick: number,
+): { text: string; fg: Rgb } | null {
+  const g = state.goal;
+  if (!g?.chip) return null;
+  let text = g.chip;
+  // Active goals get a braille spinner when the phase bar is idle
+  if (g.tone === "active" && state.phase === "idle") {
+    text = `${spinnerFrame(tick)} ${text}`;
+  }
+  const fg: Rgb =
+    g.tone === "active"
+      ? theme.success
+      : g.tone === "done"
+        ? theme.success
+        : g.tone === "error"
+          ? theme.error
+          : theme.warn;
+  return { text, fg };
 }
 
 /** Status-bar reasoning mode: harness profile or native effort. */

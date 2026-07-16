@@ -97,6 +97,10 @@ export class ToolRunner {
     this.executor.setSignal(signal);
   }
 
+  setAllowedRoots(roots: string[] | undefined): void {
+    this.executor.setAllowedRoots(roots);
+  }
+
   setAsk(fn: PermissionAskFn | undefined): void {
     this.permissions.setAskFn(fn);
   }

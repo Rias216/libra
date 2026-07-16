@@ -76,6 +76,9 @@ export function canonicalToolName(name: string): string {
       return "web_fetch";
     case "todowrite":
       return "todo_write";
+    case "updategoal":
+    case "goal_update":
+      return "update_goal";
     default:
       return name;
   }
@@ -85,14 +88,37 @@ export function canonicalToolName(name: string): string {
  * Fill defaults / normalize paths and catalog ↔ native arg aliases so
  * `{}` and `{target_directory:"."}` / `{path:"."}` hash the same for list_dir.
  */
+/**
+ * Body fields where empty string is a legitimate value and must be preserved.
+ * Stripping these made `write({content:""})` and `search_replace({new_string:""})`
+ * fail validation as "missing required" (live C-markdown-lint bench).
+ */
+const PRESERVE_EMPTY_STRING = new Set([
+  "content",
+  "contents",
+  "new_string",
+  "body",
+  "text",
+  "data",
+  "message",
+  "input",
+]);
+
 export function normalizeToolArgs(
   name: string,
   args: Record<string, unknown>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...args };
-  // Drop undefined / empty-string noise
+  // Drop undefined always. Drop empty-string path/id noise, but keep body
+  // fields so empty files and empty replacements remain valid.
   for (const k of Object.keys(out)) {
-    if (out[k] === undefined || out[k] === "") delete out[k];
+    if (out[k] === undefined) {
+      delete out[k];
+      continue;
+    }
+    if (out[k] === "" && !PRESERVE_EMPTY_STRING.has(k)) {
+      delete out[k];
+    }
   }
 
   const canon = canonicalToolName(name);
@@ -128,6 +154,19 @@ export function normalizeToolArgs(
       if (out.path != null && out.file_path == null) {
         out.file_path = out.path;
         delete out.path;
+      }
+      // Common model aliases for file body
+      if (out.content == null && out.contents != null) {
+        out.content = out.contents;
+        delete out.contents;
+      }
+      if (out.content == null && typeof out.body === "string") {
+        out.content = out.body;
+        delete out.body;
+      }
+      if (out.content == null && typeof out.text === "string") {
+        out.content = out.text;
+        delete out.text;
       }
       break;
     }

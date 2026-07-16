@@ -106,7 +106,11 @@ export const OPENAI_TOOLS: OpenAITool[] = [
         type: "object",
         properties: {
           file_path: { type: "string", description: "Path relative to workspace" },
-          content: { type: "string", description: "Full new file contents" },
+          content: {
+            type: "string",
+            description:
+              "Full new file contents (required; use empty string \"\" only to create an empty file)",
+          },
         },
         required: ["file_path", "content"],
       },
@@ -126,6 +130,7 @@ export const OPENAI_TOOLS: OpenAITool[] = [
         "- When copying from a numbered read_file result, do NOT include the LINE_NUMBER→ prefix — only the text after →. (The harness also strips pasted N→ prefixes defensively.)",
         "- If old_string matches multiple times, the tool FAILS unless replace_all=true — include more context to make it unique.",
         "- Use replace_all when renaming a symbol across the whole file.",
+        "- new_string may be \"\" to delete the matched text.",
         "- Fails if old_string is missing or ambiguous (multiple matches without replace_all). On failure, re-read with read_file before retrying.",
       ].join("\n"),
       parameters: {
@@ -133,7 +138,10 @@ export const OPENAI_TOOLS: OpenAITool[] = [
         properties: {
           file_path: { type: "string" },
           old_string: { type: "string", description: "Exact text to find" },
-          new_string: { type: "string", description: "Replacement text" },
+          new_string: {
+            type: "string",
+            description: 'Replacement text (use "" to delete the match)',
+          },
           replace_all: {
             type: "boolean",
             description: "Replace every occurrence (default false = first only)",
@@ -371,6 +379,46 @@ export const OPENAI_TOOLS: OpenAITool[] = [
           },
         },
         // Prefer items; todos accepted at runtime if items omitted
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_goal",
+      description: [
+        "Report progress on the active goal. Use to log a status message,",
+        "mark the goal completed, or flag that you're blocked.",
+        "",
+        "Usage notes:",
+        "- Set completed: true ONLY when the goal is fully achieved. This does NOT",
+        "  end the goal on the model's word alone — the harness runs adversarial",
+        "  verification against the plan's acceptance criteria first.",
+        "- Use message for progress notes or a completion summary.",
+        "- Set blocked_reason only when truly stuck after multiple failed attempts",
+        "  (FAILURE signal — never put success text there).",
+        "- Only available while a /goal is active.",
+      ].join("\n"),
+      parameters: {
+        type: "object",
+        properties: {
+          completed: {
+            type: "boolean",
+            description:
+              "Set true only when fully achieved; harness verifies before completing.",
+          },
+          message: {
+            type: "string",
+            description:
+              "Optional progress note or completion summary.",
+          },
+          blocked_reason: {
+            type: "string",
+            description:
+              "Pause the goal as blocked when truly stuck (not for success).",
+          },
+        },
         required: [],
       },
     },

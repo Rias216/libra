@@ -13,3 +13,4 @@ export * from "./history.js";
 export * from "./turn.js";
 export * from "./compaction.js";
 export * from "./thought-loop.js";
+export * from "./goal/index.js";

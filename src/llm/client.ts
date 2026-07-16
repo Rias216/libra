@@ -1031,10 +1031,16 @@ async function chatOpenAI(
     body.tools = limitToolsForModel(req.tools, caps);
     body.tool_choice = req.tool_choice ?? "auto";
   }
-  // Never impose a max_tokens ceiling — omit unless the caller set one explicitly.
+  // Never impose a max_tokens ceiling by default — omit unless the caller
+  // (or LIBRA_MAX_TOKENS env, e.g. OpenRouter credit-budget runs) set one.
   // Reasoning depth is controlled only via native effort API fields.
   if (req.max_tokens != null && req.max_tokens > 0) {
     body.max_tokens = req.max_tokens;
+  } else {
+    const envMax = Number(process.env.LIBRA_MAX_TOKENS);
+    if (Number.isFinite(envMax) && envMax > 0) {
+      body.max_tokens = Math.floor(envMax);
+    }
   }
 
   // Native reasoning control (per-model capabilities) — not prompt text.

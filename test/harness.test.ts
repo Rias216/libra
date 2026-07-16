@@ -6,7 +6,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -67,6 +67,14 @@ import { HarnessStore } from "../src/core/store.js";
 import { ToolRunner } from "../src/toolcalling/runner.js";
 import { ToolCallRuntime } from "../src/toolcalling/runtime.js";
 import type { OpenAITool } from "../src/toolcalling/schema.js";
+import {
+  normalizeToolArgs,
+  toolFingerprint,
+} from "../src/toolcalling/normalize.js";
+import {
+  validateToolArgs,
+  formatValidationError,
+} from "../src/toolcalling/validate.js";
 import {
   prepareShellCommand,
   rewriteNodePackageBins,
@@ -323,20 +331,22 @@ test("resolvePromptPackId slim override wins; pack force works", () => {
   );
 });
 
-test("every prompt pack is product-neutral (no brand identity)", async () => {
-  const { listPromptPackIds, getPromptPack, NO_PRODUCT_IDENTITY } =
+test("every prompt pack identifies as Libra (not Codex/Claude/Cursor)", async () => {
+  const { listPromptPackIds, getPromptPack, LIBRA_IDENTITY } =
     await import("../src/agent/prompts/packs.js");
-  assert.match(NO_PRODUCT_IDENTITY, /Do not claim any product name/i);
+  assert.match(LIBRA_IDENTITY, /You are \*\*Libra\*\*/i);
+  assert.match(LIBRA_IDENTITY, /Never claim to be Codex CLI/i);
   for (const id of listPromptPackIds()) {
     const pack = getPromptPack(id);
     assert.match(
       pack,
-      /Do not claim any product name/i,
-      `pack ${id} missing anti-branding line`,
+      /You are \*\*Libra\*\*/i,
+      `pack ${id} missing Libra identity`,
     );
-    assert.ok(
-      !/\bYou are \*\*Libra\*\*/i.test(pack),
-      `pack ${id} must not brand as Libra`,
+    assert.match(
+      pack,
+      /Never claim to be Codex CLI/i,
+      `pack ${id} missing anti-Codex line`,
     );
     assert.ok(
       !/\bYou are (the )?Codex CLI\b/i.test(pack),
@@ -348,8 +358,8 @@ test("every prompt pack is product-neutral (no brand identity)", async () => {
     model: "gpt-5.3-codex",
     skipProjectInstructions: true,
   });
-  assert.match(codex, /Do not claim any product name/i);
-  assert.ok(!/Product: Libra/i.test(codex));
+  assert.match(codex, /You are \*\*Libra\*\*/i);
+  assert.match(codex, /Never claim to be Codex CLI/i);
   assert.match(codex, /Active model: gpt-5\.3-codex/i);
 });
 
@@ -369,10 +379,9 @@ test("buildSystemPrompt non-empty + project inject/skip", () => {
     assert.match(withProj, /Project instructions/);
     assert.match(withProj, /Always use tabs/);
     assert.match(withProj, /gpt-4o/);
-    // Product-neutral: no brand identity
-    assert.match(withProj, /Do not claim any product name/i);
-    assert.ok(!/\bYou are \*\*Libra\*\*/i.test(withProj));
-    assert.ok(!/Product: Libra/i.test(withProj));
+    // Libra product identity (session friction D1)
+    assert.match(withProj, /You are \*\*Libra\*\*/i);
+    assert.match(withProj, /Never claim to be Codex CLI/i);
 
     const skip = buildSystemPrompt({
       provider: "openai",
@@ -392,6 +401,7 @@ test("buildSystemPrompt non-empty + project inject/skip", () => {
     assert.ok(slim.length > 40);
     assert.ok(slim.length < withProj.length);
     assert.equal(resolvePromptPackId({ profile: "slim" }), "slim");
+    assert.match(slim, /You are \*\*Libra\*\*/i);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1306,6 +1316,7 @@ test("self-review verify format + ship-gate helpers", async () => {
   const {
     formatVerifyFailure,
     SELF_REVIEW_MAX_FIX_ROUNDS,
+    decideSelfReviewShipGate,
   } = await import("../src/agent/self-review-verify.js");
   const { buildSelfReviewFixPrompt } = await import(
     "../src/agent/self-review.js"
@@ -1330,6 +1341,23 @@ test("self-review verify format + ship-gate helpers", async () => {
   });
   assert.match(fix, /VERIFY FAILED|verify FAILED/i);
   assert.match(fix, /typecheck/);
+
+  // Ship gate: red verify must not allow agent_done / success path
+  const red = decideSelfReviewShipGate({
+    verifyOk: false,
+    backupId: "backup-test",
+  });
+  assert.equal(red.maySignalAgentDone, false);
+  assert.equal(red.exitResult, "agent_failed");
+  assert.equal(red.userStatusLevel, "warn");
+  assert.match(red.userMessage, /still red/i);
+  assert.ok(!/ship gate passed/i.test(red.userMessage));
+
+  const green = decideSelfReviewShipGate({ verifyOk: true });
+  assert.equal(green.maySignalAgentDone, true);
+  assert.equal(green.exitResult, "agent_done");
+  assert.equal(green.userStatusLevel, "success");
+  assert.match(green.userMessage, /ship gate passed/i);
 });
 
 test("self-review handoff write + resume path resolve", async () => {
@@ -1536,6 +1564,204 @@ test("self-review backup + restore round-trip", async () => {
 
   rmSync(root, { recursive: true, force: true });
   delete process.env.LIBRA_SELF_REVIEW_BACKUPS;
+});
+
+// ─── Tool arg normalize/validate (live C-mdlint residual) ───────────
+
+test("write content:\"\" is valid empty file via ToolRunner", async () => {
+  const dir = join(tmpdir(), `libra-empty-write-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  try {
+    const runner = new ToolRunner(dir, { autoApprove: true });
+    // Pure helpers first (shipped entry points)
+    const norm = normalizeToolArgs("write", {
+      file_path: "empty.txt",
+      content: "",
+    });
+    assert.equal(norm.content, "");
+    assert.equal("content" in norm, true);
+    const val = validateToolArgs("write", norm);
+    assert.equal(val.ok, true, formatValidationError("write", val));
+
+    const r = await runner.run("write", {
+      file_path: "empty.txt",
+      content: "",
+    });
+    assert.equal(r.ok, true, r.output);
+    assert.equal(r.invalid, undefined);
+    assert.equal(existsSync(join(dir, "empty.txt")), true);
+    assert.equal(readFileSync(join(dir, "empty.txt"), "utf8"), "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write contents alias maps to content and executes", async () => {
+  const dir = join(tmpdir(), `libra-contents-alias-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  try {
+    const runner = new ToolRunner(dir, { autoApprove: true });
+    const norm = normalizeToolArgs("write", {
+      file_path: "via-alias.txt",
+      contents: "hello-alias",
+    });
+    assert.equal(norm.content, "hello-alias");
+    assert.equal(norm.contents, undefined);
+    const r = await runner.run("write", {
+      file_path: "via-alias.txt",
+      contents: "hello-alias",
+    });
+    assert.equal(r.ok, true, r.output);
+    assert.equal(readFileSync(join(dir, "via-alias.txt"), "utf8"), "hello-alias");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("search_replace new_string:\"\" deletes match via ToolRunner", async () => {
+  const dir = join(tmpdir(), `libra-empty-repl-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "a.txt"), "hello world", "utf8");
+  try {
+    const runner = new ToolRunner(dir, { autoApprove: true });
+    const norm = normalizeToolArgs("search_replace", {
+      file_path: "a.txt",
+      old_string: " world",
+      new_string: "",
+    });
+    assert.equal(norm.new_string, "");
+    const val = validateToolArgs("search_replace", norm);
+    assert.equal(val.ok, true, formatValidationError("search_replace", val));
+
+    const r = await runner.run("search_replace", {
+      file_path: "a.txt",
+      old_string: " world",
+      new_string: "",
+    });
+    assert.equal(r.ok, true, r.output);
+    assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "hello");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write still rejects truly missing content with invalid_args", async () => {
+  const dir = join(tmpdir(), `libra-missing-content-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  try {
+    const runner = new ToolRunner(dir, { autoApprove: true });
+    const r = await runner.run("write", { file_path: "nope.txt" });
+    assert.equal(r.ok, false);
+    assert.equal(r.invalid, true);
+    assert.equal(r.code, "invalid_args");
+    assert.match(r.output, /missing required parameter "content"/i);
+    assert.equal(existsSync(join(dir, "nope.txt")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("empty vs missing content fingerprints differ", () => {
+  const empty = toolFingerprint("write", {
+    file_path: "x.txt",
+    content: "",
+  });
+  const missing = toolFingerprint("write", { file_path: "x.txt" });
+  assert.notEqual(empty, missing);
+  assert.match(empty, /content/);
+});
+
+// ─── Sprint-1 P0: process wait, subagent notice, wait partial ───────
+
+test("process wait: still-running server is ok (not hard failure)", async () => {
+  const {
+    processAction,
+    startBackground,
+    classifyProcessWaitOutcome,
+    _resetProcessSessions,
+  } = await import("../src/toolcalling/process.js");
+
+  // Pure classifier first
+  const pure = classifyProcessWaitOutcome(
+    {
+      id: "proc_test",
+      command: "python -m http.server",
+      pid: 123,
+      running: true,
+      startedAt: Date.now() - 1000,
+      stdout: "Serving HTTP",
+      stderr: "",
+    },
+    { waited_ms: 2000, timeout_ms: 2000 },
+  );
+  assert.equal(pure.ok, true, "still-running must be ok:true");
+  assert.equal(pure.still_running, true);
+  assert.equal(pure.timed_out, true);
+  assert.equal(pure.exited, false);
+  assert.match(String(pure.hint ?? ""), /still running/i);
+
+  const pureDone = classifyProcessWaitOutcome({
+    id: "proc_done",
+    command: "echo hi",
+    pid: 1,
+    running: false,
+    startedAt: Date.now() - 100,
+    endedAt: Date.now(),
+    exitCode: 0,
+    stdout: "hi",
+    stderr: "",
+  });
+  assert.equal(pureDone.ok, true);
+  assert.equal(pureDone.still_running, false);
+  assert.equal(pureDone.exited, true);
+
+  // Live shipped path: background process + wait timeout while still up
+  _resetProcessSessions();
+  try {
+    // Sleep long enough that a short wait window times out while running.
+    // Windows: ping -n delays; use node -e for cross-platform.
+    const cmd =
+      process.platform === "win32"
+        ? `node -e "setTimeout(()=>{}, 15000)"`
+        : `node -e "setTimeout(()=>{}, 15000)"`;
+    const session = startBackground(cmd, process.cwd(), true);
+    const waited = await processAction("wait", {
+      session_id: session.id,
+      timeout_ms: 400,
+    });
+    assert.equal(waited.ok, true, JSON.stringify(waited));
+    assert.equal(waited.still_running, true);
+    assert.equal(waited.timed_out, true);
+    assert.equal(waited.running, true);
+    // Kill so we don't leak
+    await processAction("kill", { session_id: session.id });
+  } finally {
+    _resetProcessSessions();
+  }
+});
+
+test("buildSubagentNoticeMessage uses system role (never user)", async () => {
+  const { buildSubagentNoticeMessage, formatCompletionNotices } =
+    await import("../src/agent/subagent/types.js");
+
+  assert.equal(buildSubagentNoticeMessage(""), null);
+  assert.equal(buildSubagentNoticeMessage("   "), null);
+
+  const body = formatCompletionNotices([
+    {
+      id: "agent_1",
+      agentType: "explorer",
+      status: "completed",
+      resultPreview: "found three bugs",
+    },
+  ]);
+  const msg = buildSubagentNoticeMessage(body);
+  assert.ok(msg);
+  assert.equal(msg!.role, "system");
+  assert.notEqual(msg!.role, "user");
+  assert.match(msg!.content, /system-reminder/);
+  assert.match(msg!.content, /subagent_completed/);
+  assert.match(msg!.content, /found three bugs/);
 });
 
 // ─── runner ─────────────────────────────────────────────────────────

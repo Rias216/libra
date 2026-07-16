@@ -51,6 +51,39 @@ export interface AgentThread {
   inbox?: Array<{ from: string; message: string; at: number }>;
   /** Cap auto-resume chains from peer inbox (prevent loops). */
   peerChainCount?: number;
+  /**
+   * Effective cwd for child tools (worktree path when isolated, else parent cwd).
+   */
+  cwd?: string;
+  /** Git worktree path when isolation engaged (manual review/merge — no auto-merge). */
+  worktreePath?: string;
+  /** Branch created for the worktree (if any). */
+  worktreeBranch?: string;
+  /** Item key when spawned via batch fan-out (exactly-once assignment). */
+  batchItem?: string;
+  /** Accumulated child token usage (from runChildLoop). */
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+  };
+  /** Parsed ### Summary handoff (when child followed structured contract). */
+  handoffSummary?: string;
+  /** How many automatic retries were used for transient failures. */
+  retries?: number;
+}
+
+/**
+ * Extract a structured ### Summary handoff block from child result text.
+ * Returns undefined when the child did not include the convention.
+ */
+export function extractHandoffSummary(text: string | undefined): string | undefined {
+  if (!text?.trim()) return undefined;
+  const m = text.match(
+    /###\s*Summary\s*\r?\n([\s\S]*?)(?=\r?\n###\s|\r?\nTo continue this agent|$)/i,
+  );
+  const body = m?.[1]?.trim();
+  if (!body) return undefined;
+  return body.slice(0, 1200);
 }
 
 export interface MessageAgentArgs {
@@ -84,6 +117,40 @@ export interface SpawnAgentArgs {
    * message as the new user turn. Soft-ignores model override on resume.
    */
   resume_from?: string;
+  /**
+   * Opt-in: run this workspace-write child in a fresh git worktree.
+   * Also auto-triggers when ≥2 concurrent workspace-write children share cwd.
+   * Path is reported for manual review/merge — never auto-merged.
+   */
+  isolate_worktree?: boolean;
+}
+
+/** Uniform per-item fan-out (spawn_agents_on_csv spirit). */
+export interface SpawnAgentsBatchArgs {
+  /**
+   * Items to assign exactly once — array of strings, or a single CSV /
+   * newline-separated string. Each item becomes one child.
+   */
+  items?: string[] | string;
+  /** Alias for items as raw CSV / newline text. */
+  csv_text?: string;
+  /**
+   * Task template. Use `{{item}}` (or `{item}`) as the per-item placeholder.
+   * If omitted, the item string is the full message.
+   */
+  message?: string;
+  message_template?: string;
+  agent_type?: string;
+  description?: string;
+  model?: string;
+  reasoning_effort?: string;
+  capability_mode?: CapabilityMode | string;
+  isolate_worktree?: boolean;
+  fork_context?: boolean;
+}
+
+export interface GetAgentResultArgs {
+  agent_id: string;
 }
 
 export interface WaitAgentArgs {
@@ -170,6 +237,31 @@ export function formatCompletionNotices(
       ].join("\n");
     })
     .join("\n\n");
+}
+
+/**
+ * Build the mid-turn subagent notice message for the parent wire.
+ * Always uses role **system** — never user — so completions are not
+ * mistaken for user turns (session friction B2).
+ */
+export function buildSubagentNoticeMessage(rawDrainText: string): {
+  role: "system";
+  content: string;
+} | null {
+  const text = rawDrainText?.trim();
+  if (!text) return null;
+  const hasMail = text.includes("<agent_message");
+  const hasDone = text.includes("<subagent_completed");
+  const label =
+    hasMail && hasDone
+      ? "Subagent updates since last notice (completions + parent mailbox):"
+      : hasMail
+        ? "Parent mailbox messages since last notice:"
+        : "Subagent(s) finished since last notice:";
+  return {
+    role: "system",
+    content: `<system-reminder>\n${label}\n\n${text}\n</system-reminder>`,
+  };
 }
 
 /**

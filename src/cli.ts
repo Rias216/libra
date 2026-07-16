@@ -97,6 +97,7 @@ import {
   type SelfReviewHandoff,
 } from "./agent/self-review-handoff.js";
 import {
+  decideSelfReviewShipGate,
   formatVerifyFailure,
   SELF_REVIEW_MAX_FIX_ROUNDS,
   verifyLibraInstall,
@@ -111,6 +112,17 @@ import {
   sessionLibePath,
 } from "./memory/session-store.js";
 import { getVersion } from "./version.js";
+import {
+  GoalOrchestrator,
+  goalCreateStatusSuffix,
+  pauseGoalAwaitingAuth,
+  prepareGoalContinue,
+  rebindGoalSpawners,
+  resolveGoalSpawnerContext,
+  type GoalLoopDecision,
+} from "./agent/goal/index.js";
+import { join as pathJoin } from "node:path";
+import { homedir } from "node:os";
 
 /**
  * Guards handleUserSubmit against re-entrancy. AgentLoop.busy only kicks
@@ -132,6 +144,17 @@ let fusionPrepAbort: AbortController | null = null;
 
 /** Live `.libe` session autosave (set in main). */
 let sessionAutosave: ReturnType<typeof createSessionAutosave> | null = null;
+
+/**
+ * Session-scoped goal orchestrator. Created on first /goal; cleared on
+ * /goal clear or /clear. Autonomous loop re-enters the agent until
+ * complete / paused / blocked.
+ */
+let sessionGoal: GoalOrchestrator | null = null;
+/** Prevents overlapping goal continuation turns. */
+let goalLoopInFlight = false;
+/** Cap autonomous goal continuations per create/resume (safety). */
+const GOAL_MAX_CONTINUATIONS = 40;
 
 async function main(): Promise<void> {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
@@ -450,6 +473,9 @@ function handleCommand(
               "- `/self-review list` / `restore` — source snapshots under `~/.libra/self-review-backups`\n" +
               "- Sessions auto-save as `~/.libra/sessions/*.libe` (friction mined on self-review)\n" +
               "- `/subagent` — subagent config\n" +
+              "- `/goal <objective>` — autonomous plan→execute→verify loop (footer chip + detail card)\n" +
+              "  · `/goal status` rich progress · `pause` · `resume` · `clear`\n" +
+              "  · completion claims run multi-skeptic verify before ending\n" +
               "- `/verify [provider]` — live model list proves the key\n" +
               "- `/theme` `/font` `/whoami` `/logout`\n" +
               "- `Ctrl+T` — show/hide all thinking blocks\n" +
@@ -717,11 +743,20 @@ function handleCommand(
       );
       break;
 
+    case "goal":
+    case "g":
+      void handleGoalCommand(store, liveAgent, args.trim());
+      break;
+
     case "clear":
     case "new":
       agent.cancel();
       liveAgent?.cancel();
       fusionPrepAbort?.abort();
+      goalLoopInFlight = false;
+      if (sessionGoal?.hasGoal()) sessionGoal.clear();
+      sessionGoal = null;
+      store.setGoal(null);
       // Flush current transcript before wiping the UI session
       sessionAutosave?.flush();
       saveSessionLibe(store.state, { libraVersion: getVersion() });
@@ -2327,7 +2362,12 @@ async function runSelfReview(
     sessionAutosave?.flush();
     saveSessionLibe(store.state, { libraVersion: getVersion() });
 
-    const exitReason = verifyOk ? "agent_done" : "agent_failed";
+    const ship = decideSelfReviewShipGate({
+      verifyOk,
+      backupId: backup.id,
+    });
+    // Never signal agent_done while verify is red (session friction C1/C2).
+    const exitReason = ship.exitResult;
     const exitNote = !verifyOk
       ? `in-tab verify still red after ${SELF_REVIEW_MAX_FIX_ROUNDS} fix rounds` +
         (agentFailed ? `; agent: ${agentFailed}` : "") +
@@ -2338,7 +2378,9 @@ async function runSelfReview(
 
     if (handoff) {
       // Only signal exit readiness now — supervisor was waiting on parent life
-      signalRelaunch(handoff, exitReason, exitNote);
+      if (ship.maySignalAgentDone || exitReason === "agent_failed") {
+        signalRelaunch(handoff, exitReason, exitNote);
+      }
     }
 
     store.appendMessage({
@@ -2349,10 +2391,8 @@ async function runSelfReview(
         {
           id: newId("p"),
           type: "status",
-          level: verifyOk ? "success" : "warn",
-          message: verifyOk
-            ? `Self-review ship gate passed — handing off to supervisor for relaunch…`
-            : `Self-review ship gate still red — exiting for supervisor (may auto-restore backup \`${backup.id}\`)…`,
+          level: ship.userStatusLevel,
+          message: ship.userMessage,
         },
       ],
     });
@@ -2530,12 +2570,20 @@ async function handleUserSubmit(
     }
 
     if (hasAuth) {
+      const activeGoal =
+        sessionGoal?.isActive() ? sessionGoal : null;
       await live.handle(text, {
         provider,
         model,
         cwd: process.cwd(),
         tools: true,
+        goalOrchestrator: activeGoal,
+        allowedRoots: activeGoal?.toolAllowedRoots(),
       });
+      // Autonomous goal continuation (stop-detector / gaps / next-step)
+      if (sessionGoal?.isActive() && !goalLoopInFlight) {
+        await runGoalContinuationLoop(store, live, provider, model);
+      }
       return;
     }
 
@@ -2548,6 +2596,396 @@ async function handleUserSubmit(
     await mock.handle(text);
   } finally {
     submissionInFlight = false;
+  }
+}
+
+// ── /goal autonomous loop ─────────────────────────────
+
+function sessionAuthSnapshot(store: HarnessStore): {
+  provider: ProviderId;
+  model: string;
+  hasToken: boolean;
+  hasAuth: boolean;
+} {
+  const provider = store.state.session.provider as ProviderId;
+  const model = store.state.session.model ?? "unset";
+  const hasToken = Boolean(getProvider(provider) && resolveToken(provider));
+  const hasAuth =
+    hasToken &&
+    Boolean(model) &&
+    model !== "unset" &&
+    model !== "libra-mock" &&
+    model !== "libra-demo";
+  return { provider, model, hasToken, hasAuth };
+}
+
+/**
+ * Ensure session goal exists and spawners match *current* auth
+ * (never freeze unauthed spawners across a later login).
+ */
+function ensureSessionGoal(store: HarnessStore): GoalOrchestrator {
+  const sessionId = store.state.session.id || "default";
+  const sessionDir = pathJoin(
+    process.env.LIBRA_SESSIONS_DIR ?? pathJoin(homedir(), ".libra", "sessions"),
+    encodeURIComponent(sessionId),
+  );
+  const auth = sessionAuthSnapshot(store);
+  const spawnerCtx = resolveGoalSpawnerContext(
+    {
+      provider: auth.provider,
+      model: auth.model,
+      hasToken: auth.hasToken,
+    },
+    process.cwd(),
+  );
+
+  if (!sessionGoal) {
+    sessionGoal = new GoalOrchestrator({
+      sessionDir,
+      planSpawner: null,
+      verifierSpawner: null,
+      strategistSpawner: null,
+      verifierPanelSize: 2,
+    });
+  }
+  // Always rebind — login after create must upgrade structural → LLM spawners
+  rebindGoalSpawners(sessionGoal, spawnerCtx);
+  return sessionGoal;
+}
+
+async function handleGoalCommand(
+  store: HarnessStore,
+  liveAgent: AgentLoop | undefined,
+  rawArgs: string,
+): Promise<void> {
+  const args = rawArgs.trim();
+  const lower = args.toLowerCase();
+
+  if (!args || lower === "status" || lower === "show") {
+    if (!sessionGoal?.hasGoal()) {
+      notify(
+        store,
+        "No goal set. Use `/goal <objective>` to start the autonomous loop.",
+        "info",
+      );
+      return;
+    }
+    pushGoalChrome(store);
+    postGoalDetail(store, sessionGoal.detailCard());
+    return;
+  }
+
+  if (lower === "pause") {
+    if (!sessionGoal?.isActive()) {
+      notify(store, "No active goal to pause.", "warn");
+      return;
+    }
+    sessionGoal.pause("user");
+    pushGoalChrome(store);
+    notify(store, sessionGoal.toast("paused", "user"), "info");
+    return;
+  }
+
+  if (lower === "resume") {
+    if (!sessionGoal?.hasGoal()) {
+      notify(store, "No goal to resume.", "warn");
+      return;
+    }
+    const auth = sessionAuthSnapshot(store);
+    const prep = prepareGoalContinue(sessionGoal, {
+      provider: auth.provider,
+      model: auth.model,
+      hasToken: auth.hasToken,
+    });
+    pushGoalChrome(store);
+    if (!prep.ok) {
+      notify(store, prep.message, "warn");
+      return;
+    }
+    notify(store, sessionGoal.toast("resumed"), "success");
+    if (prep.shouldStartLoop && liveAgent && prep.spawnerCtx) {
+      await runGoalContinuationLoop(
+        store,
+        liveAgent,
+        prep.spawnerCtx.provider,
+        prep.spawnerCtx.model,
+        { seedNudge: sessionGoal.buildContinuationNudge() },
+      );
+    }
+    return;
+  }
+
+  if (lower === "clear" || lower === "cancel" || lower === "done") {
+    if (!sessionGoal?.hasGoal()) {
+      notify(store, "No goal to clear.", "info");
+      return;
+    }
+    sessionGoal.clear();
+    sessionGoal = null;
+    goalLoopInFlight = false;
+    store.setGoal(null);
+    notify(store, "Goal cleared.", "info");
+    return;
+  }
+
+  // Treat remaining text as the objective
+  const objective = args;
+  if (sessionGoal?.hasGoal() && sessionGoal.isActive()) {
+    notify(
+      store,
+      "A goal is already active. `/goal pause` or `/goal clear` first.",
+      "warn",
+    );
+    return;
+  }
+
+  const orch = ensureSessionGoal(store);
+  // Replace any leftover non-active goal
+  if (orch.hasGoal()) orch.clear();
+  // Rebind again after clear (spawners cleared? setSpawners keeps them)
+  ensureSessionGoal(store);
+
+  store.setPhase("thinking", "goal · planning…");
+  const created = await orch.createGoal(objective);
+  store.setPhase("idle");
+  pushGoalChrome(store);
+
+  const auth = sessionAuthSnapshot(store);
+  const suffix = goalCreateStatusSuffix({
+    createdOk: created.ok,
+    hasAuth: auth.hasAuth,
+  });
+  postGoalDetail(
+    store,
+    (created.ok ? orch.detailCard() : created.lines.join("\n")) + suffix,
+  );
+
+  if (!created.ok) return;
+
+  if (!auth.hasAuth) {
+    // Fail-open plan exists, but pause so `/goal resume` is the real entry
+    // after login (resume no-ops when status stays active).
+    const paused = pauseGoalAwaitingAuth(orch);
+    pushGoalChrome(store);
+    notify(store, paused.message, "warn");
+    return;
+  }
+
+  if (!liveAgent) {
+    pauseGoalAwaitingAuth(
+      orch,
+      "Plan ready but agent unavailable — /goal resume when ready.",
+    );
+    pushGoalChrome(store);
+    notify(store, "Goal paused — agent unavailable.", "warn");
+    return;
+  }
+
+  notify(store, orch.toast("created", objective), "success");
+
+  // Kick off first implementer turn with goal rules + inlined plan body
+  // (plan lives under ~/.libra/sessions — tools allow that root via orch).
+  const kickoff = orch.buildKickoffPrompt(objective);
+  await liveAgent.handle(kickoff, {
+    provider: auth.provider,
+    model: auth.model,
+    cwd: process.cwd(),
+    tools: true,
+    goalOrchestrator: orch,
+    allowedRoots: orch.toolAllowedRoots(),
+    label: "goal",
+  });
+  pushGoalChrome(store);
+
+  if (orch.isActive()) {
+    await runGoalContinuationLoop(
+      store,
+      liveAgent,
+      auth.provider,
+      auth.model,
+    );
+  }
+}
+
+/** Push live goal badge into TUI chrome (null when no goal). */
+function pushGoalChrome(store: HarnessStore): void {
+  if (!sessionGoal?.hasGoal()) {
+    store.setGoal(null);
+    return;
+  }
+  store.setGoal(sessionGoal.uiSnapshot());
+}
+
+function postGoalStatus(store: HarnessStore, text: string): void {
+  store.appendMessage({
+    id: newId("m"),
+    role: "system",
+    createdAt: Date.now(),
+    parts: [
+      {
+        id: newId("p"),
+        type: "status",
+        level: "info",
+        message: text,
+      },
+    ],
+  });
+}
+
+/** Rich markdown goal detail card in the scrollback. */
+function postGoalDetail(store: HarnessStore, markdown: string): void {
+  store.appendMessage({
+    id: newId("m"),
+    role: "assistant",
+    createdAt: Date.now(),
+    parts: [
+      {
+        id: newId("p"),
+        type: "text",
+        content: markdown,
+      },
+    ],
+  });
+}
+
+/**
+ * After each implementer turn: verify completion claims, re-nudge on
+ * premature stop / NotAchieved, until complete|paused|cap.
+ */
+async function runGoalContinuationLoop(
+  store: HarnessStore,
+  live: AgentLoop,
+  provider: ProviderId,
+  model: string,
+  opts?: { seedNudge?: string },
+): Promise<void> {
+  if (!sessionGoal || goalLoopInFlight) return;
+  // Rebind spawners every loop entry so login-mid-goal upgrades take effect
+  const auth = sessionAuthSnapshot(store);
+  rebindGoalSpawners(
+    sessionGoal,
+    resolveGoalSpawnerContext(
+      {
+        provider: auth.provider,
+        model: auth.model,
+        hasToken: auth.hasToken,
+      },
+      process.cwd(),
+    ),
+  );
+  goalLoopInFlight = true;
+  let continuations = 0;
+  let pendingNudge = opts?.seedNudge;
+
+  try {
+    while (sessionGoal?.isActive() && continuations < GOAL_MAX_CONTINUATIONS) {
+      pushGoalChrome(store);
+      // Decision from last turn's final text (if any)
+      const lastAssistant = [...store.state.messages]
+        .reverse()
+        .find((m) => m.role === "assistant");
+      const finalText =
+        lastAssistant?.parts
+          .filter((p) => p.type === "text")
+          .map((p) => ("content" in p ? String(p.content ?? "") : ""))
+          .join("\n")
+          .trim() ?? "";
+
+      let decision: GoalLoopDecision;
+      if (pendingNudge) {
+        // Resume seed — skip re-decide, use the nudge
+        decision = { action: "continue", nudge: pendingNudge };
+        pendingNudge = undefined;
+      } else {
+        decision = await sessionGoal.afterImplementerTurn(finalText);
+      }
+
+      if (decision.action === "complete") {
+        pushGoalChrome(store);
+        postGoalDetail(
+          store,
+          sessionGoal.detailCard() +
+            `\n\n**✓ Verified complete**\n${decision.summary}`,
+        );
+        notify(store, sessionGoal.toast("complete", decision.summary), "success");
+        return;
+      }
+
+      if (decision.action === "paused") {
+        pushGoalChrome(store);
+        postGoalDetail(store, sessionGoal.detailCard());
+        const level =
+          decision.status === "blocked" ? "warn" : "info";
+        notify(
+          store,
+          sessionGoal.toast(
+            decision.status === "blocked" ? "blocked" : "paused",
+            decision.message,
+          ),
+          level,
+        );
+        return;
+      }
+
+      if (decision.action === "idle") {
+        return;
+      }
+
+      // continue — surface NotAchieved softly
+      if (sessionGoal.tracker.snapshotMut()?.last_classifier_verdict === "not_achieved") {
+        notify(
+          store,
+          sessionGoal.toast(
+            "not_achieved",
+            sessionGoal.nextStepText().slice(0, 80),
+          ),
+          "info",
+        );
+      }
+
+      continuations += 1;
+      const ui = sessionGoal.uiSnapshot();
+      const phaseLabel = ui?.verifying
+        ? `goal · verifying…`
+        : `goal · ${ui?.statusLine ?? "Executing"} · r${continuations}`;
+      store.setPhase("thinking", phaseLabel);
+      pushGoalChrome(store);
+      await live.handle(decision.nudge, {
+        provider,
+        model,
+        cwd: process.cwd(),
+        tools: true,
+        goalOrchestrator: sessionGoal,
+        allowedRoots: sessionGoal.toolAllowedRoots(),
+        label: `goal-cont-${continuations}`,
+      });
+      pushGoalChrome(store);
+    }
+
+    if (sessionGoal?.isActive()) {
+      sessionGoal.pause(
+        "user",
+        `Autonomous continuation cap (${GOAL_MAX_CONTINUATIONS}) reached.`,
+      );
+      pushGoalChrome(store);
+      postGoalDetail(store, sessionGoal.detailCard());
+      notify(
+        store,
+        `Goal auto-paused after ${GOAL_MAX_CONTINUATIONS} continuations. /goal resume to continue.`,
+        "warn",
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (sessionGoal?.isActive()) {
+      sessionGoal.pause("infra", msg);
+    }
+    pushGoalChrome(store);
+    notify(store, `Goal loop error: ${msg}`, "error");
+  } finally {
+    goalLoopInFlight = false;
+    pushGoalChrome(store);
+    store.setPhase("idle");
   }
 }
 

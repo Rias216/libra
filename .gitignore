@@ -18,3 +18,12 @@ score.json
 .bench-run/
 **/harness-debug.log
 **/runner.log
+
+# Agent / IDE terminal session captures (not product)
+terminals/
+
+# One-off review / planning scratch (do not commit)
+review.txt
+review2.txt
+SESSION_FRICTION_PLAN.md
+*.zip

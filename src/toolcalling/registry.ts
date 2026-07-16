@@ -141,6 +141,13 @@ const ENTRIES: RegistryEntry[] = [
     description: "Update task list",
   },
   {
+    name: "update_goal",
+    toolset: "meta",
+    risk: "meta",
+    aliases: ["updategoal", "goal_update"],
+    description: "Report goal progress / claim complete / block",
+  },
+  {
     name: "calc",
     // Exposed by default with meta tools (not only Fusion catalog evals)
     toolset: "meta",

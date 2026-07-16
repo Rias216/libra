@@ -146,3 +146,38 @@ export function formatVerifyFailure(v: LibraVerifyResult): string {
 
 /** Max fix-and-reverify loops after the first agent pass (total verify attempts = 1 + this). */
 export const SELF_REVIEW_MAX_FIX_ROUNDS = 3;
+
+/**
+ * Pure ship-gate for self-review exit signaling.
+ * When verify is red, must NOT emit agent_done / success finished path.
+ */
+export type SelfReviewShipDecision = {
+  maySignalAgentDone: boolean;
+  exitResult: "agent_done" | "agent_failed";
+  userStatusLevel: "success" | "warn";
+  userMessage: string;
+};
+
+export function decideSelfReviewShipGate(opts: {
+  verifyOk: boolean;
+  backupId?: string;
+}): SelfReviewShipDecision {
+  if (opts.verifyOk) {
+    return {
+      maySignalAgentDone: true,
+      exitResult: "agent_done",
+      userStatusLevel: "success",
+      userMessage:
+        "Self-review ship gate passed — handing off to supervisor for relaunch…",
+    };
+  }
+  const backup = opts.backupId?.trim()
+    ? ` (may auto-restore backup \`${opts.backupId}\`)`
+    : "";
+  return {
+    maySignalAgentDone: false,
+    exitResult: "agent_failed",
+    userStatusLevel: "warn",
+    userMessage: `Self-review ship gate still red — exiting for supervisor${backup}…`,
+  };
+}

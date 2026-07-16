@@ -139,6 +139,13 @@ export class HarnessStore {
     this.dispatch({ type: "phase", phase, label });
   }
 
+  /** Push live goal badge for TUI chrome (null clears). */
+  setGoal(
+    goal: import("./types.js").GoalUiSnapshot | null,
+  ): void {
+    this.dispatch({ type: "goal", goal });
+  }
+
   addTokens(input: number, output: number): void {
     this.dispatch({ type: "tokens", input, output });
   }

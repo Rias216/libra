@@ -5,7 +5,7 @@
  *   claude → anthropic, gpt-4/o1/o3 → beast, codex-model → codex style pack,
  *   gpt → gpt, gemini → gemini, kimi → kimi, grok/xai → grok, else → default
  *
- * Product-neutral: no product/brand identity in system text.
+ * Product identity: Libra (shared LIBRA_IDENTITY in packs).
  */
 
 import { existsSync, readFileSync } from "node:fs";

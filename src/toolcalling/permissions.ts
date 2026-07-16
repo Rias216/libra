@@ -83,6 +83,7 @@ export const DEFAULT_PERMISSIONS: PermissionRules = {
   web_search: "allow",
   calc: "allow",
   todo_write: "allow",
+  update_goal: "allow",
   process: "allow",
   finish: "allow",
   // Mutations: allow by default (harness agents need them); user can set ask

@@ -13,10 +13,13 @@ const PARALLEL_SAFE = new Set([
   "web_search",
   "web_fetch",
   "todo_write",
+  "update_goal",
   "list_agents",
   // Fire-and-forget: returns agent_id immediately; child runs in background
   "spawn_agent",
+  "spawn_agents_batch",
   "message_agent",
+  "get_agent_result",
 ]);
 
 /** Mutators / exclusive tools — need write-lock style admission. */
@@ -67,6 +70,8 @@ export const TOOL_ALIASES: Record<string, string> = {
   websearch: "web_search",
   webfetch: "web_fetch",
   todowrite: "todo_write",
+  updategoal: "update_goal",
+  goal_update: "update_goal",
   // Codex-ish
   local_shell: "run_terminal_command",
 };

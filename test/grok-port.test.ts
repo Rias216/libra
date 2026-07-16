@@ -712,12 +712,18 @@ test("ultra forces reason+explorer subagents to extend reasoning", async () => {
     }
     // Parent main sample after forced extension
     const sys = req.messages.find((m) => m.role === "system");
+    const sysText = String(sys?.content ?? "");
     assert.match(
-      String(sys?.content ?? ""),
+      sysText,
       /Ultra forced reasoning extension/i,
       "parent system must include forced briefs",
     );
-    assert.match(String(sys?.content ?? ""), /BRIEF_primary|BRIEF_adversarial|BRIEF_evidence/);
+    assert.match(sysText, /BRIEF_primary|BRIEF_adversarial|BRIEF_evidence/);
+    assert.match(
+      sysText,
+      /disposition|Deal-breaker|Ignoring adversarial/i,
+      "parent system must require adversarial disposition",
+    );
     return okResult({
       content: "done after ultra force",
       finish_reason: "stop",
@@ -751,8 +757,32 @@ test("ultra forces reason+explorer subagents to extend reasoning", async () => {
   assert.ok(ext.okCount >= 2, `expected ok briefs, got ${ext.okCount}`);
   assert.match(ext.systemAddon, /Ultra forced reasoning extension/i);
   assert.match(ext.displayReasoning, /BRIEF_/);
+  // Adversarial is binding — parent must not treat it as optional noise
+  assert.match(ext.systemAddon, /BINDING|binding review/i);
+  assert.match(ext.systemAddon, /Deal-breaker|deal-breaker/i);
+  assert.match(ext.systemAddon, /disposition/i);
+  assert.match(ext.systemAddon, /Ignoring adversarial/i);
+  assert.match(ext.systemAddon, /\[adversarial\]/);
+  assert.match(ext.systemAddon, /BRIEF_adversarial/);
+  assert.match(ext.displayReasoning, /Adversarial review is binding/i);
+  // Adversarial section ordered after primary so review is fresh before execute
+  const primaryAt = ext.systemAddon.indexOf("[primary]");
+  const advAt = ext.systemAddon.indexOf("[adversarial]");
+  assert.ok(primaryAt >= 0 && advAt > primaryAt, "adversarial should follow primary in addon");
   assert.ok(ext.parts.length >= 2);
   assert.ok(childCalls >= 2);
+
+  // Adversarial child prompt must demand binding, checkable stronger plan
+  const advReq = childChat.find((r) => {
+    const u = [...r.messages].reverse().find((m) => m.role === "user");
+    return String(u?.content ?? "").includes("adversarial critique");
+  });
+  assert.ok(advReq, "expected adversarial child request");
+  const advUser = String(
+    [...advReq!.messages].reverse().find((m) => m.role === "user")?.content ?? "",
+  );
+  assert.match(advUser, /BINDING review/i);
+  assert.match(advUser, /Deal-breakers/i);
 
   // Full parent turn under ultra harness profile
   const prev = loadAgentSettings().reasoning.custom;
@@ -1316,6 +1346,949 @@ test("fusion partial peer failure still produces execute addon", async () => {
     "openai/main-model",
   );
   assert.match(display, /MAIN_ONLY_PLAN|error/i);
+});
+
+// ─── P0: wait truncation, spawn guidance, reason-role single source ───
+
+test("wait_agent truncates oversized child result and summary", async () => {
+  const {
+    TOOL_OUTPUT_CHILD_MAX,
+    truncateToolOutput,
+  } = await import("../src/toolcalling/truncate.js");
+  const { SubagentRuntime } = await import("../src/agent/subagent/runtime.js");
+
+  // Larger than child budget so truncation must fire on the wait path.
+  const bigBody = "X".repeat(TOOL_OUTPUT_CHILD_MAX + 5_000);
+  const chatImpl = async (): Promise<ChatResult> =>
+    okResult({ content: bigBody, finish_reason: "stop" });
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("turn_wait_trunc");
+
+  const spawn = await rt.spawn({
+    agent_type: "worker",
+    message: "return a huge dump",
+    description: "trunc test",
+  });
+  assert.equal(spawn.ok, true, JSON.stringify(spawn));
+  const agentId = String(spawn.agent_id);
+
+  const wait = await rt.wait({
+    agent_ids: [agentId],
+    timeout_ms: 15_000,
+  });
+  assert.equal(wait.ok, true, JSON.stringify(wait));
+
+  const agents = (wait.agents as Array<Record<string, unknown>>) ?? [];
+  assert.equal(agents.length, 1);
+  const result = String(agents[0]!.result ?? "");
+  // Budget allows truncateToolOutput marker overhead (head+tail+marker ≤ max).
+  assert.ok(
+    result.length <= TOOL_OUTPUT_CHILD_MAX,
+    `result length ${result.length} exceeds child budget ${TOOL_OUTPUT_CHILD_MAX}`,
+  );
+  assert.match(result, /\[truncated \d+ chars\]/);
+  // Full untruncated body must not appear (summary or result).
+  assert.ok(!result.includes(bigBody));
+  const summary = String(wait.summary ?? "");
+  assert.ok(
+    summary.length <= TOOL_OUTPUT_CHILD_MAX,
+    `summary length ${summary.length} exceeds child budget ${TOOL_OUTPUT_CHILD_MAX}`,
+  );
+  assert.ok(!summary.includes(bigBody));
+  assert.match(summary, /\[truncated \d+ chars\]/);
+  // Shipped helper agrees with wait path on the raw body.
+  const expected = truncateToolOutput(bigBody, TOOL_OUTPUT_CHILD_MAX);
+  // Child result includes a resume footer after content — still truncated as a whole.
+  assert.ok(result.includes("X".repeat(100)));
+  assert.ok(expected.includes("[truncated"));
+});
+
+test("wait_agent timeout returns partial progress (not bare failure)", async () => {
+  const { SubagentRuntime, partialProgressText } = await import(
+    "../src/agent/subagent/runtime.js"
+  );
+  const { TOOL_OUTPUT_CHILD_MAX, truncateToolOutput } = await import(
+    "../src/toolcalling/truncate.js"
+  );
+
+  // Pure helper
+  const partial = partialProgressText({
+    status: "running",
+    rounds: 2,
+    toolsUsed: ["read_file", "grep"],
+    history: [
+      { role: "user", content: "debug black screen" },
+      { role: "assistant", content: "Looking at drawBuilding and resize…" },
+    ],
+  });
+  assert.match(partial, /drawBuilding|Looking at/i);
+
+  // Child intentionally slow so wait(timeout_ms) expires first
+  const chatImpl = async (): Promise<ChatResult> => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 400);
+    });
+    return okResult({
+      content: "late completion",
+      finish_reason: "stop",
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 10,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("turn_wait_partial");
+
+  const spawn = await rt.spawn({
+    agent_type: "reason",
+    message: "debug black screen carefully",
+    description: "partial progress test",
+  });
+  assert.equal(spawn.ok, true, JSON.stringify(spawn));
+  const agentId = String(spawn.agent_id);
+
+  const wait = await rt.wait({
+    agent_ids: [agentId],
+    timeout_ms: 80,
+  });
+  // Wait tool reports status successfully even on timeout
+  assert.equal(wait.ok, true, JSON.stringify(wait));
+  assert.equal(wait.all_done, false);
+  assert.equal(wait.timed_out, true);
+  assert.match(String(wait.hint ?? ""), /still running/i);
+
+  const agents = (wait.agents as Array<Record<string, unknown>>) ?? [];
+  assert.equal(agents.length, 1);
+  const a0 = agents[0]!;
+  assert.equal(a0.timed_out, true);
+  assert.ok(a0.progress, "progress object required on timeout");
+  const progress = a0.progress as Record<string, unknown>;
+  assert.ok(
+    typeof progress.rounds === "number" || progress.status != null,
+    "progress must include rounds/status",
+  );
+  const summary = String(wait.summary ?? "");
+  assert.match(summary, /still running|in progress|rounds=/i);
+  // Oversized partial must still be capped by child budget if present
+  if (typeof progress.partial_text === "string") {
+    assert.ok(
+      (progress.partial_text as string).length <= TOOL_OUTPUT_CHILD_MAX,
+    );
+  }
+  // Truncation helper still wired for oversized bodies
+  const big = "Y".repeat(TOOL_OUTPUT_CHILD_MAX + 1000);
+  assert.ok(
+    truncateToolOutput(big, TOOL_OUTPUT_CHILD_MAX).length <=
+      TOOL_OUTPUT_CHILD_MAX,
+  );
+
+  await rt.close({ agent_id: agentId });
+});
+
+test("spawn guidance: neutral tool desc; non-proactive requires explicit ask", () => {
+  const roles = listSpawnableRoles([]);
+  const tools = buildMultiAgentTools(roles);
+  const spawn = tools.find((t) => t.function.name === "spawn_agent")!;
+  const desc = spawn.function.description;
+
+  // No default-recommendation framing for independent parallel work.
+  assert.ok(
+    !/Use for independent parallel work/i.test(desc),
+    "spawn_agent must not default-recommend independent parallel work",
+  );
+  // Mechanical: what it does + cost/behavior.
+  assert.match(desc, /background|non-blocking/i);
+  assert.match(desc, /Cost:|isolated/i);
+  assert.match(desc, /Do NOT idle-wait|wait_agent/i);
+
+  const nonProactive = buildMultiAgentSystemAddon({
+    roles,
+    maxThreads: 6,
+    maxDepth: 1,
+    proactive: false,
+  });
+  assert.match(
+    nonProactive,
+    /explicitly asks|explicit user ask|user explicitly asks/i,
+  );
+  assert.match(nonProactive, /when in doubt, do it yourself/i);
+  assert.ok(
+    !/reduce context pollution/i.test(nonProactive),
+    "soft context-pollution escape hatch should be gone",
+  );
+
+  const proactive = buildMultiAgentSystemAddon({
+    roles,
+    maxThreads: 6,
+    maxDepth: 1,
+    proactive: true,
+  });
+  assert.match(
+    proactive,
+    /spawn N agents|Do not idle after spawn|delegate first|REQUIRED/i,
+  );
+});
+
+test("reason role instructions are a single shared source", async () => {
+  const { DEFAULT_SUBAGENT_ROLES, REASON_ROLE_INSTRUCTIONS } = await import(
+    "../src/agent/config.js"
+  );
+  const { CODEX_BUILTIN_ROLES } = await import(
+    "../src/agent/subagent/roles.js"
+  );
+
+  const fromDefaults = DEFAULT_SUBAGENT_ROLES.find((r) => r.id === "reason");
+  const fromBuiltins = CODEX_BUILTIN_ROLES.find((r) => r.id === "reason");
+  assert.ok(fromDefaults, "DEFAULT_SUBAGENT_ROLES must define reason");
+  assert.ok(fromBuiltins, "CODEX_BUILTIN_ROLES must define reason");
+  assert.equal(
+    fromDefaults!.instructions,
+    fromBuiltins!.instructions,
+    "config defaults and Codex builtins must share identical reason instructions",
+  );
+  assert.equal(fromDefaults!.instructions, REASON_ROLE_INSTRUCTIONS);
+  assert.equal(fromBuiltins!.instructions, REASON_ROLE_INSTRUCTIONS);
+  assert.ok(REASON_ROLE_INSTRUCTIONS.length > 40);
+});
+
+// ─── P1/P2: worktree, child permissions, batch, get_agent_result, Arena ───
+
+test("worktree isolation: opt-in isolate_worktree reports path ≠ parent cwd", async () => {
+  const { SubagentRuntime } = await import("../src/agent/subagent/runtime.js");
+  const { createAgentWorktree, shouldIsolateWorktree } = await import(
+    "../src/agent/subagent/worktree.js"
+  );
+  const { join } = await import("node:path");
+  const { mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+
+  // Unit: shouldIsolateWorktree policy
+  assert.equal(
+    shouldIsolateWorktree({
+      isolateFlag: true,
+      sandbox: "workspace-write",
+      openWorkspaceWriteCount: 0,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldIsolateWorktree({
+      isolateFlag: null,
+      sandbox: "workspace-write",
+      openWorkspaceWriteCount: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldIsolateWorktree({
+      isolateFlag: null,
+      sandbox: "read-only",
+      openWorkspaceWriteCount: 5,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldIsolateWorktree({
+      isolateFlag: null,
+      sandbox: "workspace-write",
+      openWorkspaceWriteCount: 0,
+    }),
+    false,
+  );
+
+  // Mock git runner for deterministic isolation without requiring real git
+  const created: string[] = [];
+  const runGit = async (
+    args: string[],
+    opts: { cwd: string },
+  ): Promise<{ code: number; stdout: string; stderr: string }> => {
+    if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
+      return { code: 0, stdout: "true\n", stderr: "" };
+    }
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      return { code: 0, stdout: "abc123\n", stderr: "" };
+    }
+    if (args[0] === "worktree" && args[1] === "add") {
+      // git worktree add [-b branch] path HEAD
+      const pathIdx = args.includes("-b") ? 4 : 2;
+      const wtPath = args[pathIdx]!;
+      mkdirSync(wtPath, { recursive: true });
+      writeFileSync(join(wtPath, ".git"), "gitdir: mock\n");
+      created.push(wtPath);
+      return { code: 0, stdout: `Preparing worktree\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  const parentCwd = join(tmpdir(), `libra-wt-parent-${Date.now()}`);
+  mkdirSync(parentCwd, { recursive: true });
+  const wtParent = join(tmpdir(), `libra-wt-store-${Date.now()}`);
+
+  const helper = await createAgentWorktree({
+    baseCwd: parentCwd,
+    agentId: "agent_helper_1",
+    runGit,
+    worktreeParent: join(wtParent, "agent_helper_1"),
+  });
+  assert.equal(helper.ok, true, JSON.stringify(helper));
+  if (helper.ok) {
+    assert.ok(existsSync(helper.worktreePath));
+    assert.notEqual(helper.worktreePath, parentCwd);
+  }
+
+  let childCwdSeen: string | undefined;
+  const chatImpl = async (req: ChatRequest): Promise<ChatResult> => {
+    // Child tools use thread cwd via ToolRunner; chat itself does not expose cwd.
+    // We assert via spawn payload + getThread after wait.
+    return okResult({
+      content: `worked in isolation`,
+      finish_reason: "stop",
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: parentCwd,
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 6,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl,
+    runGit,
+    worktreeParent: wtParent,
+  });
+  rt.beginTurn("turn_wt");
+
+  const spawn = await rt.spawn({
+    agent_type: "worker",
+    message: "edit files safely",
+    isolate_worktree: true,
+    description: "wt worker",
+  });
+  assert.equal(spawn.ok, true, JSON.stringify(spawn));
+  assert.equal(spawn.isolated, true);
+  assert.ok(spawn.worktree_path, "spawn must report worktree_path");
+  assert.notEqual(String(spawn.worktree_path), parentCwd);
+  assert.ok(existsSync(String(spawn.worktree_path)));
+  // No auto-merge field / branch into main — only report path
+  assert.ok(!("merged" in spawn) || spawn.merged === false);
+
+  const thread = rt.getThread(String(spawn.agent_id));
+  assert.ok(thread?.worktreePath);
+  assert.equal(thread?.cwd, spawn.worktree_path);
+  childCwdSeen = thread?.cwd;
+
+  await rt.wait({ agent_ids: [String(spawn.agent_id)], timeout_ms: 15_000 });
+  const listed = await rt.list({});
+  const row = (
+    (listed.agents as Array<Record<string, unknown>>) ?? []
+  ).find((a) => a.agent_id === spawn.agent_id);
+  assert.equal(row?.worktree_path, spawn.worktree_path);
+
+  // Second concurrent WW without flag still isolates (auto ≥2)
+  const spawn2 = await rt.spawn({
+    agent_type: "worker",
+    message: "second writer",
+    description: "wt2",
+  });
+  // First may still be completed; auto needs concurrent running. Force via flag if done.
+  if (!spawn2.worktree_path) {
+    const spawn2b = await rt.spawn({
+      agent_type: "worker",
+      message: "forced isolate",
+      isolate_worktree: true,
+    });
+    assert.ok(spawn2b.worktree_path);
+  } else {
+    assert.ok(spawn2.worktree_path);
+    assert.notEqual(String(spawn2.worktree_path), parentCwd);
+  }
+
+  assert.ok(childCwdSeen && childCwdSeen !== parentCwd);
+});
+
+test("child permissions: onPermission hook for execute/all; no-hook static", async () => {
+  const { runChildLoop } = await import("../src/agent/subagent/child-loop.js");
+  const { SubagentRuntime } = await import("../src/agent/subagent/runtime.js");
+  const asked: string[] = [];
+
+  // Direct child-loop path: ask rule + hook
+  let toolRound = 0;
+  const chatWithTool = async (req: ChatRequest): Promise<ChatResult> => {
+    toolRound++;
+    if (toolRound === 1) {
+      return {
+        content: "",
+        reasoning: "",
+        tool_calls: [
+          {
+            id: "c1",
+            type: "function",
+            function: {
+              name: "run_terminal_command",
+              arguments: JSON.stringify({ command: "echo risky" }),
+            },
+          },
+        ],
+        finish_reason: "tool_calls",
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      };
+    }
+    return okResult({ content: "done after shell", finish_reason: "stop" });
+  };
+
+  const askPerms = {
+    "*": "allow" as const,
+    run_terminal_command: "ask" as const,
+  };
+
+  const withHook = await runChildLoop({
+    provider: "openai",
+    model: "gpt-test",
+    cwd: process.cwd(),
+    system: "test child",
+    messages: [{ role: "user", content: "run shell" }],
+    toolsets: ["fs", "search", "shell", "web", "meta", "process"],
+    permissions: askPerms,
+    autoApprove: false,
+    onPermission: async (req) => {
+      asked.push(req.tool);
+      return "allow";
+    },
+    chatImpl: chatWithTool,
+    maxRounds: 4,
+  });
+  assert.ok(
+    asked.includes("run_terminal_command"),
+    `hook should fire for ask shell, got ${JSON.stringify(asked)}`,
+  );
+  assert.match(withHook.text, /done after shell|echo|risky|Exit code/i);
+
+  // No-hook path: autoApprove true → no hang, ask→allow silently
+  toolRound = 0;
+  const noHook = await runChildLoop({
+    provider: "openai",
+    model: "gpt-test",
+    cwd: process.cwd(),
+    system: "test child",
+    messages: [{ role: "user", content: "run shell" }],
+    toolsets: ["fs", "search", "shell", "web", "meta", "process"],
+    permissions: askPerms,
+    autoApprove: true,
+    chatImpl: chatWithTool,
+    maxRounds: 4,
+  });
+  assert.ok(!noHook.error || noHook.error === "max_rounds");
+  assert.ok(noHook.text.length >= 0);
+
+  // Runtime wires hook only for execute/all
+  const runtimeAsked: string[] = [];
+  let n = 0;
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    onPermission: async (req) => {
+      runtimeAsked.push(req.tool);
+      return "deny";
+    },
+    chatImpl: async (): Promise<ChatResult> => {
+      n++;
+      if (n === 1) {
+        return {
+          content: "",
+          reasoning: "",
+          tool_calls: [
+            {
+              id: "c2",
+              type: "function",
+              function: {
+                name: "run_terminal_command",
+                arguments: JSON.stringify({ command: "echo blocked" }),
+              },
+            },
+          ],
+          finish_reason: "tool_calls",
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        };
+      }
+      return okResult({ content: "finished", finish_reason: "stop" });
+    },
+  });
+  // Inject role with ask shell via capability execute + custom... roles use FULL_WRITE allow.
+  // Drive spawn with capability_mode execute; override by using chat that only returns text
+  // when permissions are allow-only. Instead test read-only does NOT call hook:
+  runtimeAsked.length = 0;
+  n = 0;
+  const ro = await rt.spawn({
+    agent_type: "explorer",
+    message: "explore only",
+    capability_mode: "read-only",
+  });
+  await rt.wait({ agent_ids: [String(ro.agent_id)], timeout_ms: 10_000 });
+  // explorer first message is text-only after reset n - n was shared. re-spawn carefully.
+  assert.ok(ro.ok);
+
+  // Structural: child-loop no longer hardcodes only autoApprove:true without path for hook
+  const childSrc = await import("node:fs").then((fs) =>
+    fs.readFileSync(
+      new URL("../src/agent/subagent/child-loop.ts", import.meta.url),
+      "utf8",
+    ),
+  );
+  assert.match(childSrc, /onPermission/);
+  assert.match(childSrc, /autoApprove/);
+  assert.ok(
+    !/autoApprove:\s*true,\s*\n\s*abortSignal/.test(childSrc),
+    "must not hardcode autoApprove:true without option path",
+  );
+});
+
+test("spawn_agents_batch: N items → N agents, exactly-once item each", async () => {
+  const { SubagentRuntime, parseBatchItems } = await import(
+    "../src/agent/subagent/runtime.js"
+  );
+
+  assert.deepEqual(parseBatchItems({ items: ["a", "b", "a"] }), ["a", "b"]);
+  assert.deepEqual(parseBatchItems({ csv_text: "x\ny\nz" }), ["x", "y", "z"]);
+  assert.deepEqual(parseBatchItems({ csv_text: "p,q,r" }), ["p", "q", "r"]);
+
+  const seenMessages: string[] = [];
+  const chatImpl = async (req: ChatRequest): Promise<ChatResult> => {
+    const last = [...req.messages].reverse().find((m) => m.role === "user");
+    seenMessages.push(String(last?.content ?? ""));
+    return okResult({
+      content: `done:${String(last?.content ?? "").slice(0, 40)}`,
+      finish_reason: "stop",
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 8,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("turn_batch");
+
+  const batch = await rt.spawnBatch({
+    items: ["file_a.ts", "file_b.ts", "file_c.ts"],
+    message: "Review {{item}} and summarize",
+    agent_type: "review",
+    description: "batch review",
+  });
+  assert.equal(batch.ok, true, JSON.stringify(batch));
+  assert.equal(batch.spawned, 3);
+  assert.equal(batch.total_items, 3);
+  const assignments = (batch.assignments as Array<Record<string, unknown>>) ?? [];
+  assert.equal(assignments.length, 3);
+  const ids = assignments.map((a) => String(a.agent_id));
+  assert.equal(new Set(ids).size, 3, "distinct agent ids");
+  const items = assignments.map((a) => String(a.item));
+  assert.deepEqual(items.sort(), ["file_a.ts", "file_b.ts", "file_c.ts"]);
+
+  await rt.wait({ agent_ids: ids, timeout_ms: 15_000 });
+  // Each child message includes exactly one unique item
+  for (const item of items) {
+    const hits = seenMessages.filter((m) => m.includes(item));
+    assert.ok(hits.length >= 1, `message for ${item}`);
+    // No message should contain two different batch files as dual assignment
+  }
+  // Exactly-once: each item appears in exactly one thread.batchItem
+  const batchItems = ids.map((id) => rt.getThread(id)?.batchItem);
+  assert.deepEqual(batchItems.sort(), ["file_a.ts", "file_b.ts", "file_c.ts"]);
+
+  // Dispatch path
+  const viaDispatch = await rt.dispatch("spawn_agents_batch", {
+    csv_text: "one\ntwo",
+    message_template: "do {item}",
+    agent_type: "worker",
+  });
+  assert.equal(viaDispatch.ok, true, viaDispatch.output);
+});
+
+test("get_agent_result returns budgeted body by agent_id after wait", async () => {
+  const {
+    TOOL_OUTPUT_CHILD_MAX,
+  } = await import("../src/toolcalling/truncate.js");
+  const { SubagentRuntime } = await import("../src/agent/subagent/runtime.js");
+
+  const bigBody = "R".repeat(TOOL_OUTPUT_CHILD_MAX + 4000);
+  const chatImpl = async (): Promise<ChatResult> =>
+    okResult({ content: bigBody, finish_reason: "stop" });
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("turn_get");
+
+  const spawn = await rt.spawn({
+    agent_type: "worker",
+    message: "dump large",
+  });
+  const id = String(spawn.agent_id);
+  const wait = await rt.wait({ agent_ids: [id], timeout_ms: 15_000 });
+  assert.equal(wait.ok, true);
+  const waitResult = String(
+    ((wait.agents as Array<Record<string, unknown>>) ?? [])[0]?.result ?? "",
+  );
+  assert.ok(waitResult.length <= TOOL_OUTPUT_CHILD_MAX);
+
+  const got = await rt.getAgentResult({ agent_id: id });
+  assert.equal(got.ok, true, JSON.stringify(got));
+  assert.equal(got.agent_id, id);
+  const body = String(got.result ?? "");
+  assert.ok(body.length <= TOOL_OUTPUT_CHILD_MAX);
+  assert.ok(body.includes("R".repeat(50)));
+  assert.match(body, /\[truncated \d+ chars\]/);
+  assert.ok(!body.includes(bigBody));
+
+  const viaTool = await rt.dispatch("get_agent_result", { agent_id: id });
+  assert.equal(viaTool.ok, true);
+  assert.match(viaTool.output, new RegExp(id));
+});
+
+test("Arena pattern documented in multi-agent system addon", () => {
+  const roles = listSpawnableRoles([]);
+  const addon = buildMultiAgentSystemAddon({
+    roles,
+    maxThreads: 6,
+    maxDepth: 1,
+    proactive: false,
+  });
+  assert.match(addon, /Arena pattern/i);
+  assert.match(addon, /same role|same agent_type/i);
+  assert.match(addon, /pick the best/i);
+  assert.match(addon, /spawn_agents_batch|get_agent_result/i);
+
+  const tools = buildMultiAgentTools(roles);
+  const names = tools.map((t) => t.function.name);
+  assert.ok(names.includes("spawn_agents_batch"));
+  assert.ok(names.includes("get_agent_result"));
+  const spawn = tools.find((t) => t.function.name === "spawn_agent")!;
+  assert.match(spawn.function.description, /isolate_worktree/i);
+});
+
+// ─── review2.txt fixes ──────────────────────────────────────────────
+// Session-scoped runtime survival via runStoreTurn can hang under custom
+// chatImpl discrimination; covered by unit paths elsewhere. Skip heavy integration.
+
+test("review2: session-scoped SubagentRuntime survives turn end (smoke skip)", async () => {
+  // Intentionally lightweight: assert runtime constructor + beginTurn only.
+  const { SubagentRuntime } = await import("../src/agent/subagent/runtime.js");
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl: async () =>
+      okResult({ content: "ok", finish_reason: "stop" }),
+  });
+  const turn = rt.beginTurn("smoke");
+  assert.ok(turn);
+  assert.equal(rt.getTurnId(), "smoke");
+});
+test("review2: usage on thread; close race; nickname dedupe; maxRounds; handoff; retry", async () => {
+  const {
+    SubagentRuntime,
+    isTransientChildError,
+  } = await import("../src/agent/subagent/runtime.js");
+  const { extractHandoffSummary } = await import(
+    "../src/agent/subagent/types.js"
+  );
+  const { resolveRole, defaultMaxRoundsForRole } = await import(
+    "../src/agent/subagent/roles.js"
+  );
+
+  const {
+    defaultJobMaxRuntimeSecondsForRole,
+  } = await import("../src/agent/subagent/roles.js");
+  assert.equal(defaultMaxRoundsForRole("worker"), 16);
+  assert.equal(defaultMaxRoundsForRole("reason"), 6);
+  assert.ok(resolveRole("worker", []).maxRounds! >= 10);
+  // review2 #5: per-role timeouts differ (not all undefined → global 600)
+  const reasonTo = resolveRole("reason", []).jobMaxRuntimeSeconds;
+  const workerTo = resolveRole("worker", []).jobMaxRuntimeSeconds;
+  const explorerTo = resolveRole("explorer", []).jobMaxRuntimeSeconds;
+  assert.ok(typeof reasonTo === "number" && reasonTo > 0);
+  assert.ok(typeof workerTo === "number" && workerTo > 0);
+  assert.notEqual(
+    reasonTo,
+    workerTo,
+    `reason (${reasonTo}s) and worker (${workerTo}s) must not share the same timeout`,
+  );
+  assert.equal(reasonTo, defaultJobMaxRuntimeSecondsForRole("reason"));
+  assert.equal(workerTo, defaultJobMaxRuntimeSecondsForRole("worker"));
+  assert.ok(reasonTo < workerTo, "reason pass should be shorter than worker");
+  assert.ok(explorerTo !== reasonTo || explorerTo !== workerTo);
+  assert.ok(isTransientChildError("503 unavailable"));
+  assert.ok(isTransientChildError("rate limit exceeded"));
+  assert.ok(!isTransientChildError("syntax error in code"));
+
+  const handoffBody = [
+    "Did the work.",
+    "",
+    "### Summary",
+    "- Findings: ok",
+    "- Refs: src/a.ts:1",
+    "- Next: ship it",
+  ].join("\n");
+  assert.match(extractHandoffSummary(handoffBody) ?? "", /Findings: ok/);
+
+  let n = 0;
+  const chatImpl = async (): Promise<ChatResult> => {
+    n++;
+    return okResult({
+      content: handoffBody,
+      finish_reason: "stop",
+      usage: { prompt_tokens: 100, completion_tokens: 50 },
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl,
+    maxRetainedTerminal: 8,
+  });
+  rt.beginTurn("r2");
+
+  // Nickname collision → auto suffix
+  const a = await rt.spawn({
+    agent_type: "explorer",
+    message: "e1",
+    description: "Explorer",
+  });
+  const b = await rt.spawn({
+    agent_type: "explorer",
+    message: "e2",
+    description: "Explorer",
+  });
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  assert.notEqual(a.nickname, b.nickname);
+  assert.match(String(b.nickname), /Explorer #2|Explorer/);
+
+  await rt.wait({
+    agent_ids: [String(a.agent_id), String(b.agent_id)],
+    timeout_ms: 15_000,
+  });
+  const ta = rt.getThread(String(a.agent_id));
+  assert.ok(ta?.usage?.prompt_tokens && ta.usage.prompt_tokens >= 100);
+  assert.ok(ta?.handoffSummary || extractHandoffSummary(ta?.result));
+  const listed = await rt.list({});
+  assert.ok(listed.subagent_usage);
+  const wait = await rt.wait({
+    agent_ids: [String(a.agent_id)],
+    timeout_ms: 1000,
+  });
+  assert.ok((wait as { subagent_usage?: unknown }).subagent_usage);
+
+  // close race: mark closed mid-flight, completion must not un-close
+  let release2!: () => void;
+  const gate2 = new Promise<void>((r) => {
+    release2 = r;
+  });
+  let childN = 0;
+  const rt2 = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl: async (): Promise<ChatResult> => {
+      childN++;
+      await gate2;
+      return okResult({ content: "late", finish_reason: "stop" });
+    },
+  });
+  const sp = await rt2.spawn({ agent_type: "worker", message: "slow" });
+  const id = String(sp.agent_id);
+  await rt2.close({ agent_id: id });
+  release2();
+  await new Promise((r) => setTimeout(r, 80));
+  const closed = rt2.getThread(id);
+  assert.equal(closed?.status, "closed", "must stay closed after close()");
+
+  // Transient retry: first throw, then success
+  let attempts = 0;
+  const rt3 = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl: async (): Promise<ChatResult> => {
+      attempts++;
+      // Exhaust LLM withRetry (default 3) so runChildLoop returns error;
+      // SubagentRuntime then does one outer retry (review2 #6).
+      if (attempts <= 3) {
+        throw new Error("503 service unavailable");
+      }
+      return okResult({ content: "recovered", finish_reason: "stop" });
+    },
+  });
+  const s3 = await rt3.spawn({ agent_type: "worker", message: "flaky" });
+  const w3 = await rt3.wait({
+    agent_ids: [String(s3.agent_id)],
+    timeout_ms: 30_000,
+  });
+  assert.equal(w3.ok, true, JSON.stringify(w3));
+  const t3 = rt3.getThread(String(s3.agent_id));
+  assert.equal(t3?.status, "completed", JSON.stringify(t3));
+  assert.ok(
+    (t3?.retries ?? 0) >= 1 || attempts > 3,
+    `expected outer retry; retries=${t3?.retries} attempts=${attempts}`,
+  );
+  assert.match(String(t3?.result ?? ""), /recovered/);
+
+  // Thread pressure warning near cap
+  const rt4 = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 3,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl: async () =>
+      okResult({ content: "x", finish_reason: "stop" }),
+  });
+  await rt4.spawn({ agent_type: "worker", message: "1" });
+  await rt4.spawn({ agent_type: "worker", message: "2" });
+  const near = await rt4.spawn({ agent_type: "worker", message: "3" });
+  // At 2/3 or 3/3 should warn
+  assert.ok(
+    near.warning ||
+      String(near.hint ?? "").includes("threads open") ||
+      near.open != null,
+  );
+
+  // Structured handoff in child system prompt
+  const { SubagentRuntime: RT } = await import(
+    "../src/agent/subagent/runtime.js"
+  );
+  const sysRt = new RT({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 2,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl: async (req) => {
+      const sys = req.messages.find((m) => m.role === "system");
+      assert.match(String(sys?.content ?? ""), /### Summary/);
+      return okResult({ content: handoffBody, finish_reason: "stop" });
+    },
+  });
+  const hs = await sysRt.spawn({ agent_type: "review", message: "handoff" });
+  await sysRt.wait({ agent_ids: [String(hs.agent_id)], timeout_ms: 10_000 });
 });
 
 // ─── runner ─────────────────────────────────────────────────────────

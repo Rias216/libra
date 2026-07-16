@@ -42,6 +42,15 @@ export interface SubagentRole {
    * Default inferred from role id (explorer/review/security → read-only).
    */
   sandbox?: "read-only" | "workspace-write";
+  /**
+   * Optional per-role child sampling-round budget (overrides MAX_CHILD_ROUNDS).
+   * Workers doing implementation may want more; reason roles often need fewer.
+   */
+  maxRounds?: number;
+  /**
+   * Optional per-role wall-clock timeout in seconds (overrides jobMaxRuntimeSeconds).
+   */
+  jobMaxRuntimeSeconds?: number;
   enabled: boolean;
 }
 
@@ -119,14 +128,20 @@ export interface AgentSettings {
   subagents: SubagentConfig;
 }
 
+/**
+ * Single source of truth for the reason role's system instructions.
+ * Used by DEFAULT_SUBAGENT_ROLES and CODEX_BUILTIN_ROLES (roles.ts).
+ */
+export const REASON_ROLE_INSTRUCTIONS =
+  "You are a deep-reasoning specialist. Do NOT implement. Think step-by-step from first principles about the assigned question. Cover goals, constraints, alternatives, risks, edge cases, and a concrete recommended plan. Prefer evidence from the codebase when tools allow. Return a structured reasoning brief (Findings | Plan | Risks | Open questions) — no code dumps.";
+
 export const DEFAULT_SUBAGENT_ROLES: SubagentRole[] = [
   {
     id: "reason",
     name: "Reason",
     description:
       "Deep multi-angle reasoning (read-only). Extends parent thinking with plans, critiques, and risks.",
-    instructions:
-      "You are a deep-reasoning specialist. Do NOT implement. Think step-by-step from first principles about the assigned question. Cover goals, constraints, alternatives, risks, edge cases, and a concrete recommended plan. Prefer evidence from the codebase when tools allow. Return a structured reasoning brief (Findings | Plan | Risks | Open questions) — no code dumps.",
+    instructions: REASON_ROLE_INSTRUCTIONS,
     sandbox: "read-only",
     reasoningEffort: "max",
     enabled: true,

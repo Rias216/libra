@@ -78,6 +78,13 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     args: ["items", "merge"],
     category: "meta",
   },
+  {
+    name: "update_goal",
+    description:
+      "Goal progress tool: message / completed / blocked_reason (goal mode only)",
+    args: ["completed", "message", "blocked_reason"],
+    category: "meta",
+  },
 ];
 
 export function toolByName(name: string): ToolDef | undefined {

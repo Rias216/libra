@@ -19,6 +19,7 @@ const SLIM_DESC: Record<string, string> = {
     "Run a shell command (builds/tests/git). Prefer specialized tools for file ops. On Windows avoid missing unix utils; background=true + process tool, no sleep-poll.",
   web_search: "Search the web.",
   todo_write: "Update the session todo list.",
+  update_goal: "Report goal progress, claim complete, or block.",
   process: "Manage background processes (poll/log/wait/kill — do not sleep-poll).",
 };
 

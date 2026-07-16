@@ -300,6 +300,43 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     ],
   },
   {
+    name: "goal",
+    aliases: ["g"],
+    description:
+      "Autonomous plan→execute→verify loop (status chip, pause/resume/clear)",
+    picker: "select",
+    params: [
+      {
+        name: "action",
+        description:
+          "status | pause | resume | clear | or free-form objective text",
+        freeform: true,
+        values: [
+          {
+            value: "status",
+            label: "Status",
+            description: "Show active goal status and plan path",
+          },
+          {
+            value: "pause",
+            label: "Pause",
+            description: "Pause the active goal (user)",
+          },
+          {
+            value: "resume",
+            label: "Resume",
+            description: "Resume a paused goal and continue the loop",
+          },
+          {
+            value: "clear",
+            label: "Clear",
+            description: "Clear the goal entirely",
+          },
+        ],
+      },
+    ],
+  },
+  {
     name: "quit",
     aliases: ["exit", "q"],
     description: "Exit Libra",

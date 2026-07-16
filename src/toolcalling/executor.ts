@@ -23,7 +23,15 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { spawn } from "node:child_process";
 import { normalizeToolArgs } from "./normalize.js";
 import { processAction, startBackground } from "./process.js";
@@ -90,6 +98,12 @@ export interface ToolExecutorOptions {
   signal?: AbortSignal;
   /** Default max lines for read_file when limit omitted (default 2000) */
   defaultReadLimit?: number;
+  /**
+   * Extra absolute roots tools may read/write (in addition to cwd).
+   * Used by /goal so plan.md + private scratch under ~/.libra and %TEMP%
+   * are not rejected as "path escapes workspace".
+   */
+  allowedRoots?: string[];
 }
 
 export interface ToolExecResult {
@@ -121,6 +135,15 @@ export class ToolExecutor {
   /** Update abort signal mid-session (agent cancel). */
   setSignal(signal: AbortSignal | undefined): void {
     this.opts.signal = signal;
+  }
+
+  /** Replace allowed path roots (goal plan/scratch, etc.). */
+  setAllowedRoots(roots: string[] | undefined): void {
+    this.opts.allowedRoots = roots;
+  }
+
+  getAllowedRoots(): string[] {
+    return [...(this.opts.allowedRoots ?? [])];
   }
 
   async run(
@@ -353,6 +376,14 @@ export class ToolExecutor {
         return this.calc(str(args.expression));
       case "todo_write":
         return this.todoWrite(args.items ?? args.todos, Boolean(args.merge));
+      case "update_goal":
+        // Dispatched as a custom tool when a GoalOrchestrator is bound.
+        // Bare executor path (no orchestrator) returns a clear error.
+        return {
+          ok: false,
+          error:
+            "update_goal requires an active /goal session (goal orchestrator not bound)",
+        };
       case "finish":
         return {
           ok: true,
@@ -368,19 +399,53 @@ export class ToolExecutor {
   }
 
   private resolveSafe(p: string): string {
-    let rel = p.replace(/\\/g, "/");
-    if (rel.startsWith("./")) rel = rel.slice(2);
-    if (rel === "workspace" || rel.startsWith("workspace/")) {
-      rel = rel === "workspace" ? "." : rel.slice("workspace/".length);
+    if (!p || !String(p).trim()) {
+      throw Object.assign(new Error("path required"), { code: "invalid_path" });
     }
-    const abs = resolve(this.cwd, rel);
-    const root = resolve(this.cwd);
-    if (abs !== root && !abs.startsWith(root + sep)) {
+    const raw = String(p).trim();
+    let abs: string;
+    if (isAbsolute(raw) || /^[a-zA-Z]:[\\/]/.test(raw)) {
+      // Absolute (POSIX or Windows) — do not resolve relative to cwd first.
+      abs = resolve(raw);
+    } else {
+      let rel = raw.replace(/\\/g, "/");
+      if (rel.startsWith("./")) rel = rel.slice(2);
+      if (rel === "workspace" || rel.startsWith("workspace/")) {
+        rel = rel === "workspace" ? "." : rel.slice("workspace/".length);
+      }
+      abs = resolve(this.cwd, rel);
+    }
+    if (!this.isPathAllowed(abs)) {
       throw Object.assign(new Error(`path escapes workspace: ${p}`), {
         code: "path_escape",
       });
     }
     return abs;
+  }
+
+  /** True when abs is under cwd or any allowedRoots entry. */
+  private isPathAllowed(abs: string): boolean {
+    const candidates = [resolve(this.cwd), ...(this.opts.allowedRoots ?? [])]
+      .filter(Boolean)
+      .map((r) => resolve(r));
+    const target = resolve(abs);
+    const norm = (s: string) =>
+      process.platform === "win32" ? s.toLowerCase() : s;
+    const t = norm(target);
+    for (const root of candidates) {
+      const r = norm(root);
+      if (t === r || t.startsWith(r + sep) || t.startsWith(r + "/")) {
+        return true;
+      }
+      // Windows: root may be reported with either separator after resolve
+      if (
+        process.platform === "win32" &&
+        (t.startsWith(r + "\\") || t.startsWith(r + "/"))
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private listDir(dir: string): Record<string, unknown> {

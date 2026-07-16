@@ -37,16 +37,29 @@ import {
   type AgentThread,
   type AgentThreadStatus,
   type CapabilityMode,
+  extractHandoffSummary,
   type CloseAgentArgs,
+  type GetAgentResultArgs,
   type ListAgentsArgs,
   type MessageAgentArgs,
   type ParentInboxEntry,
   type SendInputArgs,
   type SpawnAgentArgs,
+  type SpawnAgentsBatchArgs,
   type WaitAgentArgs,
 } from "./types.js";
 import type { OpenAITool } from "../../toolcalling/schema.js";
+import type { PermissionAskFn } from "../../toolcalling/permissions.js";
+import {
+  TOOL_OUTPUT_CHILD_MAX,
+  truncateToolOutput,
+} from "../../toolcalling/truncate.js";
 import type { TurnOptions } from "../turn.js";
+import {
+  createAgentWorktree,
+  shouldIsolateWorktree,
+  type RunGitFn,
+} from "./worktree.js";
 
 export interface SubagentRuntimeOptions {
   parentProvider: ProviderId;
@@ -62,7 +75,40 @@ export interface SubagentRuntimeOptions {
   preferredModelKey?: string;
   /** Injected chat for child loops (tests) */
   chatImpl?: TurnOptions["chatImpl"];
+  /**
+   * Parent permission-ask hook. When set, execute/all children surface
+   * "ask" rules through this hook instead of auto-approving.
+   * Without a hook, children stay non-interactive (static allow/deny).
+   */
+  onPermission?: PermissionAskFn;
+  /** Injectable git runner for worktree isolation (tests). */
+  runGit?: RunGitFn;
+  /** Override parent dir for created worktrees (tests). */
+  worktreeParent?: string;
+  /**
+   * Max terminal (completed/failed/cancelled/closed) threads retained for
+   * resume_from / get_agent_result. Oldest beyond this are pruned.
+   */
+  maxRetainedTerminal?: number;
 }
+
+/** Partial rebind when a session-scoped runtime is reused on a new parent turn. */
+export type SubagentRuntimeRebind = Partial<
+  Pick<
+    SubagentRuntimeOptions,
+    | "parentProvider"
+    | "parentModel"
+    | "cwd"
+    | "config"
+    | "parentContextSummary"
+    | "signal"
+    | "preferredModelKey"
+    | "chatImpl"
+    | "onPermission"
+    | "runGit"
+    | "worktreeParent"
+  >
+>;
 
 let agentSeq = 0;
 function nextAgentId(): string {
@@ -70,8 +116,58 @@ function nextAgentId(): string {
   return `agent_${Date.now().toString(36)}_${agentSeq}`;
 }
 
+/** Transient errors worth a single automatic retry. */
+export function isTransientChildError(err: string | undefined): boolean {
+  if (!err) return false;
+  return /rate.?limit|429|503|502|504|ECONNRESET|ETIMEDOUT|ENOTFOUND|network|fetch failed|socket|temporar|overloaded|unavailable|timeout/i.test(
+    err,
+  );
+}
+
+/** Avoid TS control-flow narrowing issues after awaits. */
+function isThreadClosed(t: AgentThread): boolean {
+  return t.status === "closed";
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Parse batch items from array, csv_text, or comma/newline string. */
+export function parseBatchItems(args: SpawnAgentsBatchArgs): string[] {
+  const out: string[] = [];
+  const push = (s: string) => {
+    const t = s.trim();
+    if (t) out.push(t);
+  };
+  if (Array.isArray(args.items)) {
+    for (const it of args.items) push(String(it ?? ""));
+  } else if (typeof args.items === "string" && args.items.trim()) {
+    splitCsvOrLines(args.items).forEach(push);
+  }
+  if (typeof args.csv_text === "string" && args.csv_text.trim()) {
+    splitCsvOrLines(args.csv_text).forEach(push);
+  }
+  // Dedupe while preserving order (exactly-once assignment intent)
+  const seen = new Set<string>();
+  return out.filter((x) => {
+    if (seen.has(x)) return false;
+    seen.add(x);
+    return true;
+  });
+}
+
+function splitCsvOrLines(text: string): string[] {
+  const raw = text.replace(/\r\n/g, "\n").trim();
+  if (!raw) return [];
+  if (raw.includes("\n")) {
+    return raw.split("\n").map((l) => l.trim()).filter(Boolean);
+  }
+  // Single line: split on commas unless it's a path-like single token
+  if (raw.includes(",")) {
+    return raw.split(",").map((c) => c.trim()).filter(Boolean);
+  }
+  return [raw];
 }
 
 const TERMINAL: ReadonlySet<AgentThreadStatus> = new Set([
@@ -80,6 +176,33 @@ const TERMINAL: ReadonlySet<AgentThreadStatus> = new Set([
   "cancelled",
 ]);
 
+/**
+ * Best-effort partial progress text while a child is still running.
+ * Prefers structured handoff, then any result draft, then last assistant turn.
+ */
+export function partialProgressText(t: {
+  result?: string;
+  handoffSummary?: string;
+  error?: string;
+  history?: Array<{ role: string; content: string }>;
+  rounds?: number;
+  toolsUsed?: string[];
+  status?: string;
+}): string {
+  if (t.handoffSummary?.trim()) return t.handoffSummary.trim();
+  if (t.result?.trim()) return t.result.trim();
+  if (t.error?.trim()) return t.error.trim();
+  const hist = t.history ?? [];
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const h = hist[i]!;
+    if (h.role === "assistant" && h.content?.trim()) {
+      return h.content.trim().slice(0, 2_000);
+    }
+  }
+  const tools = (t.toolsUsed ?? []).join(", ") || "none";
+  return `[in progress] status=${t.status ?? "running"} rounds=${t.rounds ?? 0} tools=${tools}`;
+}
+
 export class SubagentRuntime {
   private threads = new Map<string, AgentThread>();
   private aborts = new Map<string, AbortController>();
@@ -87,6 +210,7 @@ export class SubagentRuntime {
   private maxThreads: number;
   private maxDepth: number;
   private jobTimeoutMs: number;
+  private maxRetainedTerminal: number;
   /** Current parent turn id — spawns tag with this; cancelTurn filters by it */
   private activeTurnId: string = "turn_0";
   /** Agent ids already reported via drainCompletionNotices */
@@ -103,6 +227,30 @@ export class SubagentRuntime {
     this.maxDepth = Math.max(0, opts.config.maxDepth ?? 1);
     this.jobTimeoutMs =
       (opts.config.jobMaxRuntimeSeconds ?? 600) * 1000;
+    this.maxRetainedTerminal = Math.max(
+      4,
+      opts.maxRetainedTerminal ?? 24,
+    );
+  }
+
+  /**
+   * Update turn-scoped options when this runtime is session-hoisted and
+   * reused across parent messages (model, signal, chatImpl, ask hook, …).
+   */
+  rebind(partial: SubagentRuntimeRebind): void {
+    this.opts = { ...this.opts, ...partial };
+    if (partial.config) {
+      this.roles = listSpawnableRoles(partial.config.roles);
+      this.maxThreads = Math.max(1, partial.config.maxConcurrent || 6);
+      this.maxDepth = Math.max(0, partial.config.maxDepth ?? 1);
+      this.jobTimeoutMs =
+        (partial.config.jobMaxRuntimeSeconds ?? 600) * 1000;
+    }
+  }
+
+  /** Snapshot of current options (tests / diagnostics). */
+  getOptions(): Readonly<SubagentRuntimeOptions> {
+    return this.opts;
   }
 
   /** OpenAI tools for the parent (empty if depth exhausted). */
@@ -169,6 +317,11 @@ export class SubagentRuntime {
     switch (name) {
       case "spawn_agent":
         return this.spawn(args as unknown as SpawnAgentArgs, fromAgentId);
+      case "spawn_agents_batch":
+        return this.spawnBatch(
+          args as unknown as SpawnAgentsBatchArgs,
+          fromAgentId,
+        );
       case "wait_agent":
         return this.wait(args as unknown as WaitAgentArgs);
       case "send_input":
@@ -182,6 +335,8 @@ export class SubagentRuntime {
         return this.close(args as unknown as CloseAgentArgs);
       case "list_agents":
         return this.list(args as unknown as ListAgentsArgs);
+      case "get_agent_result":
+        return this.getAgentResult(args as unknown as GetAgentResultArgs);
       default:
         return { ok: false, error: `unhandled: ${name}` };
     }
@@ -348,6 +503,8 @@ export class SubagentRuntime {
   }
 
   private summarizeThread(t: AgentThread): Record<string, unknown> {
+    const handoff =
+      t.handoffSummary ?? extractHandoffSummary(t.result);
     return {
       agent_id: t.id,
       agent_type: t.agentType,
@@ -355,20 +512,115 @@ export class SubagentRuntime {
       status: t.status,
       model: `${t.provider}/${t.model}`,
       description: t.message.slice(0, 80),
-      result_preview: t.result?.slice(0, 400),
+      result_preview: handoff?.slice(0, 400) ?? t.result?.slice(0, 400),
+      handoff_summary: handoff,
       error: t.error,
       rounds: t.rounds,
       tools_used: t.toolsUsed,
+      usage: t.usage,
+      retries: t.retries,
       started_at: t.startedAt,
       ended_at: t.endedAt,
       turn_id: t.turnId,
       reasoning_effort: t.reasoningEffort,
       capability_mode: t.capabilityMode,
+      cwd: t.cwd ?? this.opts.cwd,
+      worktree_path: t.worktreePath,
+      worktree_branch: t.worktreeBranch,
+      batch_item: t.batchItem,
       ms:
         t.endedAt && t.startedAt
           ? t.endedAt - t.startedAt
           : Date.now() - t.startedAt,
     };
+  }
+
+  /** Sum usage across all threads (rough subagent spend). */
+  totalUsage(): { prompt_tokens: number; completion_tokens: number } {
+    let prompt = 0;
+    let completion = 0;
+    for (const t of this.threads.values()) {
+      prompt += t.usage?.prompt_tokens ?? 0;
+      completion += t.usage?.completion_tokens ?? 0;
+    }
+    return { prompt_tokens: prompt, completion_tokens: completion };
+  }
+
+  private uniqueNickname(base: string): string {
+    const want = base.trim() || "agent";
+    const taken = new Set(
+      [...this.threads.values()]
+        .filter((t) => t.status !== "closed")
+        .map((t) => t.nickname),
+    );
+    if (!taken.has(want)) return want;
+    let i = 2;
+    while (taken.has(`${want} #${i}`)) i++;
+    return `${want} #${i}`;
+  }
+
+  private threadPressureWarning(): string | undefined {
+    const open = this.openCount();
+    if (open >= this.maxThreads) {
+      return `max_threads (${this.maxThreads}) full — wait_agent or close_agent before more spawns`;
+    }
+    // Nudge before hard failure (at 75% or within 2 of cap)
+    if (
+      open >= Math.max(1, this.maxThreads - 2) ||
+      open / this.maxThreads >= 0.75
+    ) {
+      return `${open} of ${this.maxThreads} threads open — consider wait_agent or close_agent before hitting the cap`;
+    }
+    return undefined;
+  }
+
+  /** Drop oldest terminal threads beyond retention cap (session-scoped runtimes). */
+  pruneTerminalThreads(): number {
+    const terminal = [...this.threads.values()]
+      .filter(
+        (t) =>
+          t.status === "closed" ||
+          t.status === "completed" ||
+          t.status === "failed" ||
+          t.status === "cancelled",
+      )
+      .sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0));
+    let removed = 0;
+    while (terminal.length > this.maxRetainedTerminal) {
+      const t = terminal.shift()!;
+      // Prefer pruning closed first; always safe for non-running
+      if (t.status === "running" || t.status === "queued") continue;
+      this.threads.delete(t.id);
+      this.aborts.delete(t.id);
+      this.notifiedCompletions.delete(t.id);
+      removed++;
+    }
+    return removed;
+  }
+
+  /** Open non-closed workspace-write (or execute/all) children. */
+  private openWorkspaceWriteCount(): number {
+    let n = 0;
+    for (const t of this.threads.values()) {
+      if (t.status === "closed") continue;
+      if (t.status !== "running" && t.status !== "queued") continue;
+      const cap = t.capabilityMode;
+      if (cap === "read-only") continue;
+      // read-write / execute / all / undefined with worker-like roles write
+      if (
+        cap === "read-write" ||
+        cap === "execute" ||
+        cap === "all" ||
+        cap == null
+      ) {
+        // Prefer sandbox from resolved role when capability unset
+        const role = resolveRole(t.agentType, this.opts.config.roles);
+        if (role.sandbox === "workspace-write" || cap === "read-write" || cap === "execute" || cap === "all") {
+          n++;
+        }
+      }
+    }
+    return n;
   }
 
   /**
@@ -463,11 +715,14 @@ export class SubagentRuntime {
       return this.spawnResume(args, resumeFrom, message);
     }
 
+    this.pruneTerminalThreads();
     if (this.openCount() >= this.maxThreads) {
       return {
         ok: false,
         error: `max_threads (${this.maxThreads}) reached — wait_agent or close_agent first`,
         code: "max_threads",
+        open: this.openCount(),
+        max_threads: this.maxThreads,
       };
     }
 
@@ -477,14 +732,48 @@ export class SubagentRuntime {
     const { provider, model } = this.resolveModel(args.model, role);
     const effort = resolveChildEffort(args.reasoning_effort, role);
     const id = nextAgentId();
-    const nickname =
-      args.description?.trim() ||
-      `${role.name} ${id.slice(-4)}`;
+    const nickBase =
+      args.description?.trim() || `${role.name} ${id.slice(-4)}`;
+    const nickname = this.uniqueNickname(nickBase);
     const turnId = this.activeTurnId;
+    const pressure = this.threadPressureWarning();
     const effectiveCap: CapabilityMode | undefined =
       capMode ??
       (role.sandbox === "read-only" ? "read-only" : "execute");
     const childDepth = caller.depth + 1;
+
+    // Worktree isolation for workspace-write (opt-in or auto ≥2 concurrent)
+    let childCwd = this.opts.cwd;
+    let worktreePath: string | undefined;
+    let worktreeBranch: string | undefined;
+    const isolate = shouldIsolateWorktree({
+      isolateFlag:
+        typeof args.isolate_worktree === "boolean"
+          ? args.isolate_worktree
+          : null,
+      sandbox: role.sandbox,
+      openWorkspaceWriteCount: this.openWorkspaceWriteCount(),
+    });
+    if (isolate) {
+      const wt = await createAgentWorktree({
+        baseCwd: this.opts.cwd,
+        agentId: id,
+        runGit: this.opts.runGit,
+        worktreeParent: this.opts.worktreeParent
+          ? `${this.opts.worktreeParent}/${id}`
+          : undefined,
+      });
+      if (!wt.ok) {
+        return {
+          ok: false,
+          error: `worktree isolation failed: ${wt.error}`,
+          code: "worktree_failed",
+        };
+      }
+      childCwd = wt.worktreePath;
+      worktreePath = wt.worktreePath;
+      worktreeBranch = wt.branch;
+    }
 
     const thread: AgentThread = {
       id,
@@ -500,6 +789,9 @@ export class SubagentRuntime {
       turnId,
       reasoningEffort: effort,
       capabilityMode: effectiveCap,
+      cwd: childCwd,
+      worktreePath,
+      worktreeBranch,
     };
 
     this.launchChild(thread, role, message, args.fork_context === true, effort);
@@ -519,8 +811,139 @@ export class SubagentRuntime {
       max_depth: this.maxDepth,
       spawned_by: caller.from,
       turn_id: turnId,
+      cwd: childCwd,
+      worktree_path: worktreePath,
+      worktree_branch: worktreeBranch,
+      isolated: Boolean(worktreePath),
+      open: this.openCount(),
+      max_threads: this.maxThreads,
+      warning: pressure,
       hint:
-        "Child is running in the background. Continue other parent work now. Call wait_agent only when you need this summary; mid-turn <subagent_completed> notices may arrive first. Resume later with resume_from.",
+        "Child is running in the background (survives across parent turns until cancelled). Continue other parent work now. Call wait_agent only when you need this summary; mid-turn <subagent_completed> notices may arrive first. Resume later with resume_from or get_agent_result." +
+        (worktreePath
+          ? ` Worktree at ${worktreePath} — review/merge manually (no auto-merge).`
+          : "") +
+        (pressure ? ` Warning: ${pressure}` : ""),
+    };
+  }
+
+  /**
+   * Fan-out: one child per item with exactly-once assignment.
+   */
+  async spawnBatch(
+    args: SpawnAgentsBatchArgs,
+    fromAgentId?: string,
+  ): Promise<Record<string, unknown>> {
+    const items = parseBatchItems(args);
+    if (!items.length) {
+      return {
+        ok: false,
+        error: "items or csv_text required (non-empty)",
+        code: "invalid_args",
+      };
+    }
+    const template =
+      (args.message_template ?? args.message ?? "").trim() || "{{item}}";
+    const agents: Array<Record<string, unknown>> = [];
+    const assignments: Array<{ item: string; agent_id?: string; ok: boolean; error?: string }> =
+      [];
+
+    for (const item of items) {
+      if (this.openCount() >= this.maxThreads) {
+        assignments.push({
+          item,
+          ok: false,
+          error: `max_threads (${this.maxThreads}) reached`,
+        });
+        continue;
+      }
+      const message = template
+        .replace(/\{\{\s*item\s*\}\}/gi, item)
+        .replace(/\{\s*item\s*\}/gi, item);
+      const spawnArgs: SpawnAgentArgs = {
+        agent_type: args.agent_type,
+        message,
+        description:
+          args.description?.trim()
+            ? `${args.description.trim()} · ${item.slice(0, 40)}`
+            : `batch ${item.slice(0, 40)}`,
+        model: args.model,
+        reasoning_effort: args.reasoning_effort,
+        capability_mode: args.capability_mode,
+        isolate_worktree: args.isolate_worktree,
+        fork_context: args.fork_context,
+      };
+      const r = await this.spawn(spawnArgs, fromAgentId);
+      if (r.ok && r.agent_id) {
+        const t = this.threads.get(String(r.agent_id));
+        if (t) t.batchItem = item;
+        assignments.push({ item, agent_id: String(r.agent_id), ok: true });
+        agents.push({ ...r, batch_item: item });
+      } else {
+        assignments.push({
+          item,
+          ok: false,
+          error: String(r.error ?? "spawn failed"),
+        });
+      }
+    }
+
+    const okCount = assignments.filter((a) => a.ok).length;
+    return {
+      ok: okCount > 0,
+      spawned: okCount,
+      total_items: items.length,
+      agents,
+      assignments,
+      hint:
+        "Each item was assigned to at most one child. Continue parent work; wait_agent or get_agent_result for reports.",
+    };
+  }
+
+  /**
+   * Mailbox-style fetch of one child's result (budgeted).
+   */
+  async getAgentResult(
+    args: GetAgentResultArgs,
+  ): Promise<Record<string, unknown>> {
+    const id = String(args.agent_id ?? "").trim();
+    if (!id) {
+      return { ok: false, error: "agent_id required", code: "invalid_args" };
+    }
+    const t = this.threads.get(id);
+    if (!t) {
+      return { ok: false, error: `unknown agent_id: ${id}`, code: "unknown_agent" };
+    }
+    const stillRunning =
+      t.status === "running" || t.status === "queued";
+    const raw = stillRunning
+      ? undefined
+      : t.result ?? t.error ?? "(no result)";
+    const result =
+      raw === undefined
+        ? undefined
+        : truncateToolOutput(raw, TOOL_OUTPUT_CHILD_MAX);
+    const handoff = t.handoffSummary ?? extractHandoffSummary(t.result);
+    return {
+      ok: !stillRunning && t.status !== "failed",
+      agent_id: id,
+      agent_type: t.agentType,
+      status: t.status,
+      timed_out: stillRunning,
+      result,
+      handoff_summary: handoff,
+      usage: t.usage,
+      retries: t.retries,
+      truncated:
+        raw != null && raw.length > TOOL_OUTPUT_CHILD_MAX
+          ? true
+          : Boolean(result && /\[truncated \d+ chars\]/.test(result)),
+      worktree_path: t.worktreePath,
+      cwd: t.cwd ?? this.opts.cwd,
+      batch_item: t.batchItem,
+      hint: stillRunning
+        ? "Agent still running — call wait_agent first, then get_agent_result."
+        : undefined,
     };
   }
 
@@ -631,12 +1054,18 @@ export class SubagentRuntime {
       });
     }
 
+    // Per-role timeout always set on ResolvedRole (role override or
+    // defaultJobMaxRuntimeSecondsForRole); fall back to global only if absent.
+    const jobTimeoutMs =
+      (role.jobMaxRuntimeSeconds > 0
+        ? role.jobMaxRuntimeSeconds
+        : Math.round(this.jobTimeoutMs / 1000)) * 1000;
     const jobTimer = setTimeout(() => {
       if (thread.status === "running") {
         ac.abort();
-        thread.error = `timeout after ${this.jobTimeoutMs}ms`;
+        thread.error = `timeout after ${jobTimeoutMs}ms`;
       }
-    }, this.jobTimeoutMs);
+    }, jobTimeoutMs);
 
     const peerOn = this.peerMessagingEnabled();
     let system = this.buildChildSystem(role, forkContext);
@@ -692,6 +1121,44 @@ export class SubagentRuntime {
       ? buildMultiAgentTools(this.roles)
       : peerTools;
 
+    const maxRounds = role.maxRounds;
+    const cap = thread.capabilityMode;
+    const interactive =
+      Boolean(this.opts.onPermission) &&
+      (cap === "execute" || cap === "all");
+
+    const runOnce = () =>
+      runChildLoop({
+        provider: thread.provider,
+        model: thread.model,
+        cwd: thread.cwd ?? this.opts.cwd,
+        system,
+        messages: historyMsgs,
+        toolsets: role.toolsets,
+        permissions: role.permissions,
+        signal: ac.signal,
+        label: `child.${role.id}.${id.slice(-6)}`,
+        reasoningEffort: effort,
+        maxRounds,
+        chatImpl: this.opts.chatImpl,
+        autoApprove: !interactive,
+        onPermission: interactive ? this.opts.onPermission : undefined,
+        peer:
+          childMaTools.length > 0
+            ? {
+                tools: childMaTools,
+                isCustomTool: (n) =>
+                  childCanSpawn ? isMultiAgentTool(n) : isPeerTool(n),
+                customDispatch: async (name, args) => {
+                  if (childCanSpawn) {
+                    return this.dispatch(name, args, id);
+                  }
+                  return this.dispatchPeer(id, name, args);
+                },
+              }
+            : undefined,
+      });
+
     thread.promise = (async () => {
       try {
         dbg("subagent", isResume ? "child.resume" : "child.start", {
@@ -701,42 +1168,56 @@ export class SubagentRuntime {
           effort,
           peer: peerOn,
           canSpawn: childCanSpawn,
+          maxRounds: maxRounds ?? null,
+          jobTimeoutMs,
         });
-        const result = await runChildLoop({
-          provider: thread.provider,
-          model: thread.model,
-          cwd: this.opts.cwd,
-          system,
-          messages: historyMsgs,
-          toolsets: role.toolsets,
-          permissions: role.permissions,
-          signal: ac.signal,
-          label: `child.${role.id}.${id.slice(-6)}`,
-          reasoningEffort: effort,
-          chatImpl: this.opts.chatImpl,
-          peer:
-            childMaTools.length > 0
-              ? {
-                  tools: childMaTools,
-                  isCustomTool: (n) =>
-                    childCanSpawn
-                      ? isMultiAgentTool(n)
-                      : isPeerTool(n),
-                  customDispatch: async (name, args) => {
-                    if (childCanSpawn) {
-                      return this.dispatch(name, args, id);
-                    }
-                    return this.dispatchPeer(id, name, args);
-                  },
-                }
-              : undefined,
-        });
+
+        let result = await runOnce();
+        // One automatic retry on transient failure (network/rate-limit), not cancel.
+        if (
+          !ac.signal.aborted &&
+          !isThreadClosed(thread) &&
+          result.error &&
+          result.error !== "cancelled" &&
+          result.error !== "max_rounds" &&
+          isTransientChildError(result.error)
+        ) {
+          thread.retries = (thread.retries ?? 0) + 1;
+          dbg("subagent", "child.retry", {
+            id,
+            error: result.error,
+            attempt: thread.retries,
+          });
+          result = await runOnce();
+        } else if (
+          !ac.signal.aborted &&
+          thread.status !== "closed" &&
+          !result.error &&
+          // thrown path handled in catch — also retry empty hard failures via catch
+          false
+        ) {
+          /* unreachable */
+        }
+
+        // close() may have won the race — never un-close a closed thread.
+        if (isThreadClosed(thread)) {
+          if (result.text) {
+            thread.result = result.text;
+            thread.handoffSummary = extractHandoffSummary(result.text);
+          }
+          this.accumulateUsage(thread, result.usage);
+          dbg("subagent", "child.done_after_close", { id });
+          return;
+        }
+
         thread.result = result.text;
+        thread.handoffSummary = extractHandoffSummary(result.text);
         thread.rounds = (thread.rounds ?? 0) + result.rounds;
         thread.toolsUsed = [
           ...(thread.toolsUsed ?? []),
           ...result.toolsUsed,
         ];
+        this.accumulateUsage(thread, result.usage);
         thread.history.push({ role: "assistant", content: result.text });
         if (result.error === "cancelled" || ac.signal.aborted) {
           thread.status = "cancelled";
@@ -760,6 +1241,7 @@ export class SubagentRuntime {
           status: thread.status,
           rounds: result.rounds,
           outLen: result.text.length,
+          usage: thread.usage,
         });
 
         // Auto-chain: deliver peer messages that arrived during the run
@@ -783,14 +1265,72 @@ export class SubagentRuntime {
           }
         }
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Single retry on thrown transient errors
+        if (
+          !ac.signal.aborted &&
+          !isThreadClosed(thread) &&
+          isTransientChildError(msg) &&
+          (thread.retries ?? 0) < 1
+        ) {
+          try {
+            thread.retries = (thread.retries ?? 0) + 1;
+            dbg("subagent", "child.retry_throw", { id, error: msg });
+            const result = await runOnce();
+            if (isThreadClosed(thread)) {
+              if (result.text) thread.result = result.text;
+              this.accumulateUsage(thread, result.usage);
+              return;
+            }
+            thread.result = result.text;
+            thread.handoffSummary = extractHandoffSummary(result.text);
+            thread.rounds = (thread.rounds ?? 0) + result.rounds;
+            thread.toolsUsed = [
+              ...(thread.toolsUsed ?? []),
+              ...result.toolsUsed,
+            ];
+            this.accumulateUsage(thread, result.usage);
+            thread.history.push({ role: "assistant", content: result.text });
+            if (result.error === "cancelled" || ac.signal.aborted) {
+              thread.status = "cancelled";
+              thread.error = result.error ?? "cancelled";
+            } else if (result.error && result.error !== "max_rounds") {
+              thread.status = "failed";
+              thread.error = result.error;
+            } else {
+              thread.status = "completed";
+            }
+            if (thread.status === "completed" && thread.result) {
+              const footer = formatResumeFooter(id);
+              if (!thread.result.includes(footer)) {
+                thread.result = `${thread.result}\n\n${footer}`;
+              }
+            }
+            return;
+          } catch (err2) {
+            const msg2 = err2 instanceof Error ? err2.message : String(err2);
+            if (isThreadClosed(thread)) return;
+            thread.status = "failed";
+            thread.error = msg2;
+            thread.result = `Subagent failed: ${msg2}`;
+            dbg("subagent", "child.error", { id, error: msg2, afterRetry: true });
+            return;
+          }
+        }
+        if (isThreadClosed(thread)) return;
         thread.status = "failed";
-        thread.error = err instanceof Error ? err.message : String(err);
+        thread.error = msg;
         thread.result = `Subagent failed: ${thread.error}`;
         dbg("subagent", "child.error", { id, error: thread.error });
       } finally {
         clearTimeout(jobTimer);
-        thread.endedAt = Date.now();
+        if (!isThreadClosed(thread)) {
+          thread.endedAt = Date.now();
+        } else {
+          thread.endedAt = thread.endedAt ?? Date.now();
+        }
         this.aborts.delete(id);
+        this.pruneTerminalThreads();
         runSpan.end({
           status: thread.status,
           ms: thread.endedAt - thread.startedAt,
@@ -840,21 +1380,40 @@ export class SubagentRuntime {
       }
       const stillRunning =
         t.status === "running" || t.status === "queued";
+      // Prefer final result; while running, surface best-effort partial text.
+      const rawResult = stillRunning
+        ? partialProgressText(t)
+        : t.result ?? t.error ?? "(no result)";
+      // Cap child text so a large completion cannot inflate parent context.
+      const result =
+        rawResult === undefined
+          ? undefined
+          : truncateToolOutput(rawResult, TOOL_OUTPUT_CHILD_MAX);
+      const progress = {
+        status: t.status,
+        rounds: t.rounds ?? 0,
+        tools_used: t.toolsUsed ?? [],
+        ms:
+          t.endedAt && t.startedAt
+            ? t.endedAt - t.startedAt
+            : Date.now() - t.startedAt,
+        partial_text: stillRunning
+          ? result
+          : undefined,
+      };
       return {
         ...this.summarizeThread(t),
         ok: !stillRunning && t.status !== "failed",
         timed_out: stillRunning,
-        result: stillRunning
-          ? undefined
-          : t.result ?? t.error ?? "(no result)",
+        result: stillRunning ? undefined : result,
+        progress,
       };
     });
 
     const allDone = agents.every((a) => !("timed_out" in a && a.timed_out));
-    return {
-      ok: allDone,
-      agents,
-      summary: agents
+    // Truncate the combined summary with the same child budget (may hold N agents).
+    const summary = truncateToolOutput(
+      agents
         .map((a) => {
           const r = a as {
             agent_id: string;
@@ -862,10 +1421,48 @@ export class SubagentRuntime {
             status?: string;
             result?: string;
             error?: string;
+            timed_out?: boolean;
+            handoff_summary?: string;
+            progress?: {
+              rounds?: number;
+              tools_used?: string[];
+              partial_text?: string;
+              ms?: number;
+            };
+            usage?: { prompt_tokens?: number; completion_tokens?: number };
           };
-          return `### ${r.agent_type ?? "agent"} (${r.agent_id}) [${r.status}]\n${r.result ?? r.error ?? ""}`;
+          const handoff = r.handoff_summary
+            ? `\n[handoff]\n${r.handoff_summary}`
+            : "";
+          const usage =
+            r.usage &&
+            (r.usage.prompt_tokens != null || r.usage.completion_tokens != null)
+              ? `\n[usage] prompt=${r.usage.prompt_tokens ?? 0} completion=${r.usage.completion_tokens ?? 0}`
+              : "";
+          const body =
+            r.result ??
+            r.error ??
+            (r.timed_out
+              ? `[still running] rounds=${r.progress?.rounds ?? 0} tools=${(r.progress?.tools_used ?? []).join(",") || "none"} ms=${r.progress?.ms ?? 0}\n${r.progress?.partial_text ?? "(no partial output yet)"}`
+              : "");
+          return `### ${r.agent_type ?? "agent"} (${r.agent_id}) [${r.status}]\n${body}${handoff}${usage}`;
         })
         .join("\n\n"),
+      TOOL_OUTPUT_CHILD_MAX,
+    );
+    const totals = this.totalUsage();
+    // Wait tool itself succeeded in reporting status — timeout is not a hard
+    // tool failure. Models read all_done / timed_out / progress instead.
+    return {
+      ok: true,
+      all_done: allDone,
+      timed_out: !allDone,
+      agents,
+      summary,
+      subagent_usage: totals,
+      hint: allDone
+        ? undefined
+        : "One or more agents still running — see progress/partial_text; wait_agent again or continue parent work.",
     };
   }
 
@@ -955,12 +1552,15 @@ export class SubagentRuntime {
       description: "Root/parent coordinator — message_agent target for child→root",
       parent_inbox_depth: this.parentInbox.length,
     };
+    const pressure = this.threadPressureWarning();
     return {
       ok: true,
       open: this.openCount(),
       max_threads: this.maxThreads,
       depth: this.opts.depth,
       max_depth: this.maxDepth,
+      subagent_usage: this.totalUsage(),
+      warning: pressure,
       parent: parentRow,
       agents: [parentRow, ...agents],
     };
@@ -1000,6 +1600,19 @@ export class SubagentRuntime {
     return this.threads.get(id);
   }
 
+  private accumulateUsage(
+    thread: AgentThread,
+    usage?: { prompt_tokens?: number; completion_tokens?: number },
+  ): void {
+    if (!usage) return;
+    const prev = thread.usage ?? { prompt_tokens: 0, completion_tokens: 0 };
+    thread.usage = {
+      prompt_tokens: (prev.prompt_tokens ?? 0) + (usage.prompt_tokens ?? 0),
+      completion_tokens:
+        (prev.completion_tokens ?? 0) + (usage.completion_tokens ?? 0),
+    };
+  }
+
   private buildChildSystem(role: ResolvedRole, forkContext: boolean): string {
     const peerOn = this.peerMessagingEnabled();
     const parts = [
@@ -1011,6 +1624,11 @@ export class SubagentRuntime {
       "- Complete only the assigned task.",
       "- Be concise and direct. Prefer path:line references over long dumps.",
       "- Return a concise summary for the parent agent (findings, path:line refs, next steps).",
+      "- End your final reply with a structured handoff block exactly like:",
+      "### Summary",
+      "- Findings: …",
+      "- Refs: path:line, …",
+      "- Next: …",
       peerOn
         ? "- You may coordinate via list_agents / message_agent / wait_agent when those tools are available. Address the root with agent_id \"parent\" or \"root\"."
         : "- Do not spawn further subagents — you have no multi-agent tools.",

@@ -151,13 +151,12 @@ export async function processAction(
       while (s.running && Date.now() - t0 < timeout) {
         await sleep(100);
       }
-      return {
-        ok: !s.running,
-        ...summarize(s),
-        timed_out: s.running,
-        stdout_tail: s.stdout.slice(-4000),
-        stderr_tail: s.stderr.slice(-2000),
-      };
+      // Still-running after the wait window is normal for servers —
+      // do not mark as tool failure (ok:false) solely because it is up.
+      return classifyProcessWaitOutcome(s, {
+        waited_ms: Date.now() - t0,
+        timeout_ms: timeout,
+      });
     }
 
     case "kill": {
@@ -204,6 +203,51 @@ function requireSession(id: string | undefined): BgSession {
   const s = sessions.get(id);
   if (!s) throw new Error(`unknown session_id: ${id}`);
   return s;
+}
+
+/**
+ * Classify process wait outcome.
+ * A healthy long-lived process that is still running after the timeout is
+ * **ok: true** with still_running/timed_out flags — not a hard tool failure.
+ */
+export function classifyProcessWaitOutcome(
+  s: Pick<
+    BgSession,
+    | "id"
+    | "command"
+    | "pid"
+    | "running"
+    | "startedAt"
+    | "endedAt"
+    | "exitCode"
+    | "stdout"
+    | "stderr"
+  >,
+  meta?: { waited_ms?: number; timeout_ms?: number },
+): Record<string, unknown> {
+  const stillRunning = Boolean(s.running);
+  return {
+    ok: true,
+    session_id: s.id,
+    command: s.command,
+    pid: s.pid,
+    running: stillRunning,
+    still_running: stillRunning,
+    exited: !stillRunning,
+    timed_out: stillRunning,
+    started_at: s.startedAt,
+    ended_at: s.endedAt,
+    exit_code: s.exitCode,
+    stdout_len: s.stdout.length,
+    stderr_len: s.stderr.length,
+    stdout_tail: s.stdout.slice(-4000),
+    stderr_tail: s.stderr.slice(-2000),
+    waited_ms: meta?.waited_ms,
+    timeout_ms: meta?.timeout_ms,
+    hint: stillRunning
+      ? "Process still running after wait window (normal for servers). Use process poll/log/kill — not a failure."
+      : undefined,
+  };
 }
 
 function sleep(ms: number): Promise<void> {

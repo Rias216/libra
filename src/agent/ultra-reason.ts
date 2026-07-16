@@ -34,6 +34,9 @@ export const ULTRA_REASON_ANGLES = [
         "- Risks, edge cases, and unknowns",
         "- Concrete recommended plan with ordered steps",
         "",
+        "Note: a sibling adversarial pass will challenge this plan.",
+        "Prefer checkable steps; do not assume the shortest path is best.",
+        "",
         "Use read/search tools when evidence would strengthen the plan.",
         "Do NOT implement or edit files.",
         "Return a structured brief:",
@@ -52,13 +55,23 @@ export const ULTRA_REASON_ANGLES = [
         "User request:",
         userPrompt,
         "",
-        "Assume the obvious plan is incomplete or wrong.",
-        "Attack assumptions, find missing requirements, security/perf traps,",
-        "and coordination hazards. Propose a stronger alternative plan.",
+        "Your brief is BINDING review for the parent — not optional color commentary.",
+        "The parent MUST dispose of every deal-breaker and fold stronger-plan steps",
+        "that still fit the user's explicit constraints.",
         "",
+        "Assume the obvious / minimal plan is incomplete or wrong.",
+        "Attack assumptions, missing requirements, security/perf traps,",
+        "and coordination hazards.",
+        "",
+        "If the user asked for minimal scope: still propose the strongest plan",
+        "compatible with that constraint (cheap verifications, missing checks,",
+        "safety nets) — do NOT invent unrelated product scope.",
+        "",
+        "Prefer concrete, checkable steps over abstract philosophy.",
         "Use read/search only if needed for evidence. Do NOT implement.",
-        "Return a structured brief:",
-        "  Critiques | Stronger plan | Deal-breakers | Mitigations",
+        "",
+        "Return a structured brief with ALL sections:",
+        "  Critiques | Stronger plan (ordered steps) | Deal-breakers | Mitigations",
       ].join("\n"),
   },
   {
@@ -76,11 +89,65 @@ export const ULTRA_REASON_ANGLES = [
         "Map relevant code paths, files, symbols, and prior art in this repo.",
         "Cite path:line. Prefer targeted search over dumping whole files.",
         "Do NOT edit files or run mutating shell.",
+        "Flag evidence that supports or weakens the obvious plan.",
         "Return a structured brief:",
         "  Key files | Call paths / symbols | Gaps | Implications for the plan",
       ].join("\n"),
   },
 ] as const;
+
+/**
+ * Parent-facing instructions that make adversarial briefs binding.
+ * Exported for tests / fusion-style reuse.
+ */
+export function buildUltraSystemAddon(body: string): string {
+  return [
+    "# Ultra forced reasoning extension (subagents)",
+    "The harness already ran parallel high-effort reasoning subagents on the user request.",
+    "Their briefs are below and in Thought blocks.",
+    "",
+    "## Binding execution rules (do not skip)",
+    "1. **PRIMARY** = baseline plan only — not the final plan by default.",
+    "2. **ADVERSARIAL** is binding review. You MUST:",
+    "   - Address **every Deal-breaker**: Accept, Mitigate, or Reject.",
+    "   - Reject only with a concrete reason tied to an **explicit user constraint**",
+    "     (e.g. \"no refactors\", \"minimal change\") — never because the primary plan was shorter.",
+    "   - Fold **Stronger plan** / **Mitigations** into execution when they still satisfy",
+    "     the user request (cheap checks, missing requirements, safety).",
+    "   - **Ignoring adversarial content is a failure mode.** Do not silently drop Critiques.",
+    "3. **EVIDENCE**: prefer cited paths over re-exploring from scratch when the map is adequate;",
+    "   only re-fetch when evidence is missing, stale, or contradicted.",
+    "4. \"Minimal\" / \"keep scope tight\" does **not** license ignoring risk — apply low-cost",
+    "   adversarial mitigations; only reject scope-expanding steps that violate the ask.",
+    "5. **Before the first tool call**, in your reasoning, write a short disposition table:",
+    "   `| Adversarial item | Accept / Mitigate / Reject | Why | Action |`",
+    "   covering deal-breakers and the top stronger-plan steps. Then execute the merged plan.",
+    "6. Continue using multi-agent tools for independent parallel execution when useful",
+    "   (spawn N in background, keep working, wait_agent only when you need results).",
+    "7. Do not re-derive the whole plan solo; build on these briefs after disposition.",
+    "",
+    body,
+  ].join("\n");
+}
+
+/** Label a forced-angle body so the parent can tell primary vs adversarial. */
+export function formatUltraAngleSection(part: {
+  title: string;
+  content: string;
+  agentId?: string;
+  angle: string;
+}): string {
+  const angle = part.angle.toLowerCase();
+  const binding =
+    angle === "adversarial"
+      ? "\n> **BINDING REVIEW** — dispose every deal-breaker; fold stronger-plan steps that fit the ask."
+      : angle === "primary"
+        ? "\n> Baseline plan only — must be reconciled with adversarial before execute."
+        : angle === "evidence"
+          ? "\n> Prefer these citations over blind re-exploration."
+          : "";
+  return `### ${part.title} [${part.angle}] (${part.agentId ?? "?"})${binding}\n${part.content}`;
+}
 
 export interface UltraReasonPart {
   title: string;
@@ -235,27 +302,25 @@ export async function forceUltraReasoningExtension(
   ).length;
   const ms = Date.now() - t0;
 
-  const body = parts
-    .map(
-      (p) =>
-        `### ${p.title} (${p.agentId ?? "?"})\n${p.content}`,
-    )
-    .join("\n\n");
+  // Prefer adversarial last among reason briefs so binding review is fresh
+  // before the parent executes; evidence after for citation support.
+  const orderRank = (angle: string): number => {
+    const a = angle.toLowerCase();
+    if (a === "primary") return 0;
+    if (a === "evidence") return 1;
+    if (a === "adversarial") return 2;
+    return 3;
+  };
+  const ordered = [...parts].sort(
+    (a, b) => orderRank(a.angle) - orderRank(b.angle),
+  );
 
-  const systemAddon = [
-    "# Ultra forced reasoning extension (subagents)",
-    "The harness already ran parallel high-effort reasoning subagents on the user request.",
-    "Their briefs are below and in Thought blocks. You MUST:",
-    "1. Synthesize them — keep what strengthens the plan, drop noise",
-    "2. Continue using multi-agent tools for execution (spawn worker / review as needed)",
-    "3. Prefer spawn N in background, keep working, then one wait_agent only if you need results",
-    "4. Do not re-do the entire reasoning solo; build on these briefs",
-    "",
-    body,
-  ].join("\n");
+  const body = ordered.map((p) => formatUltraAngleSection(p)).join("\n\n");
+  const systemAddon = buildUltraSystemAddon(body);
 
   const displayReasoning = [
     "Ultra forced multi-agent reasoning",
+    "Adversarial review is binding — disposition required before execute.",
     "",
     body,
   ].join("\n");
