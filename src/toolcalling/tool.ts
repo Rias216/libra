@@ -14,6 +14,9 @@ const PARALLEL_SAFE = new Set([
   "web_fetch",
   "todo_write",
   "list_agents",
+  // Fire-and-forget: returns agent_id immediately; child runs in background
+  "spawn_agent",
+  "message_agent",
 ]);
 
 /** Mutators / exclusive tools — need write-lock style admission. */
@@ -22,7 +25,7 @@ const EXCLUSIVE = new Set([
   "search_replace",
   "run_terminal_command",
   "process",
-  "spawn_agent",
+  // Blocks until children finish — never treat as parallel-safe with parent work
   "wait_agent",
   "send_input",
   "close_agent",

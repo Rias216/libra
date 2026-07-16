@@ -398,7 +398,8 @@ export class SubagentRuntime {
       reasoning_effort: effort,
       capability_mode: effectiveCap,
       turn_id: turnId,
-      hint: 'Call wait_agent with this agent_id (or omit ids to wait for all) when you need the summary. On complete, resume with resume_from.',
+      hint:
+        "Child is running in the background. Continue other parent work now. Call wait_agent only when you need this summary; mid-turn <subagent_completed> notices may arrive first. Resume later with resume_from.",
     };
   }
 
@@ -482,7 +483,8 @@ export class SubagentRuntime {
       model: `${t.provider}/${t.model}`,
       resumed_from: resumeFrom,
       reasoning_effort: effort,
-      hint: "Resumed prior history with new message. Call wait_agent for the result.",
+      hint:
+        "Resumed prior history with new message (running in background). Continue other work; wait_agent only if you need the result.",
     };
   }
 
@@ -689,13 +691,24 @@ export class SubagentRuntime {
     }
 
     const t0 = Date.now();
+    // Settle through auto-chain / inbox resumes: a child may flip
+    // completed → running again after peer/parent messages drain.
     for (const id of ids) {
-      const t = this.threads.get(id);
-      if (!t) continue;
-      if (t.promise && (t.status === "running" || t.status === "queued")) {
-        const remaining = timeout - (Date.now() - t0);
-        if (remaining <= 0) break;
-        await Promise.race([t.promise, sleep(remaining)]);
+      while (Date.now() - t0 < timeout) {
+        const t = this.threads.get(id);
+        if (!t) break;
+        if (
+          t.promise &&
+          (t.status === "running" || t.status === "queued")
+        ) {
+          const remaining = timeout - (Date.now() - t0);
+          if (remaining <= 0) break;
+          await Promise.race([t.promise, sleep(remaining)]);
+          // Yield so auto-chain sendInput can attach the next promise
+          await sleep(0);
+          continue;
+        }
+        break;
       }
     }
 
@@ -746,12 +759,19 @@ export class SubagentRuntime {
       return { ok: false, error: `unknown or closed agent: ${id}` };
     }
 
-    if (t.promise && t.status === "running") {
-      await t.promise;
-    }
-    const latest = this.threads.get(id);
-    if (!latest || latest.status === "closed") {
-      return { ok: false, error: "agent closed" };
+    // Queue while running — do not block the parent on the child (matches tool docs).
+    if (t.status === "running" || t.status === "queued") {
+      t.inbox = t.inbox ?? [];
+      t.inbox.push({ from: "parent", message, at: Date.now() });
+      return {
+        ok: true,
+        agent_id: id,
+        queued: true,
+        inbox_depth: t.inbox.length,
+        status: t.status,
+        hint:
+          "Message queued — delivered when the agent becomes idle (auto-resume). Continue other parent work; wait_agent only if you need the next result.",
+      };
     }
 
     let role = resolveRole(t.agentType, this.opts.config.roles);
@@ -774,7 +794,8 @@ export class SubagentRuntime {
       ok: true,
       agent_id: id,
       status: "running",
-      hint: "Call wait_agent to collect the follow-up result.",
+      hint:
+        "Follow-up running in background. Continue other work; wait_agent only if you need the result.",
     };
   }
 

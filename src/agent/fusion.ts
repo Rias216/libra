@@ -482,7 +482,7 @@ ${partialFailureNote ? `\n### Status reminder\n${partialFailureNote}\n` : ""}
 2. ${reviewHint}
 3. Discard any plan that invents a different product (e.g. building an "AI harness", agent framework, or unrelated scaffold) unless the user explicitly asked for that
 4. Execute the user's request with tools when needed — do not only restate plans
-5. Use dual traces for **planning only**. Use spawn_agent for **independent parallel execution**, not for re-reasoning the same plan. Prefer spawn N → one wait_agent.
+5. Use dual traces for **planning only**. Use spawn_agent for **independent parallel execution**, not for re-reasoning the same plan. Spawn N in the background, keep working, wait_agent only when you need summaries.
 
 ### Coding hygiene (only if the user request involves writing code)
 - Prefer medium-sized writes over one giant truncated file

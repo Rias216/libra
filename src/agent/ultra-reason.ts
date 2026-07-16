@@ -248,7 +248,7 @@ export async function forceUltraReasoningExtension(
     "Their briefs are below and in Thought blocks. You MUST:",
     "1. Synthesize them — keep what strengthens the plan, drop noise",
     "2. Continue using multi-agent tools for execution (spawn worker / review as needed)",
-    "3. Prefer spawn N → one wait_agent for independent workstreams",
+    "3. Prefer spawn N in background, keep working, then one wait_agent only if you need results",
     "4. Do not re-do the entire reasoning solo; build on these briefs",
     "",
     body,

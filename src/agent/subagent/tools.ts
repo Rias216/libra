@@ -64,7 +64,10 @@ export function buildMultiAgentTools(roles: ResolvedRole[]): OpenAITool[] {
           "Use for independent parallel work: deep reasoning (reason), exploration, review, tests, focused implementation.",
           "Under Ultra, prefer agent_type=reason with reasoning_effort=max to extend thinking on hard sub-problems.",
           "Returns agent_id immediately; the child runs in the background.",
-          "Prefer: spawn several agents in one tool step, then one wait_agent — do not busy-wait/poll.",
+          "CRITICAL: Do NOT idle-wait after spawn. Keep doing other parent work (reads, edits, more spawns) while children run.",
+          "Call wait_agent only when you need their summaries before your next decision — not immediately after every spawn.",
+          "You may also rely on <subagent_completed> notices injected mid-turn.",
+          "Prefer: spawn several agents in one tool step (with any other independent tools), continue work, then wait once if needed.",
           "Peers can coordinate with message_agent (and children can message each other under Ultra).",
           "Resume a completed agent with resume_from=<agent_id> + a new message.",
           "Optional capability_mode: read-only | read-write | execute | all.",
@@ -126,9 +129,11 @@ export function buildMultiAgentTools(roles: ResolvedRole[]): OpenAITool[] {
       function: {
         name: "wait_agent",
         description: [
-          "Wait for one or more subagents to finish and return their summaries.",
+          "Block until one or more subagents finish and return their summaries.",
           "Omit agent_ids to wait for all currently open (non-closed) agents.",
-          "Prefer waiting once after spawning several agents in parallel.",
+          "Use only when you cannot proceed without the child result(s).",
+          "Do NOT call this immediately after spawn if you still have independent parent work — finish that first.",
+          "Prefer one wait after several parallel spawns, not per-agent polling.",
           "Do not poll with sleep — this tool blocks until done or timeout_ms.",
         ].join("\n"),
         parameters: {
@@ -259,7 +264,7 @@ export function buildMultiAgentSystemAddon(opts: {
 ## Peer messaging
 - message_agent — send a message to another agent by id (queued if running)
 - Children also have list_agents / message_agent / wait_agent so they can talk to each other
-- Pattern: spawn explorer + worker → explorer message_agent(worker, findings) OR parent wait then synthesize
+- Pattern: spawn explorer + worker → parent keeps working → peers message_agent each other OR wait once to synthesize
 `
     : "";
 
@@ -272,16 +277,18 @@ You still MUST keep using multi-agent tools for the rest of the turn:
 2. Spawn **reason** again when a hard sub-problem needs a second deep pass
 3. Spawn **explorer** for more evidence; spawn **worker/implement** for changes
 4. Optionally spawn **review** after implementation
-5. Prefer **spawn N in one tool step**, then **one wait_agent**
-6. Use **message_agent** so peers share findings (explorer → worker) instead of only reporting to you
-7. Do NOT solve multi-axis work solo when spawn_agent is available — delegate first
+5. Prefer **spawn N agents in one tool step** together with any independent parent tools — children run in the background
+6. **Do not idle after spawn.** Keep reading/editing/planning while children run; wait_agent only when you need their results
+7. Use **message_agent** so peers share findings (explorer → worker) instead of only reporting to you
+8. Do NOT solve multi-axis work solo when spawn_agent is available — delegate first
 Dual-reason Fusion traces (if present) are for **planning only**; spawn_agent is for **execution + further reasoning**.
 Do not dump raw tool logs to the user — summarize path:line findings.
 `
     : `
 # When to delegate
 Spawn subagents when the user asks for parallel agents, or when independent workstreams would clearly reduce context pollution.
-Spawn several → one wait_agent. Use message_agent for peer handoffs; resume_from / send_input for follow-ups.
+Spawn several in the background → keep parent work going → one wait_agent only when you need summaries.
+Use message_agent for peer handoffs; resume_from / send_input for follow-ups.
 `;
 
   return `
@@ -289,17 +296,22 @@ Spawn several → one wait_agent. Use message_agent for peer handoffs; resume_fr
 You coordinate specialized subagents. Each runs in an isolated context; summaries and peer messages return here.
 
 ## Tools
-- spawn_agent — start a child (returns agent_id immediately). Supports reasoning_effort, capability_mode, resume_from.
-- wait_agent — block until children finish; get summaries
+- spawn_agent — start a child (returns agent_id immediately; runs in background). Supports reasoning_effort, capability_mode, resume_from.
+- wait_agent — block until children finish; get summaries. Use sparingly — only when blocked without their output.
 - message_agent — peer/parent message to an agent (queue or resume)
-- send_input — parent follow-up / resume a child
+- send_input — parent follow-up / resume a child (queued if still running)
 - close_agent — cancel and free a slot
 - list_agents — status overview
+
+## Parallelism (important)
+- spawn_agent is non-blocking. After spawn, continue useful parent work in the same turn.
+- Do not call wait_agent in the same breath as spawn unless you have nothing else to do.
+- Parent may receive mid-turn <subagent_completed> notices — incorporate them without re-spawning.
+- Prefer: spawn N (+ independent tools) → more parent work → one wait_agent if still needed.
 ${peerNote}
 ## Limits
 - max concurrent threads: ${opts.maxThreads}
 - max spawn depth: ${opts.maxDepth} (children spawn only when depth remains)
-- Prefer parallel spawn then a single wait. Parent may receive <subagent_completed> notices.
 
 ## Roles
 ${roleLines}
@@ -318,7 +330,7 @@ Your agent_id is ${selfId}.
 You can coordinate with sibling agents:
 - list_agents — see peers and status
 - message_agent — send them a handoff/question (queued if they are still running)
-- wait_agent — wait for peer(s) if you need their result before continuing
+- wait_agent — only if you cannot continue without a peer's result (do not idle-wait by default)
 Do not claim to spawn new agents unless spawn_agent is in your tool list.
 Keep messages concise with path:line refs.
 `.trim();

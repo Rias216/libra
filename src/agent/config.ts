@@ -192,7 +192,7 @@ export const DEFAULT_FUSION: FusionConfig = {
   analysisInstructions:
     "Reason step-by-step about the USER request only. Cover risks, alternatives, and a concrete plan for what they asked. Do not invent a different project. No tool use in this pass.",
   fuseInstructions:
-    "Compare traces against the user request. Keep what helps fulfill it; drop digressions. Execute that plan with tools. Use spawn_agent/wait_agent only for independent parallel work the user needs.",
+    "Compare traces against the user request. Keep what helps fulfill it; drop digressions. Execute that plan with tools. Use spawn_agent for independent parallel work (background); keep parent work going; wait_agent only when you need child summaries.",
 };
 
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {

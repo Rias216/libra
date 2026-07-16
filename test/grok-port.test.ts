@@ -408,13 +408,112 @@ test("multi-agent system addon separates planning vs parallel execution", () => 
     maxDepth: 1,
     proactive: true,
   });
-  assert.match(proactive, /spawn N agents|spawn several|one wait_agent/i);
+  assert.match(
+    proactive,
+    /spawn N agents|keep working|Do not idle after spawn|background/i,
+  );
   assert.match(proactive, /planning only|parallel execution/i);
   assert.match(proactive, /resume_from|capability_mode/i);
+  assert.match(spawn.function.description, /Do NOT idle-wait|background/i);
   // Multi-agent addon is product-neutral
   assert.ok(!/Codex multi-agent/i.test(proactive));
   assert.ok(!/Codex CLI/i.test(spawn.function.description));
   assert.ok(!/\bYou are Libra\b/i.test(proactive));
+});
+
+test("spawn_agent returns immediately; send_input queues while running", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let childStarted = 0;
+  const chatImpl = async (): Promise<ChatResult> => {
+    childStarted++;
+    // First invocation blocks until parent releases (proves spawn is non-blocking).
+    // Later auto-chain rounds pass immediately (gate already resolved).
+    await gate;
+    return okResult({ content: `child round ${childStarted}`, finish_reason: "stop" });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("turn_bg");
+
+  const t0 = Date.now();
+  const spawn = await rt.spawn({
+    agent_type: "explorer",
+    message: "slow explore",
+    description: "bg",
+  });
+  const spawnMs = Date.now() - t0;
+  assert.equal(spawn.ok, true, JSON.stringify(spawn));
+  assert.equal(spawn.status, "running");
+  assert.ok(
+    spawnMs < 500,
+    `spawn should return immediately, took ${spawnMs}ms`,
+  );
+  assert.match(String(spawn.hint ?? ""), /background|Continue other/i);
+
+  // Parent can queue follow-up without blocking on the still-running child
+  const queued = await rt.sendInput({
+    agent_id: String(spawn.agent_id),
+    message: "extra note from parent",
+  });
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  assert.equal(queued.queued, true);
+  assert.match(String(queued.hint ?? ""), /queued|Continue other/i);
+
+  const thread = rt.getThread(String(spawn.agent_id));
+  assert.equal(thread?.status, "running");
+  // Parent kept working while child still blocked on gate
+  assert.ok(childStarted >= 1, "child should have started");
+
+  release();
+  const wait = await rt.wait({
+    agent_ids: [String(spawn.agent_id)],
+    timeout_ms: 15_000,
+  });
+  assert.equal(wait.ok, true, JSON.stringify(wait));
+  const done = rt.getThread(String(spawn.agent_id));
+  assert.ok(
+    done?.status === "completed" || done?.status === "failed",
+    `expected settled status, got ${done?.status}`,
+  );
+});
+
+test("scheduleToolWaves defers wait_agent after spawn and other tools", async () => {
+  const { scheduleToolWaves } = await import(
+    "../src/toolcalling/concurrency.js"
+  );
+  const waves = scheduleToolWaves([
+    { id: "w1", name: "wait_agent", args: { agent_ids: ["a"] } },
+    { id: "s1", name: "spawn_agent", args: { message: "x" } },
+    { id: "r1", name: "read_file", args: { target_file: "a.ts" } },
+    { id: "w2", name: "wait_agent", args: { agent_ids: ["b"] } },
+  ]);
+  assert.ok(waves.length >= 2, `expected barrier, got ${waves.length} waves`);
+  const flatBeforeWait = waves.slice(0, -1).flat().map((c) => c.name);
+  assert.ok(flatBeforeWait.includes("spawn_agent"));
+  assert.ok(flatBeforeWait.includes("read_file"));
+  assert.ok(!flatBeforeWait.includes("wait_agent"));
+  const last = waves[waves.length - 1]!;
+  assert.deepEqual(
+    last.map((c) => c.name).sort(),
+    ["wait_agent", "wait_agent"],
+  );
 });
 
 // ─── Reasoning modes per provider ───────────────────────────────────
