@@ -30,7 +30,9 @@ import {
 } from "../src/agent/subagent/tools.js";
 import {
   formatCompletionNotices,
+  formatParentMailboxNotices,
   formatResumeFooter,
+  isParentAgentId,
 } from "../src/agent/subagent/types.js";
 import { PermissionChecker } from "../src/toolcalling/permissions.js";
 
@@ -323,23 +325,15 @@ test("resume_from continues history; notices dedupe; turn cancel scoped", async 
 
   // Abort-aware hang: cancelTurn must only cancel matching turnId
   const hangChat = async (req: ChatRequest): Promise<ChatResult> => {
-    await new Promise<void>((resolve, reject) => {
+    await new Promise<void>((_resolve, reject) => {
       if (req.signal?.aborted) {
         reject(new DOMException("Aborted", "AbortError"));
         return;
       }
       const onAbort = () => {
-        cleanup();
+        req.signal?.removeEventListener("abort", onAbort);
         reject(new DOMException("Aborted", "AbortError"));
       };
-      const cleanup = () => {
-        clearInterval(tick);
-        req.signal?.removeEventListener("abort", onAbort);
-      };
-      // Poll so we also exit if abort fired before listener attach
-      const tick = setInterval(() => {
-        if (req.signal?.aborted) onAbort();
-      }, 15);
       req.signal?.addEventListener("abort", onAbort, { once: true });
     });
     return okResult({ content: "late", finish_reason: "stop" });
@@ -387,6 +381,9 @@ test("resume_from continues history; notices dedupe; turn cancel scoped", async 
 
   rt2.cancelTurn("old_turn");
   await rt2.wait({ timeout_ms: 2000 }).catch(() => undefined);
+  // Ensure both threads settle so no open child promises remain
+  rt2.cancelAll();
+  await rt2.wait({ timeout_ms: 1000 }).catch(() => undefined);
 });
 
 test("multi-agent system addon separates planning vs parallel execution", () => {
@@ -804,6 +801,477 @@ test("ultra forces reason+explorer subagents to extend reasoning", async () => {
   }
 });
 
+// ─── Multi-agent v2: spawn/wait/resume + peer + child→root ─────────
+
+test("multi-agent: parallel spawn+wait summaries, resume history, depth deny", async () => {
+  const chatImpl = async (req: ChatRequest): Promise<ChatResult> => {
+    const last = [...req.messages].reverse().find((m) => m.role === "user");
+    const content = String(last?.content ?? "");
+    return okResult({
+      content: `summary:${content.slice(0, 48)}`,
+      finish_reason: "stop",
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 6,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      peerMessaging: true,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("parallel_spawn");
+
+  const a = await rt.spawn({
+    agent_type: "explorer",
+    message: "map module A",
+    description: "exp-a",
+  });
+  const b = await rt.spawn({
+    agent_type: "worker",
+    message: "implement module B",
+    description: "wrk-b",
+  });
+  assert.equal(a.ok, true, JSON.stringify(a));
+  assert.equal(b.ok, true, JSON.stringify(b));
+  assert.equal(a.status, "running");
+  assert.equal(b.status, "running");
+  const idA = String(a.agent_id);
+  const idB = String(b.agent_id);
+  assert.notEqual(idA, idB);
+  assert.ok(idA.length > 0 && idB.length > 0);
+
+  const wait = await rt.wait({
+    agent_ids: [idA, idB],
+    timeout_ms: 15_000,
+  });
+  assert.equal(wait.ok, true, JSON.stringify(wait));
+  const agents = (wait.agents as Array<Record<string, unknown>>) ?? [];
+  assert.equal(agents.length, 2);
+  for (const row of agents) {
+    assert.ok(
+      String(row.result ?? "").length > 0,
+      `expected non-empty summary for ${row.agent_id}`,
+    );
+    assert.equal(row.status, "completed");
+  }
+  assert.match(String(wait.summary ?? ""), /summary:/);
+
+  // resume_from continues history with new user message
+  const resumed = await rt.spawn({
+    resume_from: idA,
+    message: "second pass on A",
+  });
+  assert.equal(resumed.ok, true, JSON.stringify(resumed));
+  assert.equal(resumed.agent_id, idA);
+  await rt.wait({ agent_ids: [idA], timeout_ms: 15_000 });
+  const thA = rt.getThread(idA)!;
+  const users = thA.history
+    .filter((h) => h.role === "user")
+    .map((h) => h.content);
+  assert.ok(users.includes("map module A"));
+  assert.ok(users.includes("second pass on A"));
+
+  // Over-depth: child runtime at depth=1 with maxDepth=1 cannot spawn
+  const childRt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 1,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 10,
+      autoSpawn: false,
+      peerMessaging: true,
+      roles: [],
+    },
+    chatImpl,
+  });
+  assert.equal(childRt.canSpawn, false);
+  assert.deepEqual(childRt.schemas(), []);
+  const denied = await childRt.spawn({
+    agent_type: "worker",
+    message: "should fail",
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.code, "max_depth");
+  assert.match(String(denied.error ?? ""), /max_depth|depth/i);
+
+  // Peer tools still exist for children but do not include spawn
+  const {
+    buildPeerTools,
+    isPeerTool,
+    isMultiAgentTool,
+  } = await import("../src/agent/subagent/tools.js");
+  const peers = buildPeerTools();
+  assert.ok(peers.every((t) => isPeerTool(t.function.name)));
+  assert.ok(!peers.some((t) => t.function.name === "spawn_agent"));
+  assert.ok(isMultiAgentTool("spawn_agent"));
+  assert.ok(!isPeerTool("spawn_agent"));
+});
+
+test("multi-agent: nested spawn depth via child dispatch on shared runtime", async () => {
+  // maxDepth=2 (Ultra): root→A (depth 1) may spawn B (depth 2);
+  // B must NOT spawn C — deny on the real dispatch path with fromAgentId.
+  const chatImpl = async (req: ChatRequest): Promise<ChatResult> => {
+    const last = [...req.messages].reverse().find((m) => m.role === "user");
+    return okResult({
+      content: `ok:${String(last?.content ?? "").slice(0, 40)}`,
+      finish_reason: "stop",
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 8,
+      maxDepth: 2,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: true,
+      peerMessaging: true,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("nested_depth");
+
+  // Root spawns A
+  const a = await rt.spawn({
+    agent_type: "worker",
+    message: "parent task A",
+    description: "A",
+  });
+  assert.equal(a.ok, true, JSON.stringify(a));
+  const idA = String(a.agent_id);
+  assert.equal(a.depth, 1);
+  assert.equal(rt.getThread(idA)?.depth, 1);
+  await rt.wait({ agent_ids: [idA], timeout_ms: 15_000 });
+
+  // A dispatches spawn_agent on the SAME shared runtime (shipped child path)
+  const bDisp = await rt.dispatch(
+    "spawn_agent",
+    {
+      agent_type: "explorer",
+      message: "helper from A",
+      description: "B",
+    },
+    idA,
+  );
+  assert.equal(bDisp.ok, true, bDisp.output);
+  const bData = bDisp.data as Record<string, unknown>;
+  assert.equal(bData.ok, true, JSON.stringify(bData));
+  const idB = String(bData.agent_id);
+  assert.equal(bData.depth, 2, "child-spawned agent must be depth 2");
+  assert.equal(bData.spawned_by, idA);
+  assert.equal(rt.getThread(idB)?.depth, 2);
+  await rt.wait({ agent_ids: [idB], timeout_ms: 15_000 });
+
+  // B at depth=2 tries to spawn C — must be denied (not unlimited nesting)
+  const cDisp = await rt.dispatch(
+    "spawn_agent",
+    {
+      agent_type: "worker",
+      message: "should be denied at depth 2",
+    },
+    idB,
+  );
+  assert.equal(cDisp.ok, false, `expected deny, got ${cDisp.output}`);
+  const cData = cDisp.data as Record<string, unknown>;
+  assert.equal(cData.ok, false);
+  assert.equal(cData.code, "max_depth");
+  assert.match(String(cData.error ?? ""), /depth|max_depth/i);
+  assert.equal(cData.caller_depth, 2);
+  assert.equal(cData.max_depth, 2);
+
+  // Direct spawn(args, fromAgentId) path matches dispatch
+  const cDirect = await rt.spawn(
+    { message: "also denied" },
+    idB,
+  );
+  assert.equal(cDirect.ok, false);
+  assert.equal(cDirect.code, "max_depth");
+
+  // At maxDepth=1, child A (depth 1) cannot spawn at all via dispatch
+  const rt1 = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 1,
+      jobMaxRuntimeSeconds: 15,
+      autoSpawn: false,
+      peerMessaging: true,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt1.beginTurn("depth1");
+  const a1 = await rt1.spawn({ message: "only child" });
+  assert.equal(a1.ok, true);
+  const idA1 = String(a1.agent_id);
+  assert.equal(rt1.getThread(idA1)?.depth, 1);
+  await rt1.wait({ agent_ids: [idA1], timeout_ms: 10_000 });
+  const nestedDeny = await rt1.dispatch(
+    "spawn_agent",
+    { message: "child cannot spawn under maxDepth=1" },
+    idA1,
+  );
+  assert.equal(nestedDeny.ok, false, nestedDeny.output);
+  assert.equal(
+    (nestedDeny.data as Record<string, unknown>).code,
+    "max_depth",
+  );
+});
+
+test("multi-agent: child→child handoff and child→root mailbox", async () => {
+  const toolsMod = await import("../src/agent/subagent/tools.js");
+  assert.equal(isParentAgentId("parent"), true);
+  assert.equal(isParentAgentId("root"), true);
+  assert.equal(isParentAgentId("agent_x"), false);
+  assert.match(
+    formatParentMailboxNotices([
+      { from: "agent_a", message: "hello root", at: 1 },
+    ]),
+    /agent_message from="agent_a"[\s\S]*to="parent"/,
+  );
+  assert.match(
+    toolsMod.formatPeerUserMessage("agent_a", "hi"),
+    /\[peer message from agent_a\]/,
+  );
+  assert.match(
+    toolsMod.buildPeerChildSystemAddon("agent_self"),
+    /parent|root/i,
+  );
+  assert.match(
+    toolsMod.buildMultiAgentSystemAddon({
+      roles: listSpawnableRoles([]),
+      maxThreads: 6,
+      maxDepth: 2,
+      proactive: false,
+      peerMessaging: true,
+    }),
+    /child→root|"parent"|parent mailbox|to="parent"/i,
+  );
+
+  let n = 0;
+  const chatImpl = async (req: ChatRequest): Promise<ChatResult> => {
+    n++;
+    const last = [...req.messages].reverse().find((m) => m.role === "user");
+    const content = String(last?.content ?? "");
+    if (content.includes("[peer message") || content.includes("PEER_PAYLOAD")) {
+      return okResult({
+        content: `worker-got-peer:${content.slice(0, 80)}`,
+        finish_reason: "stop",
+      });
+    }
+    return okResult({
+      content: `done-${n}:${content.slice(0, 40)}`,
+      finish_reason: "stop",
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 6,
+      maxDepth: 2,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: true,
+      peerMessaging: true,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("peer_root_test");
+
+  // Spawn B first so A can address it (we patch agent_id after both exist)
+  const b = await rt.spawn({
+    agent_type: "worker",
+    message: "implement after peer",
+  });
+  assert.equal(b.ok, true, JSON.stringify(b));
+  const idB = String(b.agent_id);
+
+  // Custom chat that rewrites tool args with real idB — use a second runtime path:
+  // drive messageAgent API for peer + root (shipped surface), then also
+  // exercise child dispatchPeer for root.
+  const a = await rt.spawn({
+    agent_type: "explorer",
+    message: "plain explore first",
+  });
+  assert.equal(a.ok, true, JSON.stringify(a));
+  const idA = String(a.agent_id);
+  await rt.wait({ agent_ids: [idA, idB], timeout_ms: 15_000 });
+
+  // Child A → child B (direct runtime message path used by peer tools)
+  const peer = await rt.messageAgent(
+    { agent_id: idB, message: "PEER_PAYLOAD findings at src/x.ts:42" },
+    idA,
+  );
+  assert.equal(peer.ok, true, JSON.stringify(peer));
+  await rt.wait({ agent_ids: [idB], timeout_ms: 15_000 });
+  const thB = rt.getThread(idB)!;
+  assert.match(
+    String(thB.result ?? ""),
+    /worker-got-peer|PEER_PAYLOAD|findings/i,
+  );
+  assert.ok(
+    thB.history.some(
+      (h) =>
+        h.role === "user" &&
+        (h.content.includes("PEER_PAYLOAD") ||
+          h.content.includes("[peer message from")),
+    ),
+    "B history must include peer payload from A",
+  );
+
+  // Child A → root/parent mailbox
+  assert.equal(rt.parentInboxDepth(), 0);
+  const toRoot = await rt.messageAgent(
+    { agent_id: "parent", message: "ROOT_PAYLOAD progress from explorer" },
+    idA,
+  );
+  assert.equal(toRoot.ok, true, JSON.stringify(toRoot));
+  assert.equal(toRoot.delivered_to, "parent_mailbox");
+  assert.equal(toRoot.from, idA);
+  assert.ok(
+    toRoot.agent_id === "parent" || toRoot.to === "parent",
+    JSON.stringify(toRoot),
+  );
+  assert.equal(rt.parentInboxDepth(), 1);
+  assert.equal(rt.peekParentInbox()[0]?.from, idA);
+  assert.match(rt.peekParentInbox()[0]?.message ?? "", /ROOT_PAYLOAD/);
+
+  // Alias "root" also works
+  const toRootAlias = await rt.dispatchPeer(idA, "message_agent", {
+    agent_id: "root",
+    message: "ROOT_ALIAS_PAYLOAD via peer dispatch",
+  });
+  assert.equal(toRootAlias.ok, true, toRootAlias.output);
+  assert.ok(rt.parentInboxDepth() >= 2);
+
+  // Mid-turn parent drain surfaces both (completion may also appear)
+  const notices = rt.drainCompletionNotices();
+  assert.match(notices, /agent_message/);
+  assert.match(notices, /ROOT_PAYLOAD/);
+  assert.match(notices, new RegExp(`from="${idA}"`));
+  assert.match(notices, /ROOT_ALIAS_PAYLOAD|parent/);
+  assert.equal(rt.parentInboxDepth(), 0, "drain clears parent mailbox");
+  const again = rt.drainParentInbox();
+  assert.equal(again, "", "second drain empty");
+
+  // list_agents includes parent row for children to discover
+  const listed = await rt.list({});
+  assert.equal(listed.ok, true);
+  const rows = (listed.agents as Array<Record<string, unknown>>) ?? [];
+  assert.ok(
+    rows.some((r) => r.agent_id === "parent"),
+    `expected parent in list_agents, got ${JSON.stringify(rows.map((r) => r.agent_id))}`,
+  );
+  assert.ok(listed.parent);
+
+  // Self-message parent rejected
+  const self = await rt.messageAgent(
+    { agent_id: "parent", message: "nope" },
+    "parent",
+  );
+  assert.equal(self.ok, false);
+});
+
+test("multi-agent: busy inbox queues then auto-resumes idle target", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let started = 0;
+  const chatImpl = async (req: ChatRequest): Promise<ChatResult> => {
+    started++;
+    const last = [...req.messages].reverse().find((m) => m.role === "user");
+    const content = String(last?.content ?? "");
+    // Only the first (blocked) run waits on the gate
+    if (started === 1) await gate;
+    return okResult({
+      content: content.includes("[peer message")
+        ? `after-peer:${content.slice(0, 60)}`
+        : `run-${started}`,
+      finish_reason: "stop",
+    });
+  };
+
+  const rt = new SubagentRuntime({
+    parentProvider: "openai",
+    parentModel: "gpt-test",
+    cwd: process.cwd(),
+    depth: 0,
+    config: {
+      enabled: true,
+      maxConcurrent: 4,
+      maxDepth: 2,
+      jobMaxRuntimeSeconds: 30,
+      autoSpawn: false,
+      peerMessaging: true,
+      roles: [],
+    },
+    chatImpl,
+  });
+  rt.beginTurn("busy_queue");
+
+  const s = await rt.spawn({
+    agent_type: "worker",
+    message: "long task",
+  });
+  const id = String(s.agent_id);
+  assert.equal(s.ok, true);
+
+  // Message while running → queued
+  const q = await rt.messageAgent(
+    { agent_id: id, message: "busy note from sibling" },
+    "agent_sibling",
+  );
+  assert.equal(q.ok, true, JSON.stringify(q));
+  assert.equal(q.queued, true);
+  assert.ok((q.inbox_depth as number) >= 1);
+
+  const th = rt.getThread(id)!;
+  assert.equal(th.status, "running");
+  assert.ok((th.inbox?.length ?? 0) >= 1);
+
+  release();
+  const wait = await rt.wait({ agent_ids: [id], timeout_ms: 15_000 });
+  assert.equal(wait.ok, true, JSON.stringify(wait));
+  const done = rt.getThread(id)!;
+  // Auto-chain should have delivered peer message (result or history)
+  const hist = done.history.map((h) => h.content).join("\n");
+  assert.ok(
+    /busy note|peer message|after-peer/i.test(
+      `${done.result ?? ""}\n${hist}`,
+    ),
+    `expected peer delivery in result/history, got result=${done.result} hist=${hist}`,
+  );
+});
+
 // ─── Wave 3 ─────────────────────────────────────────────────────────
 
 test("fusion partial peer failure still produces execute addon", async () => {
@@ -868,7 +1336,8 @@ async function main(): Promise<void> {
   }
   console.log("");
   console.log(`result: ${passed} passed, ${failed} failed, ${tests.length} total`);
-  if (failed > 0) process.exitCode = 1;
+  // Force exit: subagent hangChat/interval aborts can leave open handles in Bun.
+  process.exit(failed > 0 ? 1 : 0);
 }
 
 await main();

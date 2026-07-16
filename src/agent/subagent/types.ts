@@ -118,6 +118,33 @@ export interface ChildRunResult {
   };
 }
 
+/**
+ * Canonical addresses for the root/parent agent mailbox (Codex multi-agent v2).
+ * Children message any of these to reach the coordinating parent.
+ */
+export const PARENT_AGENT_IDS = ["parent", "root"] as const;
+
+export type ParentAgentId = (typeof PARENT_AGENT_IDS)[number];
+
+/** True when agent_id addresses the root/parent mailbox (not a child thread). */
+export function isParentAgentId(id: string): boolean {
+  const k = id.trim().toLowerCase();
+  return (PARENT_AGENT_IDS as readonly string[]).includes(k);
+}
+
+/** Normalize parent aliases to the canonical id used in list_agents / notices. */
+export function canonicalParentAgentId(id: string): ParentAgentId {
+  const k = id.trim().toLowerCase();
+  if (k === "root") return "root";
+  return "parent";
+}
+
+export interface ParentInboxEntry {
+  from: string;
+  message: string;
+  at: number;
+}
+
 /** Footer on completed agent results (Grok format_resume_footer spirit). */
 export function formatResumeFooter(agentId: string): string {
   return `To continue this agent, spawn_agent with resume_from="${agentId}" and a new message (or use send_input).`;
@@ -140,6 +167,26 @@ export function formatCompletionNotices(
         `<subagent_completed id="${it.id}" type="${it.agentType}" status="${it.status}">`,
         preview,
         `</subagent_completed>`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+/**
+ * Format child→root mailbox messages for the parent wire (same mid-turn
+ * injection path as completion notices).
+ */
+export function formatParentMailboxNotices(
+  items: ParentInboxEntry[],
+): string {
+  if (!items.length) return "";
+  return items
+    .map((it) => {
+      const body = (it.message ?? "").slice(0, 2000);
+      return [
+        `<agent_message from="${it.from}" to="parent">`,
+        body,
+        `</agent_message>`,
       ].join("\n");
     })
     .join("\n\n");

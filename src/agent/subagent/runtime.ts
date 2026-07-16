@@ -29,14 +29,18 @@ import {
   type MultiAgentToolName,
 } from "./tools.js";
 import {
+  canonicalParentAgentId,
   formatCompletionNotices,
+  formatParentMailboxNotices,
   formatResumeFooter,
+  isParentAgentId,
   type AgentThread,
   type AgentThreadStatus,
   type CapabilityMode,
   type CloseAgentArgs,
   type ListAgentsArgs,
   type MessageAgentArgs,
+  type ParentInboxEntry,
   type SendInputArgs,
   type SpawnAgentArgs,
   type WaitAgentArgs,
@@ -87,6 +91,11 @@ export class SubagentRuntime {
   private activeTurnId: string = "turn_0";
   /** Agent ids already reported via drainCompletionNotices */
   private notifiedCompletions = new Set<string>();
+  /**
+   * Root/parent mailbox (Codex multi-agent v2): children message agent_id
+   * "parent" | "root". Drained mid-turn into the parent wire transcript.
+   */
+  private parentInbox: ParentInboxEntry[] = [];
 
   constructor(private opts: SubagentRuntimeOptions) {
     this.roles = listSpawnableRoles(opts.config.roles);
@@ -159,7 +168,7 @@ export class SubagentRuntime {
   ): Promise<Record<string, unknown>> {
     switch (name) {
       case "spawn_agent":
-        return this.spawn(args as unknown as SpawnAgentArgs);
+        return this.spawn(args as unknown as SpawnAgentArgs, fromAgentId);
       case "wait_agent":
         return this.wait(args as unknown as WaitAgentArgs);
       case "send_input":
@@ -179,7 +188,33 @@ export class SubagentRuntime {
   }
 
   /**
+   * Nesting depth of the agent that is calling spawn.
+   * Root/parent uses runtime.opts.depth (0 for the session root).
+   * A live child uses its thread.depth so maxDepth is enforced per hop.
+   */
+  private resolveCallerDepth(fromAgentId?: string): {
+    ok: true;
+    depth: number;
+    from: string;
+  } | { ok: false; error: string; code: string } {
+    if (!fromAgentId || isParentAgentId(fromAgentId)) {
+      return { ok: true, depth: this.opts.depth, from: "parent" };
+    }
+    const t = this.threads.get(fromAgentId);
+    if (!t || t.status === "closed") {
+      return {
+        ok: false,
+        error: `spawn denied: unknown or closed caller agent_id: ${fromAgentId}`,
+        code: "unknown_caller",
+      };
+    }
+    return { ok: true, depth: t.depth, from: fromAgentId };
+  }
+
+  /**
    * Peer/parent → agent messaging (Codex multi-agent v2).
+   * Any live agent (root or child) can address any other live agent —
+   * child↔child, child→root ("parent"/"root"), and root→child.
    * Queues while running; auto-resumes when idle/completed.
    */
   async messageAgent(
@@ -191,9 +226,41 @@ export class SubagentRuntime {
     if (!id || !message) {
       return { ok: false, error: "agent_id and message required" };
     }
-    if (id === fromId) {
+    if (id === fromId || (isParentAgentId(id) && isParentAgentId(fromId))) {
       return { ok: false, error: "cannot message self" };
     }
+
+    // Child → root / parent mailbox (first-class address, not a child thread)
+    if (isParentAgentId(id)) {
+      if (isParentAgentId(fromId)) {
+        return { ok: false, error: "cannot message self" };
+      }
+      const target = canonicalParentAgentId(id);
+      const entry: ParentInboxEntry = {
+        from: fromId,
+        message,
+        at: Date.now(),
+      };
+      this.parentInbox.push(entry);
+      dbg("subagent", "parent.inbox.push", {
+        from: fromId,
+        to: target,
+        depth: this.parentInbox.length,
+        chars: message.length,
+      });
+      return {
+        ok: true,
+        agent_id: target,
+        to: target,
+        from: fromId,
+        queued: true,
+        inbox_depth: this.parentInbox.length,
+        delivered_to: "parent_mailbox",
+        hint:
+          "Message accepted into the parent/root mailbox (sender preserved). Parent will see it on the next mid-turn drain or wait.",
+      };
+    }
+
     const t = this.threads.get(id);
     if (!t || t.status === "closed") {
       return { ok: false, error: `unknown or closed agent: ${id}` };
@@ -207,6 +274,7 @@ export class SubagentRuntime {
       return {
         ok: true,
         agent_id: id,
+        from: fromId,
         queued: true,
         inbox_depth: t.inbox.length,
         hint: "Message queued — delivered when the agent becomes idle (auto-resume).",
@@ -306,6 +374,8 @@ export class SubagentRuntime {
   /**
    * Drain completion notices for agents that finished since last call.
    * Deduped by agent id (Grok ReportedTaskCompletions spirit).
+   * Also drains parent-bound peer messages (child→root mailbox) so the
+   * coordinating parent sees handoffs without only blocking on wait_agent.
    */
   drainCompletionNotices(): string {
     const fresh: Array<{
@@ -325,17 +395,64 @@ export class SubagentRuntime {
         resultPreview: t.result ?? t.error,
       });
     }
-    return formatCompletionNotices(fresh);
+    const completions = formatCompletionNotices(fresh);
+    const parentMail = this.drainParentInbox();
+    return [completions, parentMail].filter(Boolean).join("\n\n");
   }
 
-  async spawn(args: SpawnAgentArgs): Promise<Record<string, unknown>> {
-    if (!this.canSpawn) {
+  /**
+   * Drain child→root mailbox entries (FIFO). Returns formatted notices
+   * for the parent wire, or empty string when nothing is pending.
+   */
+  drainParentInbox(): string {
+    if (!this.parentInbox.length) return "";
+    const items = this.parentInbox.splice(0, this.parentInbox.length);
+    return formatParentMailboxNotices(items);
+  }
+
+  /** Test/inspection helper: pending parent mailbox depth (not drained). */
+  parentInboxDepth(): number {
+    return this.parentInbox.length;
+  }
+
+  /** Test helper: peek parent inbox without draining. */
+  peekParentInbox(): readonly ParentInboxEntry[] {
+    return this.parentInbox;
+  }
+
+  /**
+   * Spawn a child agent. When called from a live child (fromAgentId), nesting
+   * depth is parentThread.depth+1 so maxDepth is enforced per hop on the
+   * shared root runtime (not only runtime.opts.depth).
+   */
+  async spawn(
+    args: SpawnAgentArgs,
+    fromAgentId?: string,
+  ): Promise<Record<string, unknown>> {
+    const caller = this.resolveCallerDepth(fromAgentId);
+    if (!caller.ok) {
+      return { ok: false, error: caller.error, code: caller.code };
+    }
+    // Deny when the caller is already at max depth (cannot spawn further).
+    if (caller.depth >= this.maxDepth) {
+      return {
+        ok: false,
+        error: `spawn denied: caller depth ${caller.depth} >= max_depth ${this.maxDepth}`,
+        code: "max_depth",
+        caller_depth: caller.depth,
+        max_depth: this.maxDepth,
+        from: caller.from,
+      };
+    }
+    // Runtime-level gate for headless child runtimes that share opts.depth
+    if (!this.canSpawn && (!fromAgentId || isParentAgentId(fromAgentId))) {
       return {
         ok: false,
         error: `spawn denied: depth ${this.opts.depth} >= max_depth ${this.maxDepth}`,
         code: "max_depth",
       };
     }
+
     const message = String(args.message ?? "").trim();
     if (!message) {
       return { ok: false, error: "message is required", code: "invalid_args" };
@@ -367,13 +484,14 @@ export class SubagentRuntime {
     const effectiveCap: CapabilityMode | undefined =
       capMode ??
       (role.sandbox === "read-only" ? "read-only" : "execute");
+    const childDepth = caller.depth + 1;
 
     const thread: AgentThread = {
       id,
       agentType: role.id,
       nickname,
       status: "running",
-      depth: this.opts.depth + 1,
+      depth: childDepth,
       provider,
       model,
       message,
@@ -397,6 +515,9 @@ export class SubagentRuntime {
       sandbox: role.sandbox,
       reasoning_effort: effort,
       capability_mode: effectiveCap,
+      depth: childDepth,
+      max_depth: this.maxDepth,
+      spawned_by: caller.from,
       turn_id: turnId,
       hint:
         "Child is running in the background. Continue other parent work now. Call wait_agent only when you need this summary; mid-turn <subagent_completed> notices may arrive first. Resume later with resume_from.",
@@ -824,13 +945,24 @@ export class SubagentRuntime {
     const agents = [...this.threads.values()]
       .filter((t) => args.include_closed || t.status !== "closed")
       .map((t) => this.summarizeThread(t));
+    // Root is always addressable for message_agent (Codex v2 peer+root)
+    const parentRow = {
+      agent_id: "parent",
+      agent_type: "parent",
+      nickname: "root",
+      status: "running" as AgentThreadStatus,
+      aliases: ["parent", "root"],
+      description: "Root/parent coordinator — message_agent target for child→root",
+      parent_inbox_depth: this.parentInbox.length,
+    };
     return {
       ok: true,
       open: this.openCount(),
       max_threads: this.maxThreads,
       depth: this.opts.depth,
       max_depth: this.maxDepth,
-      agents,
+      parent: parentRow,
+      agents: [parentRow, ...agents],
     };
   }
 
@@ -869,6 +1001,7 @@ export class SubagentRuntime {
   }
 
   private buildChildSystem(role: ResolvedRole, forkContext: boolean): string {
+    const peerOn = this.peerMessagingEnabled();
     const parts = [
       `You are a specialized coding subagent (role: ${role.name}, id: ${role.id}).`,
       "Help with software engineering using the tools available to you. Do not claim any product name or brand.",
@@ -878,7 +1011,9 @@ export class SubagentRuntime {
       "- Complete only the assigned task.",
       "- Be concise and direct. Prefer path:line references over long dumps.",
       "- Return a concise summary for the parent agent (findings, path:line refs, next steps).",
-      "- Do not spawn further subagents — you have no multi-agent tools.",
+      peerOn
+        ? "- You may coordinate via list_agents / message_agent / wait_agent when those tools are available. Address the root with agent_id \"parent\" or \"root\"."
+        : "- Do not spawn further subagents — you have no multi-agent tools.",
       role.sandbox === "read-only"
         ? "- READ-ONLY: do not edit files or run shell that mutates state."
         : "- Prefer specialized file tools over shell for edits.",

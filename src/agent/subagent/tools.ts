@@ -177,18 +177,21 @@ export function buildMultiAgentTools(roles: ResolvedRole[]): OpenAITool[] {
       function: {
         name: "message_agent",
         description: [
-          "Message another agent in this multi-agent session (peer chat).",
-          "Works parent→child and child→child. Queues if the target is still running;",
-          "delivers (and auto-resumes) when the target is idle/completed.",
-          "Use for handoffs: explorer findings → worker, worker asking explorer for a path, etc.",
-          "Include agent_id from list_agents or spawn_agent.",
+          "Message another agent in this multi-agent session (peer + root chat).",
+          "Works parent→child, child→child, and child→root.",
+          "Address the root/parent with agent_id \"parent\" or \"root\" (same mailbox).",
+          "Queues if the target child is still running; delivers (and auto-resumes) when idle/completed.",
+          "Parent-bound messages are accepted into the root mailbox and surfaced mid-turn as <agent_message> notices.",
+          "Use for handoffs: explorer findings → worker, worker → parent progress, etc.",
+          "Include agent_id from list_agents or spawn_agent (or parent/root).",
         ].join("\n"),
         parameters: {
           type: "object",
           properties: {
             agent_id: {
               type: "string",
-              description: "Target agent_id (sibling or child)",
+              description:
+                'Target agent_id (sibling, child, or "parent"/"root" for the coordinator)',
             },
             message: {
               type: "string",
@@ -261,10 +264,12 @@ export function buildMultiAgentSystemAddon(opts: {
 
   const peerNote = opts.peerMessaging !== false
     ? `
-## Peer messaging
-- message_agent — send a message to another agent by id (queued if running)
-- Children also have list_agents / message_agent / wait_agent so they can talk to each other
-- Pattern: spawn explorer + worker → parent keeps working → peers message_agent each other OR wait once to synthesize
+## Peer + root messaging (multi-agent v2)
+- message_agent — send a message to any live agent by id (queued if running; auto-resume when idle)
+- Works parent→child, child→child, and child→root (agent_id "parent" or "root")
+- Children have list_agents / message_agent / wait_agent so they can talk to each other and to you
+- You may receive mid-turn <agent_message from="…" to="parent"> notices when children message you — incorporate without re-spawning
+- Pattern: spawn explorer + worker → parent keeps working → peers message_agent each other / message parent OR wait once to synthesize
 `
     : "";
 
@@ -298,15 +303,15 @@ You coordinate specialized subagents. Each runs in an isolated context; summarie
 ## Tools
 - spawn_agent — start a child (returns agent_id immediately; runs in background). Supports reasoning_effort, capability_mode, resume_from.
 - wait_agent — block until children finish; get summaries. Use sparingly — only when blocked without their output.
-- message_agent — peer/parent message to an agent (queue or resume)
+- message_agent — message any live agent by id (parent→child, child→child, child→root via "parent"/"root"); queue or resume
 - send_input — parent follow-up / resume a child (queued if still running)
 - close_agent — cancel and free a slot
-- list_agents — status overview
+- list_agents — status overview (includes parent row + children)
 
 ## Parallelism (important)
 - spawn_agent is non-blocking. After spawn, continue useful parent work in the same turn.
 - Do not call wait_agent in the same breath as spawn unless you have nothing else to do.
-- Parent may receive mid-turn <subagent_completed> notices — incorporate them without re-spawning.
+- Parent may receive mid-turn <subagent_completed> and <agent_message to="parent"> notices — incorporate them without re-spawning.
 - Prefer: spawn N (+ independent tools) → more parent work → one wait_agent if still needed.
 ${peerNote}
 ## Limits
@@ -327,10 +332,11 @@ export function buildPeerChildSystemAddon(selfId: string): string {
   return `
 # Peer multi-agent tools (this session)
 Your agent_id is ${selfId}.
-You can coordinate with sibling agents:
-- list_agents — see peers and status
-- message_agent — send them a handoff/question (queued if they are still running)
+You can coordinate with sibling agents AND the root/parent:
+- list_agents — see peers, status, and the parent/root row
+- message_agent — handoff/question to a sibling (queued if running) OR to the root with agent_id "parent" or "root"
 - wait_agent — only if you cannot continue without a peer's result (do not idle-wait by default)
+Use message_agent(agent_id="parent", …) when you need the coordinator to see a finding without waiting for your full completion summary.
 Do not claim to spawn new agents unless spawn_agent is in your tool list.
 Keep messages concise with path:line refs.
 `.trim();

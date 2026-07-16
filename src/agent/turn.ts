@@ -1214,7 +1214,10 @@ function mergeToolSchemas(
   return out;
 }
 
-/** Append deduped subagent completion notices as a system-reminder user turn. */
+/**
+ * Append deduped subagent completion + parent-mailbox notices as a
+ * system-reminder user turn (Grok completions + Codex v2 child→root).
+ */
 function maybeInjectSubagentNotices(
   messages: ChatMessage[],
   drain?: () => string | undefined,
@@ -1222,9 +1225,17 @@ function maybeInjectSubagentNotices(
   if (!drain) return;
   const text = drain()?.trim();
   if (!text) return;
+  const hasMail = text.includes("<agent_message");
+  const hasDone = text.includes("<subagent_completed");
+  const label =
+    hasMail && hasDone
+      ? "Subagent updates since last notice (completions + parent mailbox):"
+      : hasMail
+        ? "Parent mailbox messages since last notice:"
+        : "Subagent(s) finished since last notice:";
   messages.push({
     role: "user",
-    content: `<system-reminder>\nSubagent(s) finished since last notice:\n\n${text}\n</system-reminder>`,
+    content: `<system-reminder>\n${label}\n\n${text}\n</system-reminder>`,
   });
 }
 
